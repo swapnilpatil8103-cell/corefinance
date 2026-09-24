@@ -1,0 +1,45 @@
+[project]
+name = "corefin"
+version = "0.1.0"
+description = "Vectorized core library for quantitative finance / investment banking projects (sponsor LBO, credit, bank statement models)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.3",
+    "openpyxl>=3.1.5",
+    "pandas>=3.0.6",
+    "pydantic>=2.13.5",
+    "pyyaml>=6.0.3",
+    "typer>=0.27.2",
+]
+
+[project.scripts]
+corefin = "corefin.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.12.18,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-benchmark>=5.3.0",
+    "ruff>=0.16.8",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: performance/scale tests, excluded by default (run with -m slow)",
+]
+addopts = "-m 'not slow'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "N"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["N802"]
+"src/corefin/cli.py" = ["B008"]  # typer's idiomatic Option()/Argument() defaults
