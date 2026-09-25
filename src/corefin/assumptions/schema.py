@@ -469,6 +469,57 @@ class OptimizerConfig(BaseModel):
         return self
 
 
+class RecessionStressConfig(BaseModel):
+    """A one-time growth/margin shock at `start_year_index`, tapering
+    linearly back to zero over `recovery_years` (e.g. start_year_index=2,
+    recovery_years=2: full hit at year 2, half at year 3, fully recovered
+    by year 4). Illustrative defaults, not calibrated to any real
+    downturn."""
+
+    start_year_index: int = Field(ge=0)
+    revenue_growth_hit: float = Field(
+        default=-0.10, description="Additive hit at the peak (start) year, e.g. -0.10 = 10pp."
+    )
+    ebitda_margin_hit: float = Field(
+        default=-0.03, description="Additive hit at the peak (start) year, e.g. -0.03 = 300bps."
+    )
+    recovery_years: int = Field(default=2, ge=0, description="0 = one-period shock with no taper.")
+
+
+class RateShockStressConfig(BaseModel):
+    """A permanent, held base_rate shift from `start_year_index` onward."""
+
+    start_year_index: int = Field(default=0, ge=0)
+    bps: float = Field(default=0.03, description="Additive, e.g. 0.03 = +300bps.")
+
+
+class MultipleCompressionStressConfig(BaseModel):
+    """A shift applied to the exit multiple only."""
+
+    delta: float = Field(default=-2.0, description="Additive, e.g. -2.0 = 2.0x lower.")
+
+
+class StressShockConfig(BaseModel):
+    """One or more shocks combined into a named stress scenario; any
+    combination of the three is allowed (e.g. "combined downside" sets all
+    three at once)."""
+
+    recession: RecessionStressConfig | None = None
+    rate_shock: RateShockStressConfig | None = None
+    multiple_compression: MultipleCompressionStressConfig | None = None
+
+
+class NamedStressScenarioConfig(BaseModel):
+    name: str
+    shocks: StressShockConfig
+
+
+class SimulateConfig(BaseModel):
+    """Settings for the Sponsor LBO Monte Carlo engine (`corefin simulate`)."""
+
+    stress_scenarios: list[NamedStressScenarioConfig] = Field(default_factory=list)
+
+
 class RootConfig(BaseModel):
     timeline: TimelineConfig
     company: CompanyAssumptions
@@ -479,6 +530,7 @@ class RootConfig(BaseModel):
     scenario: ScenarioConfig
     waterfall: WaterfallConfig
     optimizer: OptimizerConfig | None = None
+    simulate: SimulateConfig | None = None
 
     @model_validator(mode="after")
     def _check_tranches(self) -> RootConfig:
