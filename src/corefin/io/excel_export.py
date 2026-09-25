@@ -120,6 +120,31 @@ def _credit_metrics_frame(
     )
 
 
+def write_scenario_sheets(
+    writer: pd.ExcelWriter,
+    timeline: Timeline,
+    income_statement: IncomeStatement,
+    balance_sheet: BalanceSheet,
+    cash_flow_statement: CashFlowStatement,
+    debt_schedule: DebtScheduleResult,
+    credit_metrics: CreditMetrics,
+    scenario: int = 0,
+) -> None:
+    """Writes the five per-statement sheets to an already-open ExcelWriter --
+    shared by export_scenario_to_excel below and optimize/excel_export.py,
+    so the optimizer's recommended-structure sheets are produced by the exact
+    same code as a standalone `corefin run` export."""
+    sheets = {
+        "Income Statement": _income_statement_frame(income_statement, timeline, scenario),
+        "Balance Sheet": _balance_sheet_frame(balance_sheet, timeline, scenario),
+        "Cash Flow Statement": _cash_flow_frame(cash_flow_statement, timeline, scenario),
+        "Debt Schedule": _debt_schedule_frame(debt_schedule, timeline, scenario),
+        "Credit Metrics": _credit_metrics_frame(credit_metrics, timeline, scenario),
+    }
+    for sheet_name, frame in sheets.items():
+        frame.T.to_excel(writer, sheet_name=sheet_name, index_label="Line Item")
+
+
 def export_scenario_to_excel(
     path: str,
     timeline: Timeline,
@@ -130,13 +155,14 @@ def export_scenario_to_excel(
     credit_metrics: CreditMetrics,
     scenario: int = 0,
 ) -> None:
-    sheets = {
-        "Income Statement": _income_statement_frame(income_statement, timeline, scenario),
-        "Balance Sheet": _balance_sheet_frame(balance_sheet, timeline, scenario),
-        "Cash Flow Statement": _cash_flow_frame(cash_flow_statement, timeline, scenario),
-        "Debt Schedule": _debt_schedule_frame(debt_schedule, timeline, scenario),
-        "Credit Metrics": _credit_metrics_frame(credit_metrics, timeline, scenario),
-    }
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        for sheet_name, frame in sheets.items():
-            frame.T.to_excel(writer, sheet_name=sheet_name, index_label="Line Item")
+        write_scenario_sheets(
+            writer,
+            timeline,
+            income_statement,
+            balance_sheet,
+            cash_flow_statement,
+            debt_schedule,
+            credit_metrics,
+            scenario=scenario,
+        )

@@ -108,3 +108,44 @@ def test_exit_and_returns_moic_includes_interim_dividends():
     exit_equity_value = 8.0 * 100.0 - (100.0 - 10.0)
     expected_moic = (5.0 + 5.0 + exit_equity_value) / sponsor_equity_mm
     np.testing.assert_allclose(result.moic, [expected_moic])
+
+
+def test_exit_equity_value_floored_at_zero_when_underwater():
+    # Net debt (300) exceeds enterprise value (8x * 20 = 160): a wipeout.
+    # Limited liability means the sponsor's realized proceeds and MOIC can't
+    # go negative, even though the raw enterprise-value-minus-net-debt does.
+    exit_year_index = 1
+    ebitda = np.array([[0.0, 20.0]])
+    total_debt = np.array([[0.0, 320.0]])
+    cash = np.array([[0.0, 20.0]])
+    dividends = np.zeros_like(ebitda)
+    exit_multiple = np.array([8.0])
+    sponsor_equity_mm = 100.0
+
+    result = compute_exit_and_returns(
+        sponsor_equity_mm, exit_year_index, exit_multiple, ebitda, total_debt, cash, dividends
+    )
+
+    assert result.exit_equity_value[0] < 0
+    assert result.realized_exit_equity_value[0] == 0.0
+    assert result.moic[0] == 0.0
+    # A total wipeout is close to -100% IRR (the solver clips at -99.9999% to
+    # keep (1+r) away from zero), not undefined or a positive/absurd value.
+    assert result.irr[0] < -0.99
+
+
+def test_moic_never_negative_across_a_range_of_leverage_outcomes():
+    # A grid of increasingly underwater exits: MOIC should floor at 0, never go
+    # negative, regardless of how far net debt exceeds enterprise value.
+    exit_year_index = 0
+    ebitda = np.array([[10.0]] * 5)
+    total_debt = np.array([[50.0], [100.0], [200.0], [500.0], [1000.0]])
+    cash = np.zeros((5, 1))
+    dividends = np.zeros((5, 1))
+    exit_multiple = np.full(5, 8.0)
+    sponsor_equity_mm = 50.0
+
+    result = compute_exit_and_returns(
+        sponsor_equity_mm, exit_year_index, exit_multiple, ebitda, total_debt, cash, dividends
+    )
+    assert np.all(result.moic >= 0.0)

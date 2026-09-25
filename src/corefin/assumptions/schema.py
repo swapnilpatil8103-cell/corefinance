@@ -208,6 +208,127 @@ class ScenarioConfig(BaseModel):
         return self
 
 
+class DecisionVariableConfig(BaseModel):
+    """One tranche's size, expressed as a multiple of entry EBITDA, that the
+    optimizer is free to vary. Revolver and PIK tranches can be decision
+    variables too (e.g. min_multiple=0.0 lets a PIK tranche be switched off);
+    nothing here is specific to term tranches."""
+
+    tranche_name: str
+    min_multiple: float = Field(ge=0)
+    max_multiple: float = Field(gt=0)
+    step_multiple: float | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Grid step, in turns of EBITDA. If omitted, the step is derived from "
+            "search.grid_points_per_dimension instead of a hardcoded default."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> DecisionVariableConfig:
+        if self.max_multiple <= self.min_multiple:
+            raise ValueError(
+                f"decision variable '{self.tranche_name}': max_multiple must exceed min_multiple"
+            )
+        return self
+
+
+class LeverageBasis(StrEnum):
+    TOTAL = "total_leverage"
+    SENIOR = "senior_leverage"
+
+
+class TranchePricingConfig(BaseModel):
+    """Linear leverage-based pricing ramp for one tranche: above
+    leverage_threshold, spread/fees step up by a fixed amount per turn of
+    leverage (closing leverage, gross of cash -- a static, structure-only
+    figure distinct from the period-by-period *net* leverage covenants use)."""
+
+    tranche_name: str
+    basis: LeverageBasis = LeverageBasis.TOTAL
+    leverage_threshold: float = Field(ge=0)
+    spread_bps_per_turn: float = Field(default=0.0, ge=0)
+    upfront_fee_pct_per_turn: float = Field(default=0.0, ge=0)
+    oid_pct_per_turn: float = Field(default=0.0, ge=0)
+    market_capacity_mm: float | None = Field(default=None, ge=0)
+
+
+class PricingGridConfig(BaseModel):
+    tranches: list[TranchePricingConfig] = []
+    total_market_capacity_mm: float | None = Field(default=None, ge=0)
+
+
+class DeterministicConstraintsConfig(BaseModel):
+    """At-close constraints, each optional (None = unconstrained)."""
+
+    max_total_leverage: float | None = Field(default=None, gt=0)
+    max_senior_leverage: float | None = Field(default=None, gt=0)
+    min_equity_pct_of_sources: float | None = Field(default=None, ge=0, le=1)
+    min_interest_coverage_at_close: float | None = Field(default=None, gt=0)
+
+
+class StochasticConstraintsConfig(BaseModel):
+    """Monte Carlo constraints, each optional (None = unconstrained).
+    max_covenant_breach_probability is one aggregate probability across every
+    configured covenant (P(any tested period of any covenant breaches)), not
+    a separate limit per covenant."""
+
+    max_covenant_breach_probability: float | None = Field(default=None, ge=0, le=1)
+    max_revolver_shortfall_probability: float | None = Field(default=None, ge=0, le=1)
+    max_loss_of_capital_probability: float | None = Field(default=None, ge=0, le=1)
+
+
+class ObjectiveKind(StrEnum):
+    MEAN_IRR = "mean_irr"
+    MEDIAN_IRR = "median_irr"
+    PERCENTILE_IRR = "percentile_irr"
+    MEAN_DOWNSIDE_BLEND = "mean_downside_blend"
+
+
+class ObjectiveConfig(BaseModel):
+    kind: ObjectiveKind = ObjectiveKind.MEAN_IRR
+    percentile: float = Field(
+        default=10.0,
+        ge=0,
+        le=100,
+        description="Used by percentile_irr, and as the downside p in the blend.",
+    )
+    downside_lambda: float = Field(
+        default=0.5,
+        ge=0,
+        description="mean_downside_blend: mean_irr - downside_lambda*(mean_irr - percentile_irr).",
+    )
+
+
+class SearchConfig(BaseModel):
+    n_scenarios_search: int = Field(default=2000, gt=0)
+    n_scenarios_confirm: int = Field(default=10000, gt=0)
+    random_seed: int = 42
+    grid_points_per_dimension: int = Field(default=15, gt=1)
+    refine: bool = True
+    refine_grid_points_per_dimension: int = Field(default=9, gt=1)
+
+
+class OptimizerConfig(BaseModel):
+    decision_variables: list[DecisionVariableConfig]
+    pricing: PricingGridConfig = PricingGridConfig()
+    deterministic_constraints: DeterministicConstraintsConfig = DeterministicConstraintsConfig()
+    stochastic_constraints: StochasticConstraintsConfig = StochasticConstraintsConfig()
+    objective: ObjectiveConfig = ObjectiveConfig()
+    search: SearchConfig = SearchConfig()
+
+    @model_validator(mode="after")
+    def _check_decision_variables(self) -> OptimizerConfig:
+        if not self.decision_variables:
+            raise ValueError("optimizer.decision_variables must have at least one entry")
+        names = [d.tranche_name for d in self.decision_variables]
+        if len(names) != len(set(names)):
+            raise ValueError("optimizer.decision_variables tranche_name values must be unique")
+        return self
+
+
 class RootConfig(BaseModel):
     timeline: TimelineConfig
     company: CompanyAssumptions
@@ -217,6 +338,7 @@ class RootConfig(BaseModel):
     covenants: list[CovenantConfig] = []
     scenario: ScenarioConfig
     waterfall: WaterfallConfig
+    optimizer: OptimizerConfig | None = None
 
     @model_validator(mode="after")
     def _check_tranches(self) -> RootConfig:
@@ -234,4 +356,18 @@ class RootConfig(BaseModel):
             raise ValueError("sweep_priority values must be unique among sweep-eligible tranches")
         if self.transaction.exit_year_index >= self.timeline.n_periods:
             raise ValueError("transaction.exit_year_index must be within the timeline")
+        if self.optimizer is not None:
+            tranche_names = {t.name for t in self.tranches}
+            for dv in self.optimizer.decision_variables:
+                if dv.tranche_name not in tranche_names:
+                    raise ValueError(
+                        f"optimizer decision variable references unknown tranche "
+                        f"'{dv.tranche_name}'; known tranches: {sorted(tranche_names)}"
+                    )
+            for tp in self.optimizer.pricing.tranches:
+                if tp.tranche_name not in tranche_names:
+                    raise ValueError(
+                        f"optimizer pricing entry references unknown tranche "
+                        f"'{tp.tranche_name}'; known tranches: {sorted(tranche_names)}"
+                    )
         return self

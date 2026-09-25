@@ -106,3 +106,66 @@ waterfall:
   interest_mode: average_balance
   circularity_tolerance: 1.0e-6
   circularity_max_iterations: 50
+
+# Financing Structure Optimizer: search over TLB and Senior Notes size for
+# the structure that maximizes sponsor returns subject to the constraints
+# below. Revolver commitment stays fixed at 50mm (not a decision variable).
+# The pricing grid, capacity limits and constraint thresholds here are
+# ILLUSTRATIVE placeholders for demonstrating the optimizer, not real market
+# data -- replace with actual lender feedback before using this for a live
+# deal.
+optimizer:
+  decision_variables:
+    # min/max are turns of entry EBITDA (100mm); bounds bracket the example's
+    # own 3.75x/1.75x sizing so `corefin optimize` explores both directions.
+    - tranche_name: TLB
+      min_multiple: 2.0
+      max_multiple: 5.0
+    - tranche_name: SeniorNotes
+      min_multiple: 0.5
+      max_multiple: 3.0
+
+  pricing:
+    # Illustrative only: spread/fee step-ups per turn of TOTAL closing
+    # leverage above each threshold, roughly bracketing the example's 5.5x
+    # closing leverage -- not sourced from any real lender or market data.
+    tranches:
+      - tranche_name: TLB
+        basis: total_leverage
+        leverage_threshold: 5.0
+        spread_bps_per_turn: 0.0075 # +75bps of spread per turn above 5.0x
+        upfront_fee_pct_per_turn: 0.0025
+        market_capacity_mm: 500.0 # illustrative TLB market depth cap
+      - tranche_name: SeniorNotes
+        basis: total_leverage
+        leverage_threshold: 5.0
+        spread_bps_per_turn: 0.0125 # notes price wider/steeper than TLB
+        oid_pct_per_turn: 0.0025
+        market_capacity_mm: 300.0 # illustrative notes market depth cap
+    total_market_capacity_mm: 700.0 # illustrative total debt capacity
+
+  deterministic_constraints:
+    max_total_leverage: 6.5
+    max_senior_leverage: 6.5 # all tranches here are senior; see is_senior()
+    min_equity_pct_of_sources: 0.25
+    min_interest_coverage_at_close: 1.5 # matches the Min Interest Coverage covenant
+
+  stochastic_constraints:
+    max_covenant_breach_probability: 0.10
+    max_revolver_shortfall_probability: 0.05
+    max_loss_of_capital_probability: 0.05
+
+  objective:
+    # mean IRR shaded toward the downside (p10): mean - 0.5*(mean - p10),
+    # so the search doesn't just chase mean IRR into fragile territory.
+    kind: mean_downside_blend
+    percentile: 10.0
+    downside_lambda: 0.5
+
+  search:
+    n_scenarios_search: 2000
+    n_scenarios_confirm: 10000
+    random_seed: 42
+    grid_points_per_dimension: 15
+    refine: true
+    refine_grid_points_per_dimension: 9

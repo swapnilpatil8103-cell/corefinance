@@ -3,9 +3,10 @@
 A vectorized core library for quantitative finance / investment banking
 projects, built as the shared foundation for:
 
-1. **Financing Structure Optimizer** — picks the debt/equity mix that
-   maximizes sponsor returns subject to leverage/coverage/covenant
-   constraints, calling this model many times inside an optimizer.
+1. **Financing Structure Optimizer** (built — see [below](#financing-structure-optimizer))
+   — picks the debt/equity mix that maximizes sponsor returns subject to
+   leverage/coverage/covenant constraints, by calling this core model many
+   times over a grid of candidate structures.
 2. **Sponsor LBO Monte Carlo Engine** — runs thousands of operating
    scenarios to produce distributions of IRR, MOIC and covenant breaches.
 3. **Credit-Loss Forecasting Engine** (later, bank-specific).
@@ -22,15 +23,22 @@ in](#where-the-bank-model-plugs-in) below.
 ```bash
 uv sync
 uv run pytest                       # fast tests (excludes the slow marker)
-uv run pytest -m slow               # the 10k-scenario performance test
+uv run pytest -m slow               # performance tests (10k scenarios; 15x15 grid search)
 uv run ruff check . && uv run ruff format --check .
 uv run corefin run --config configs/example_midmarket.yaml
+uv run corefin optimize --config configs/example_midmarket.yaml
 ```
 
 The `run` command prints a summary (sources & uses, IRR/MOIC distribution
 across scenarios, covenant breach probabilities) and exports one scenario's
 full statements, debt schedule and credit metrics to `output.xlsx`
 (`--output` to change the path, `--scenario` to pick which one).
+
+The `optimize` command (config must have an `optimizer:` section) searches
+for the debt structure that maximizes sponsor returns subject to the
+configured constraints, and prints the recommendation alongside a
+side-by-side comparison against the input config's own structure — see
+[Financing Structure Optimizer](#financing-structure-optimizer) below.
 
 ## Architecture
 
@@ -45,7 +53,9 @@ src/corefin/
   transaction/              Sources & uses, exit valuation, IRR/MOIC
   checks/                   Reusable integrity-check framework + concrete checks
   io/                       Excel export
-  cli.py                    `corefin run` / `corefin version`
+  optimize/                 Financing Structure Optimizer (structure, pricing, evaluate,
+                             search, excel_export, heatmap) -- see below
+  cli.py                    `corefin run` / `corefin optimize` / `corefin version`
 ```
 
 **Every time-series quantity is a numpy array of shape `(n_scenarios,
@@ -166,15 +176,142 @@ equity" on its own — that check depends on whether you're about to run
 `run_corporate_model_with_debt` (where each tranche is already funded at
 face value as of period 0's start, so `equity_mm` must be sized to cover
 that too). This is exactly what a real deal's Sources & Uses does
-automatically; until the Financing Structure Optimizer or Monte Carlo
-project wires `transaction/sources_uses.py`'s output directly into an
-opening balance sheet, treat `OpeningBalanceSheet` as "whatever numbers are
-consistent with the model you're about to run" and let
-`checks.check_balance_sheet_balances` tell you at runtime if they aren't.
-`configs/example_midmarket.yaml` shows a debt-inclusive example that
-balances (verify the identity: `cash + nwc + ppe + goodwill +
-deferred_financing_costs == other_liabilities + equity + sum(non-revolver
-tranche sizes)`).
+automatically, and it's exactly what `optimize/structure.py` now does for
+every candidate structure the optimizer builds (see below) — but a
+hand-written config (like the base of `configs/example_midmarket.yaml`,
+used by `corefin run`) still has to get this right by hand. Treat
+`OpeningBalanceSheet` as "whatever numbers are consistent with the model
+you're about to run" and let `checks.check_balance_sheet_balances` tell
+you at runtime if they aren't. `configs/example_midmarket.yaml` shows a
+debt-inclusive example that balances (verify the identity: `cash + nwc +
+ppe + goodwill + deferred_financing_costs == other_liabilities + equity +
+sum(non-revolver tranche sizes)`).
+
+## Financing Structure Optimizer
+
+Given a company, an entry price and market conditions, `optimize/` searches
+over debt tranche sizes for the structure that maximizes sponsor returns
+subject to financing constraints, using the same Monte Carlo scenario
+engine to measure risk. `corefin optimize --config <file>` answers: what's
+the best structure, what limits it, and how fragile is it?
+
+### Decision variables and structure building
+
+`optimizer.decision_variables` (in `assumptions/schema.py`) names which
+tranches are free to vary, each as a multiple of entry EBITDA with
+min/max bounds and an optional grid step (if omitted, the step is derived
+from `search.grid_points_per_dimension` rather than a hardcoded default).
+Any tranche can be a decision variable, including the revolver or an
+optional subordinated/PIK tranche with `min_multiple: 0.0` to let the
+search switch it off entirely — it isn't special-cased.
+
+For each candidate, `optimize/structure.build_structure` (extended with
+pricing by `optimize/pricing.build_priced_structure`) resizes the decision
+tranches, recomputes sources & uses (debt sizes, financing fees/OID that
+scale with tranche size, transaction fees, sponsor equity plug), and
+rebuilds the opening balance sheet: `cash_mm` is pinned to
+`waterfall.minimum_cash_mm`, `deferred_financing_costs_mm` and `equity_mm`
+come straight from sources & uses, and `goodwill_mm` is the plug that
+balances the sheet. `nwc_mm`/`ppe_mm`/`other_liabilities_mm` are held
+fixed — company facts independent of financing structure — read from the
+config's own `opening_balance_sheet`. A dedicated test
+(`test_optimize_structure.py`) proves the builder reproduces
+`configs/example_midmarket.yaml`'s hand-entered opening balance sheet
+exactly, goodwill included.
+
+### Leverage-dependent pricing and market capacity
+
+`optimizer.pricing` is a linear ramp, per tranche: above a leverage
+threshold (total or senior closing leverage — gross of cash, computed
+once at close, distinct from the period-by-period *net* leverage the
+covenant system tracks), spread/fixed rate and fees step up by a fixed
+amount per turn. A tranche not listed in `pricing.tranches` is never
+repriced. `market_capacity_mm` (per tranche) and `pricing.total_market_capacity_mm`
+are hard limits — debt simply isn't available above them, so those
+candidates are marked infeasible before the (expensive) model even runs.
+**The pricing grid and capacity limits in `configs/example_midmarket.yaml`
+are illustrative placeholders for demonstrating the feature, not real
+market data.**
+
+### Constraints and objective
+
+Each constraint is optional (unset = unconstrained). Deterministic, at
+close: `max_total_leverage`, `max_senior_leverage`,
+`min_equity_pct_of_sources`, `min_interest_coverage_at_close` (the last
+evaluated on a deterministic, zero-vol run — same convention as covenant
+headroom). Stochastic, across the Monte Carlo scenarios:
+`max_covenant_breach_probability` (one aggregate probability across every
+configured covenant — P(the scenario breaches any tested period of any
+covenant) — not a separate limit per covenant),
+`max_revolver_shortfall_probability`, `max_loss_of_capital_probability`
+(P(MOIC < 1.0x)). A candidate with negative sponsor equity (debt sources
+exceeding total uses) is always infeasible, regardless of configured
+constraints — not a fundable structure. Every other constraint still runs
+the model and records the actual value even when violated, so the grid
+export shows near-misses, not just pass/fail.
+`optimize/evaluate.binding_constraints` reports which configured limits
+are within 2% (relative) of binding for a given evaluation.
+
+The objective (`optimizer.objective.kind`) is mean, median or a percentile
+of IRR, or a mean-downside blend: `mean_irr - downside_lambda *
+(mean_irr - percentile_irr)` (reduces to the mean at `downside_lambda=0`
+and exactly to the percentile at `downside_lambda=1`). IRR is always
+well-defined: `transaction/returns.py` floors the realized exit equity
+value at zero (limited liability — a wipeout is a 0x MOIC / ~-100% IRR,
+never negative) and pins the Newton-Raphson IRR solver directly to
+-99.9999% for the degenerate case of zero distributions of any kind
+(that scenario's NPV equation has no root to converge to at all, not
+just a very negative one) — both were real bugs this project's own tests
+caught while building the optimizer.
+
+### Search method
+
+The problem is low-dimensional (2-4 variables) and the objective is noisy
+(Monte Carlo), so:
+
+1. **Common random numbers.** `optimize/search.generate_search_drivers`
+   builds one `DriverSet` up front (fixed seed), reused for every
+   candidate evaluated — differences in the objective between structures
+   reflect the structure, not fresh sampling noise. Financing structure
+   never affects operating performance (revenue/EBITDA), so this is
+   trivially exact, not an approximation.
+2. **Coarse grid search** (`grid_search`) over the full cartesian product
+   of decision-variable bounds, reporting evaluation count and runtime.
+3. **Local refinement** (`refine`): a finer grid in a shrunk neighborhood
+   (± one coarse step, clipped to the original bounds) around the best
+   feasible grid point. Chosen over Nelder-Mead specifically to avoid a
+   new dependency (`scipy`) for a 2-4 dimensional problem where a finer
+   grid is just as effective, simpler to test against the coarse grid
+   within tolerance, and robust to Monte Carlo noise given common random
+   numbers already make nearby candidates' differences mostly real
+   signal. Refinement can only match or improve the coarse optimum, never
+   regress it.
+
+`search.n_scenarios_search` (default 2,000) drives the search; the chosen
+structure is then re-run at `search.n_scenarios_confirm` (default 10,000)
+for a more robust final read — if the confirmation run finds a constraint
+violation the smaller search sample missed, that's a genuine fragility
+signal, and the CLI prints a warning rather than hiding it.
+`run_optimization` orchestrates search → refine → confirm end to end; the
+same seed always gives the same answer.
+
+### Outputs
+
+`corefin optimize` prints the recommended structure (tranche sizes in $mm
+and x EBITDA, priced spread/fixed rate, equity check and %), the
+objective and IRR/MOIC distribution, breach/shortfall/loss probabilities,
+binding constraints, and a side-by-side comparison against the input
+config's own structure (evaluated with the same common random numbers).
+It exports two files: `optimization.xlsx` (`--output`) with every
+evaluated candidate (`Grid Results`), the feasible subset sorted by
+return with the recommendation flagged (`Efficient Frontier`), and the
+recommended structure's full statements/debt schedule/credit metrics —
+the last of these produced by the exact same sheet-writing code as
+`corefin run`'s export (`io/excel_export.write_scenario_sheets`, factored
+out for reuse); and `heatmap.png` (`--heatmap`), a matplotlib PNG of the
+objective surface over the first two decision variables (any other
+decision variable held at the recommended value — a 2D profile slice),
+infeasible cells masked gray, and the recommendation marked with a star.
 
 ## Where the bank model plugs in
 
@@ -202,11 +339,19 @@ used throughout `statements/corporate_model.py`.
 ## Testing conventions
 
 - `pytest.mark.slow` is excluded by default (`addopts = "-m 'not slow'"` in
-  `pyproject.toml`); run it explicitly with `pytest -m slow`.
+  `pyproject.toml`); run it explicitly with `pytest -m slow`. It covers two
+  performance budgets: 10,000 scenarios × 7 periods for the core model, and
+  a 15×15 grid × 2,000 scenarios for the optimizer's grid search.
 - Every check in `checks/` returns a `CheckResult` reporting *which*
   scenario/period pairs failed, not just pass/fail — `run_checks([...])`
   raises with that detail if anything failed.
 - Config fixtures live in `tests/conftest.py` (a minimal schema-validation
   fixture) and `tests/test_debt_integration.py::debt_config_dict` (a
-  self-consistent, debt-inclusive fixture reused by the metrics, covenants
-  and transaction tests).
+  self-consistent, debt-inclusive fixture reused throughout the metrics,
+  covenants, transaction and optimizer tests).
+- The optimizer's tests are split by stage: `test_optimize_structure.py`,
+  `test_optimize_pricing.py`, `test_optimize_evaluate.py`,
+  `test_optimize_search.py` (grid search, including the two required
+  sanity checks: flat pricing/no constraints pins the optimum to the max
+  leverage bound, a steep pricing grid pulls it interior),
+  `test_optimize_refine_confirm.py`, and `test_optimize_excel_heatmap.py`.
