@@ -67,14 +67,24 @@ tranches:
     sweep_priority: 2
 
 covenants:
+  # Max leverage starts ~25% above closing leverage (5.5x -> 7.0x) and
+  # steps down linearly to 5.0x by the final period, giving working
+  # headroom instead of testing right at the closing level. Springing at
+  # 35% revolver draw: sponsor term loans are typically covenant-lite,
+  # with the leverage test applying only to the revolver and only once
+  # it's meaningfully drawn.
   - name: Max Total Net Leverage
     metric: total_net_leverage
-    threshold: [5.5, 5.25, 5.0, 4.5, 4.0, 3.5, 3.0]
+    threshold: [7.00, 6.67, 6.33, 6.00, 5.67, 5.33, 5.00]
     test_from_period: 0
+    springing_revolver_draw_pct: 0.35
 
+  # Regular (non-springing) maintenance covenant, loosened from 2.0x to
+  # 1.5x -- coverage at close was already thin (~2.1x) against a 2.0x
+  # threshold, flagging normal scenario noise as a breach.
   - name: Min Interest Coverage
     metric: interest_coverage
-    threshold: 2.0
+    threshold: 1.5
     test_from_period: 0
 
 scenario:

@@ -108,6 +108,38 @@ commitment; a shortfall that still can't be covered is *flagged*, not
 silently allowed) → revolver paydown → optional cash sweep by priority
 (`sweep_priority`, lower = swept first) at a configurable `sweep_pct`.
 
+## Covenants
+
+`CovenantConfig` (`assumptions/schema.py`) supports four metrics:
+`total_net_leverage` / `senior_net_leverage` (**maximum** — breach when the
+metric exceeds `threshold`) and `interest_coverage` / `fccr` (**minimum** —
+breach when the metric falls below `threshold`). `metrics/covenants.py`
+signs `headroom` the same way for both directions, so positive headroom
+always means compliant regardless of which kind of covenant it is.
+
+**Springing covenants.** Sponsor-backed term loans are usually
+covenant-lite: the maintenance test applies only to the revolver, and only
+once it's meaningfully drawn. Set `springing_revolver_draw_pct` (e.g.
+`0.35`) on a covenant and it's only *tested* in a period where the
+revolver's drawn balance / commitment strictly exceeds that fraction —
+untested periods are neither a pass nor a breach. `CovenantResult.tested`
+(a `(n_scenarios, n_periods)` bool array, same shape as `breach`) lets a
+caller distinguish tested-and-breached, tested-and-passed, and not-tested.
+Leaving the field unset (the default) tests the covenant every period from
+`test_from_period` onward, exactly as before this field existed.
+
+**Headroom warnings.** `metrics.covenants.compute_base_case_headroom`
+takes a single (typically deterministic, zero-vol) scenario's
+`CovenantResult`s and reports the cushion — `headroom / threshold` — at
+each covenant's *first tested* period; a springing covenant that never
+triggers in that scenario reports `tested=False` rather than a fabricated
+number. `low_headroom_warnings` filters that down to covenants under a
+minimum cushion (default 15%). The CLI surfaces both: `corefin run` prints
+base-case headroom per covenant and a `WARNING:` line for anything under
+`--min-headroom-pct`. This is a display/warning threshold for the tool's
+output, not a modeling assumption, so it's a CLI flag rather than a YAML
+field.
+
 ## Adding a new tranche type
 
 1. Add the new value to `TrancheType` in `assumptions/schema.py`.

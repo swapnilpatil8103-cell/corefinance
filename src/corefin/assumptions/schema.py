@@ -135,6 +135,19 @@ class CovenantConfig(BaseModel):
     metric: CovenantMetric
     threshold: ScalarOrSeries
     test_from_period: int = Field(default=0, ge=0)
+    springing_revolver_draw_pct: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "When set, the covenant is only tested in a period where the revolver's "
+            "drawn balance / commitment strictly exceeds this fraction -- the usual "
+            "covenant-lite structure, where a maintenance test applies only to the "
+            "revolver and only once it's meaningfully drawn. None (default) means the "
+            "covenant is tested in every period from test_from_period onward, matching "
+            "prior behavior exactly."
+        ),
+    )
 
 
 class TransactionConfig(BaseModel):

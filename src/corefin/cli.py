@@ -9,9 +9,14 @@ import typer
 
 from corefin.assumptions.loader import expand_series, load_config
 from corefin.io.excel_export import export_scenario_to_excel
-from corefin.metrics.covenants import evaluate_covenants
+from corefin.metrics.covenants import (
+    DEFAULT_MIN_HEADROOM_PCT,
+    compute_base_case_headroom,
+    evaluate_covenants,
+    low_headroom_warnings,
+)
 from corefin.metrics.credit_metrics import compute_credit_metrics
-from corefin.scenarios.generator import generate_stochastic_drivers
+from corefin.scenarios.generator import deterministic_drivers, generate_stochastic_drivers
 from corefin.statements.corporate_model import run_corporate_model_with_debt
 from corefin.timeline import Timeline
 from corefin.transaction.returns import compute_exit_and_returns
@@ -38,6 +43,11 @@ def run(
     ),
     scenario: int = typer.Option(
         0, "--scenario", help="Scenario index to detail in the summary and export to Excel."
+    ),
+    min_headroom_pct: float = typer.Option(
+        DEFAULT_MIN_HEADROOM_PCT,
+        "--min-headroom-pct",
+        help="Warn if a covenant's base-case cushion at its first tested period falls below this.",
     ),
 ) -> None:
     """Run the corporate LBO model, print a summary, and export one scenario's
@@ -67,7 +77,36 @@ def run(
         result.balance_sheet.cash,
         result.balance_sheet.total_debt,
     )
-    covenant_results = evaluate_covenants(root_config.covenants, credit_metrics, timeline)
+    covenant_results = evaluate_covenants(
+        root_config.covenants, credit_metrics, timeline, result.debt_schedule, root_config.tranches
+    )
+
+    base_drivers = deterministic_drivers(root_config, timeline)
+    base_result = run_corporate_model_with_debt(
+        root_config.company,
+        root_config.opening_balance_sheet,
+        root_config.tranches,
+        root_config.waterfall,
+        timeline,
+        base_drivers,
+    )
+    base_metrics = compute_credit_metrics(
+        base_result.debt_schedule,
+        root_config.tranches,
+        base_result.income_statement.ebitda,
+        base_result.cash_flow_statement.capex,
+        base_result.balance_sheet.cash,
+        base_result.balance_sheet.total_debt,
+    )
+    base_covenant_results = evaluate_covenants(
+        root_config.covenants,
+        base_metrics,
+        timeline,
+        base_result.debt_schedule,
+        root_config.tranches,
+    )
+    headrooms = compute_base_case_headroom(base_covenant_results, timeline)
+    warnings = low_headroom_warnings(headrooms, min_headroom_pct)
 
     entry_ebitda_margin = expand_series(root_config.company.ebitda_margin, timeline.n_periods)[0]
     sau = compute_sources_and_uses(
@@ -113,11 +152,35 @@ def run(
     typer.echo("")
 
     if covenant_results:
-        typer.echo("Covenant breach probability (any tested period):")
+        typer.echo("Covenant breach probability (any tested period) and test frequency:")
         for cov in covenant_results:
             breach_prob = np.mean(np.any(cov.breach, axis=1))
-            typer.echo(f"  {cov.name}: {breach_prob:.1%}")
+            tested_prob = np.mean(cov.tested)
+            typer.echo(
+                f"  {cov.name}: breach={breach_prob:.1%}  "
+                f"tested={tested_prob:.1%} of scenario-periods"
+            )
         typer.echo("")
+
+        typer.echo("Base-case headroom by covenant (deterministic, zero-vol run):")
+        for h in headrooms:
+            if not h.tested:
+                typer.echo(f"  {h.name}: not tested in base case")
+                continue
+            typer.echo(
+                f"  {h.name}: {h.cushion_pct:.1%} cushion at {h.period_label} "
+                f"(value={h.metric_value:.2f}, threshold={h.threshold:.2f})"
+            )
+        typer.echo("")
+
+        if warnings:
+            for w in warnings:
+                typer.echo(
+                    f"WARNING: {w.name} has only {w.cushion_pct:.1%} headroom at {w.period_label} "
+                    f"(value={w.metric_value:.2f} vs threshold={w.threshold:.2f}); "
+                    f"below the {min_headroom_pct:.0%} minimum cushion."
+                )
+            typer.echo("")
 
     typer.echo(f"Detail for scenario {scenario}:")
     typer.echo(
