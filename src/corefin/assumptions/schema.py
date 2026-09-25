@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 ScalarOrSeries = float | list[float]
 
@@ -78,6 +78,11 @@ class TrancheType(StrEnum):
     SUBORDINATED_PIK = "subordinated_pik"
 
 
+DEFAULT_SECURED_TRANCHE_TYPES = frozenset(
+    {TrancheType.REVOLVER, TrancheType.TERM_LOAN_A, TrancheType.TERM_LOAN_B}
+)
+
+
 class RateType(StrEnum):
     FIXED = "fixed"
     FLOATING = "floating"
@@ -99,10 +104,24 @@ class TrancheConfig(BaseModel):
     oid_pct: float = Field(default=0.0, ge=0)
     fee_amortization_years: int = Field(default=1, gt=0)
     commitment_fee_pct: float | None = Field(default=None, ge=0)
+    secured: bool | None = Field(
+        default=None,
+        description=(
+            "None (default) uses the type-based default: revolver/term_loan_a/"
+            "term_loan_b are secured, senior_notes/subordinated_pik are not. "
+            "Set explicitly to override -- e.g. unsecured TLB or secured notes."
+        ),
+    )
 
     @property
     def is_revolver(self) -> bool:
         return self.tranche_type is TrancheType.REVOLVER
+
+    @property
+    def is_secured(self) -> bool:
+        if self.secured is not None:
+            return self.secured
+        return self.tranche_type in DEFAULT_SECURED_TRANCHE_TYPES
 
     @model_validator(mode="after")
     def _check_rate_fields(self) -> TrancheConfig:
@@ -125,7 +144,7 @@ class TrancheConfig(BaseModel):
 
 class CovenantMetric(StrEnum):
     TOTAL_NET_LEVERAGE = "total_net_leverage"
-    SENIOR_NET_LEVERAGE = "senior_net_leverage"
+    SECURED_NET_LEVERAGE = "secured_net_leverage"
     INTEREST_COVERAGE = "interest_coverage"
     FCCR = "fccr"
 
@@ -237,7 +256,7 @@ class DecisionVariableConfig(BaseModel):
 
 class LeverageBasis(StrEnum):
     TOTAL = "total_leverage"
-    SENIOR = "senior_leverage"
+    SECURED = "secured_leverage"
 
 
 class TranchePricingConfig(BaseModel):
@@ -261,10 +280,17 @@ class PricingGridConfig(BaseModel):
 
 
 class DeterministicConstraintsConfig(BaseModel):
-    """At-close constraints, each optional (None = unconstrained)."""
+    """At-close constraints, each optional (None = unconstrained).
+
+    extra="forbid": this model previously had a `max_senior_leverage` field,
+    renamed to `max_secured_leverage`. A leftover old key should raise a
+    clear error rather than silently being ignored (pydantic's default
+    behavior for unrecognized fields)."""
+
+    model_config = ConfigDict(extra="forbid")
 
     max_total_leverage: float | None = Field(default=None, gt=0)
-    max_senior_leverage: float | None = Field(default=None, gt=0)
+    max_secured_leverage: float | None = Field(default=None, gt=0)
     min_equity_pct_of_sources: float | None = Field(default=None, ge=0, le=1)
     min_interest_coverage_at_close: float | None = Field(default=None, gt=0)
 
@@ -309,6 +335,37 @@ class SearchConfig(BaseModel):
     grid_points_per_dimension: int = Field(default=15, gt=1)
     refine: bool = True
     refine_grid_points_per_dimension: int = Field(default=9, gt=1)
+    max_confirmation_fallback_attempts: int = Field(
+        default=5,
+        ge=0,
+        description=(
+            "If the recommended structure fails its constraints on the larger "
+            "confirmation sample, try up to this many of the next-best feasible "
+            "(on the search sample) candidates, in objective order, until one "
+            "also passes confirmation."
+        ),
+    )
+
+
+class ToleranceConfig(BaseModel):
+    """How close to a limit counts as 'binding' for reporting purposes.
+    Probability-type constraints (breach/shortfall/loss-of-capital) use an
+    absolute tolerance in percentage points, since a 2pp gap means something
+    very different at a 5% limit than at a 50% one; leverage/coverage/equity%
+    constraints and decision-variable bounds use a relative tolerance."""
+
+    probability_tolerance_pp: float = Field(default=2.0, ge=0)
+    relative_tolerance_pct: float = Field(default=5.0, ge=0)
+
+
+class RelaxationConfig(BaseModel):
+    """How much to loosen a binding constraint or bound when computing the
+    relaxation sensitivity ("shadow price") table."""
+
+    probability_relax_pp: float = Field(default=2.0, ge=0)
+    leverage_relax_turns: float = Field(default=0.5, ge=0)
+    equity_pct_relax_pp: float = Field(default=5.0, ge=0)
+    coverage_relax_turns: float = Field(default=0.25, ge=0)
 
 
 class OptimizerConfig(BaseModel):
@@ -318,6 +375,8 @@ class OptimizerConfig(BaseModel):
     stochastic_constraints: StochasticConstraintsConfig = StochasticConstraintsConfig()
     objective: ObjectiveConfig = ObjectiveConfig()
     search: SearchConfig = SearchConfig()
+    tolerances: ToleranceConfig = ToleranceConfig()
+    relaxation: RelaxationConfig = RelaxationConfig()
 
     @model_validator(mode="after")
     def _check_decision_variables(self) -> OptimizerConfig:

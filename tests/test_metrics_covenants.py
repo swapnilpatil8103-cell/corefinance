@@ -21,8 +21,7 @@ from corefin.metrics.covenants import (
 from corefin.metrics.credit_metrics import (
     CreditMetrics,
     compute_credit_metrics,
-    is_senior,
-    senior_debt_balance,
+    secured_debt_balance,
 )
 from corefin.scenarios.generator import deterministic_drivers
 from corefin.statements.corporate_model import run_corporate_model_with_debt
@@ -47,13 +46,36 @@ def _run(n_periods=6):
     return config, timeline, result
 
 
-def test_is_senior_classification():
+def test_is_secured_classification():
     config, *_ = _run()
-    senior_names = {t.name for t in config.tranches if is_senior(t)}
-    assert senior_names == {"Revolver", "TLB", "Notes"}
+    # Revolver and TLB are secured by type default; SeniorNotes is not
+    # (senior notes are typically unsecured in real LBOs).
+    secured_names = {t.name for t in config.tranches if t.is_secured}
+    assert secured_names == {"Revolver", "TLB"}
 
 
-def test_senior_debt_excludes_subordinated_pik():
+def test_secured_field_override():
+    tranche = TrancheConfig(
+        name="TLB",
+        tranche_type=TrancheType.TERM_LOAN_B,
+        size_mm=100.0,
+        rate_type=RateType.FLOATING,
+        spread=0.05,
+        secured=False,
+    )
+    assert tranche.is_secured is False
+    notes = TrancheConfig(
+        name="Notes",
+        tranche_type=TrancheType.SENIOR_NOTES,
+        size_mm=100.0,
+        rate_type=RateType.FIXED,
+        fixed_rate=0.08,
+        secured=True,
+    )
+    assert notes.is_secured is True
+
+
+def test_secured_debt_excludes_unsecured_tranches():
     data = debt_config_dict(n_periods=3)
     data["tranches"].append(
         {
@@ -76,9 +98,9 @@ def test_senior_debt_excludes_subordinated_pik():
         timeline,
         drivers,
     )
-    senior_debt = senior_debt_balance(result.debt_schedule, config.tranches)
+    secured_debt = secured_debt_balance(result.debt_schedule, config.tranches)
     total_debt = result.balance_sheet.total_debt
-    assert np.all(senior_debt < total_debt)
+    assert np.all(secured_debt < total_debt)
 
 
 def test_credit_metrics_hand_check():
@@ -197,7 +219,7 @@ def _synthetic_metrics(shape: tuple[int, int], value: float = 3.0) -> CreditMetr
     filled = np.full(shape, value)
     return CreditMetrics(
         total_net_leverage=filled,
-        senior_net_leverage=filled,
+        secured_net_leverage=filled,
         interest_coverage=filled,
         fccr=filled,
         cumulative_debt_paydown=np.zeros(shape),
@@ -267,7 +289,7 @@ def test_springing_covenant_breaches_only_when_tested_and_over_threshold():
     leverage = np.array([[10.0, 10.0, 2.0]])  # would breach a 5x cap except in period 2
     metrics = CreditMetrics(
         total_net_leverage=leverage,
-        senior_net_leverage=leverage,
+        secured_net_leverage=leverage,
         interest_coverage=np.full(shape, 3.0),
         fccr=np.full(shape, 3.0),
         cumulative_debt_paydown=np.zeros(shape),

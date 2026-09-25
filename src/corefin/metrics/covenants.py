@@ -21,7 +21,9 @@ from corefin.debt.circularity import DebtScheduleResult
 from corefin.metrics.credit_metrics import CreditMetrics
 from corefin.timeline import Timeline
 
-MAXIMUM_METRICS = frozenset({CovenantMetric.TOTAL_NET_LEVERAGE, CovenantMetric.SENIOR_NET_LEVERAGE})
+MAXIMUM_METRICS = frozenset(
+    {CovenantMetric.TOTAL_NET_LEVERAGE, CovenantMetric.SECURED_NET_LEVERAGE}
+)
 MINIMUM_METRICS = frozenset({CovenantMetric.INTEREST_COVERAGE, CovenantMetric.FCCR})
 
 DEFAULT_MIN_HEADROOM_PCT = 0.15
@@ -40,7 +42,7 @@ class CovenantResult:
 def _metric_value(metric: CovenantMetric, metrics: CreditMetrics) -> np.ndarray:
     return {
         CovenantMetric.TOTAL_NET_LEVERAGE: metrics.total_net_leverage,
-        CovenantMetric.SENIOR_NET_LEVERAGE: metrics.senior_net_leverage,
+        CovenantMetric.SECURED_NET_LEVERAGE: metrics.secured_net_leverage,
         CovenantMetric.INTEREST_COVERAGE: metrics.interest_coverage,
         CovenantMetric.FCCR: metrics.fccr,
     }[metric]

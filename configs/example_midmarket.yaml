@@ -116,24 +116,30 @@ waterfall:
 # deal.
 optimizer:
   decision_variables:
-    # min/max are turns of entry EBITDA (100mm); bounds bracket the example's
-    # own 3.75x/1.75x sizing so `corefin optimize` explores both directions.
+    # min/max are turns of entry EBITDA (100mm). SeniorNotes' upper bound was
+    # previously 3.0x, which turned out to be an arbitrary grid limit (not an
+    # economic one) that the optimizer kept hitting -- widened to 5.0x, same
+    # as TLB, so the real constraints below do the limiting instead.
     - tranche_name: TLB
       min_multiple: 2.0
       max_multiple: 5.0
     - tranche_name: SeniorNotes
       min_multiple: 0.5
-      max_multiple: 3.0
+      max_multiple: 5.0
 
   pricing:
-    # Illustrative only: spread/fee step-ups per turn of TOTAL closing
-    # leverage above each threshold, roughly bracketing the example's 5.5x
-    # closing leverage -- not sourced from any real lender or market data.
+    # Illustrative only: spread/fee step-ups per turn of leverage above each
+    # threshold, roughly bracketing the example's 5.5x closing leverage --
+    # not sourced from any real lender or market data. TLB is secured (term
+    # loan B), so its pricing is driven by SECURED leverage (TLB + drawn
+    # revolver); Senior Notes are unsecured by default, priced off TOTAL
+    # leverage instead, matching how the two tranches are actually priced in
+    # a real LBO.
     tranches:
       - tranche_name: TLB
-        basis: total_leverage
+        basis: secured_leverage
         leverage_threshold: 5.0
-        spread_bps_per_turn: 0.0075 # +75bps of spread per turn above 5.0x
+        spread_bps_per_turn: 0.0075 # +75bps of spread per turn above 5.0x secured
         upfront_fee_pct_per_turn: 0.0025
         market_capacity_mm: 500.0 # illustrative TLB market depth cap
       - tranche_name: SeniorNotes
@@ -146,8 +152,14 @@ optimizer:
 
   deterministic_constraints:
     max_total_leverage: 6.5
-    max_senior_leverage: 6.5 # all tranches here are senior; see is_senior()
-    min_equity_pct_of_sources: 0.25
+    # Secured (TLB + drawn revolver) leverage cap, distinct from total
+    # leverage now that Senior Notes are unsecured by default. TLB alone can
+    # reach 5.0x per its own decision-variable bound, so 5.25x caps secured
+    # leverage just above that -- illustrative, not market data.
+    max_secured_leverage: 5.25
+    # Sponsor equity has typically run ~40-50% of sources in recent years
+    # (illustrative, not deal-specific); raised from 25% accordingly.
+    min_equity_pct_of_sources: 0.40
     min_interest_coverage_at_close: 1.5 # matches the Min Interest Coverage covenant
 
   stochastic_constraints:

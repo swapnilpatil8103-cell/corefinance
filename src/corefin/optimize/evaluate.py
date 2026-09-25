@@ -102,7 +102,7 @@ def evaluate_candidate(
     equity_pct = sau.sponsor_equity_mm / sau.total_uses_mm
     constraint_values: dict[str, float] = {
         "total_leverage": lev.total_leverage,
-        "senior_leverage": lev.senior_leverage,
+        "secured_leverage": lev.secured_leverage,
         "equity_pct_of_sources": equity_pct,
     }
 
@@ -121,11 +121,11 @@ def evaluate_candidate(
         f"total leverage {lev.total_leverage:.2f}x exceeds max {(dc.max_total_leverage or 0):.2f}x",
     )
     _check_max(
-        "max_senior_leverage",
-        dc.max_senior_leverage,
-        lev.senior_leverage,
-        f"senior leverage {lev.senior_leverage:.2f}x exceeds "
-        f"max {(dc.max_senior_leverage or 0):.2f}x",
+        "max_secured_leverage",
+        dc.max_secured_leverage,
+        lev.secured_leverage,
+        f"secured leverage {lev.secured_leverage:.2f}x exceeds "
+        f"max {(dc.max_secured_leverage or 0):.2f}x",
     )
     _check_min(
         "min_equity_pct_of_sources",
@@ -241,56 +241,3 @@ def evaluate_candidate(
         exit_result=exit_result,
         objective_value=objective_value,
     )
-
-
-def binding_constraints(
-    evaluation: CandidateEvaluation, root_config: RootConfig, tolerance: float = 0.02
-) -> list[str]:
-    """Names of configured constraints within `tolerance` (relative to the
-    limit) of binding -- violated constraints always count as binding."""
-    dc = root_config.optimizer.deterministic_constraints
-    sc = root_config.optimizer.stochastic_constraints
-    cv = evaluation.constraint_values
-    checks = [
-        ("max_total_leverage", dc.max_total_leverage, cv.get("total_leverage"), "max"),
-        ("max_senior_leverage", dc.max_senior_leverage, cv.get("senior_leverage"), "max"),
-        (
-            "min_equity_pct_of_sources",
-            dc.min_equity_pct_of_sources,
-            cv.get("equity_pct_of_sources"),
-            "min",
-        ),
-        (
-            "min_interest_coverage_at_close",
-            dc.min_interest_coverage_at_close,
-            cv.get("interest_coverage_at_close"),
-            "min",
-        ),
-        (
-            "max_covenant_breach_probability",
-            sc.max_covenant_breach_probability,
-            cv.get("covenant_breach_probability"),
-            "max",
-        ),
-        (
-            "max_revolver_shortfall_probability",
-            sc.max_revolver_shortfall_probability,
-            cv.get("revolver_shortfall_probability"),
-            "max",
-        ),
-        (
-            "max_loss_of_capital_probability",
-            sc.max_loss_of_capital_probability,
-            cv.get("loss_of_capital_probability"),
-            "max",
-        ),
-    ]
-    binding = []
-    for name, limit, actual, kind in checks:
-        if limit is None or actual is None:
-            continue
-        denom = abs(limit) if limit != 0 else 1.0
-        gap = (limit - actual) / denom if kind == "max" else (actual - limit) / denom
-        if gap <= tolerance:
-            binding.append(name)
-    return binding

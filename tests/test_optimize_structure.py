@@ -66,7 +66,9 @@ def test_closing_leverage_excludes_revolver_and_matches_hand_calc():
     sized = size_tranches(config.tranches, {"TLB": 3.0, "Notes": 1.0}, entry_ebitda_mm)
     leverage = compute_closing_leverage(sized, entry_ebitda_mm)
     assert leverage.total_leverage == pytest.approx(4.0)
-    assert leverage.senior_leverage == pytest.approx(4.0)  # Notes is senior in this fixture
+    # Notes (senior_notes type) is unsecured by default -- secured leverage
+    # is TLB alone here.
+    assert leverage.secured_leverage == pytest.approx(3.0)
     assert leverage.total_debt_sources_mm == pytest.approx(4.0 * entry_ebitda_mm)
 
 

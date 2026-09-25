@@ -1,8 +1,11 @@
+import dataclasses
+
 import numpy as np
 import pytest
 
 from corefin.assumptions.schema import RootConfig
-from corefin.optimize.evaluate import binding_constraints
+from corefin.optimize import search as search_module
+from corefin.optimize.evaluate import ConstraintViolation
 from corefin.optimize.search import (
     NoFeasibleStructureError,
     confirm,
@@ -137,6 +140,50 @@ def test_run_optimization_no_feasible_raises_clear_error():
         run_optimization(config, timeline)
 
 
+def test_confirmation_flags_and_falls_back_when_search_sample_pass_fails_confirmation(
+    monkeypatch,
+):
+    """A structure can look feasible on the smaller search sample and still
+    fail a stochastic constraint on the larger confirmation sample -- the
+    optimizer must notice (via `OptimizationResult.fallback`) and recommend
+    the next-best structure that actually confirms, not silently keep the
+    one that failed."""
+    config = RootConfig.model_validate(_optimizer_data(grid_points=4))
+    timeline = Timeline.annual(n_periods=6)
+
+    stochastic = generate_search_drivers(
+        config,
+        timeline,
+        config.optimizer.search.n_scenarios_search,
+        seed=config.optimizer.search.random_seed,
+    )
+    det = deterministic_drivers(config, timeline)
+    grid_result = grid_search(config, timeline, stochastic, det)
+    refinement = refine(config, grid_result, timeline, stochastic, det)
+    original_best_values = refinement.best.candidate.decision_values
+
+    real_confirm = search_module.confirm
+
+    def fake_confirm(root_config, decision_values, timeline):
+        evaluation = real_confirm(root_config, decision_values, timeline)
+        if decision_values == original_best_values:
+            forced_violation = ConstraintViolation(
+                "max_loss_of_capital_probability",
+                "forced failure to simulate a search-sample false pass",
+            )
+            return dataclasses.replace(evaluation, feasible=False, violations=[forced_violation])
+        return evaluation
+
+    monkeypatch.setattr(search_module, "confirm", fake_confirm)
+
+    result = search_module.run_optimization(config, timeline)
+
+    assert result.fallback is not None
+    assert result.fallback.original_decision_values == original_best_values
+    assert result.recommended.candidate.decision_values != original_best_values
+    assert result.confirmation.feasible
+
+
 def test_reproducibility_same_seed_gives_same_answer():
     config = RootConfig.model_validate(_optimizer_data(grid_points=4))
     timeline = Timeline.annual(n_periods=6)
@@ -155,11 +202,5 @@ def test_reproducibility_same_seed_gives_same_answer():
     )
 
 
-def test_binding_constraints_available_for_recommended_structure():
-    data = _optimizer_data(grid_points=5)
-    data["optimizer"]["deterministic_constraints"] = {"max_total_leverage": 3.5}
-    config = RootConfig.model_validate(data)
-    timeline = Timeline.annual(n_periods=6)
-    result = run_optimization(config, timeline)
-    names = binding_constraints(result.confirmation, config)
-    assert isinstance(names, list)
+# Binding-constraint reporting moved to optimize/diagnostics.py -- see
+# tests/test_optimize_diagnostics.py.

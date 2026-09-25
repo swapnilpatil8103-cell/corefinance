@@ -11,13 +11,14 @@ import pandas as pd
 
 from corefin.io.excel_export import write_scenario_sheets
 from corefin.metrics.credit_metrics import CreditMetrics
+from corefin.optimize.diagnostics import OptimizationDiagnostics
 from corefin.optimize.evaluate import CandidateEvaluation
 from corefin.optimize.search import OptimizationResult
 from corefin.timeline import Timeline
 
 _RISK_COLUMNS = (
     "total_leverage",
-    "senior_leverage",
+    "secured_leverage",
     "equity_pct_of_sources",
     "interest_coverage_at_close",
     "covenant_breach_probability",
@@ -70,10 +71,62 @@ def _efficient_frontier_frame(optimization_result: OptimizationResult) -> pd.Dat
     return frame
 
 
+def _binding_frame(diagnostics: OptimizationDiagnostics) -> pd.DataFrame:
+    binding_rows = [
+        {
+            "Name": item.name,
+            "Kind": item.kind,
+            "Direction": item.direction,
+            "Limit": item.limit,
+            "Actual": item.actual,
+            "Gap": item.gap,
+        }
+        for item in diagnostics.binding
+    ]
+    limiting_rows = [
+        {
+            "Name": summary.name,
+            "Blocked Neighbor Count": summary.count,
+            "Example": summary.example_message,
+        }
+        for summary in diagnostics.limiting_constraints
+    ]
+    binding_frame = pd.DataFrame(
+        binding_rows, columns=["Name", "Kind", "Direction", "Limit", "Actual", "Gap"]
+    )
+    limiting_frame = pd.DataFrame(
+        limiting_rows, columns=["Name", "Blocked Neighbor Count", "Example"]
+    )
+    # Two small tables stacked in one sheet, with a blank row and a header
+    # row between them.
+    spacer = pd.DataFrame([{}])
+    header = pd.DataFrame([{"Name": "Limiting constraints from adjacent infeasible candidates"}])
+    return pd.concat([binding_frame, spacer, header, limiting_frame], ignore_index=True)
+
+
+def _relaxation_frame(diagnostics: OptimizationDiagnostics) -> pd.DataFrame:
+    rows = [
+        {
+            "Item": r.item_name,
+            "Kind": r.kind,
+            "Original Limit": r.original_limit,
+            "Relaxed Limit": r.relaxed_limit,
+            "Objective Before": r.objective_before,
+            "Objective After": r.objective_after,
+            "Delta Objective": r.delta_objective,
+            "Leverage Before": r.leverage_before,
+            "Leverage After": r.leverage_after,
+        }
+        for r in diagnostics.relaxation
+    ]
+    return pd.DataFrame(rows)
+
+
 def export_optimization_to_excel(
     path: str,
     timeline: Timeline,
     optimization_result: OptimizationResult,
+    diagnostics: OptimizationDiagnostics,
     recommended_credit_metrics: CreditMetrics,
 ) -> None:
     confirmation = optimization_result.confirmation
@@ -83,6 +136,10 @@ def export_optimization_to_excel(
         )
         _efficient_frontier_frame(optimization_result).to_excel(
             writer, sheet_name="Efficient Frontier", index=False
+        )
+        _binding_frame(diagnostics).to_excel(writer, sheet_name="Binding & Limiting", index=False)
+        _relaxation_frame(diagnostics).to_excel(
+            writer, sheet_name="Relaxation Sensitivity", index=False
         )
         write_scenario_sheets(
             writer,

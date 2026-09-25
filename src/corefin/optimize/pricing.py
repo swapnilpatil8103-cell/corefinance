@@ -1,7 +1,7 @@
 """Leverage-dependent pricing and market capacity limits.
 
 Pricing is a linear ramp: above `leverage_threshold` turns of (total or
-senior) closing leverage, spread/fixed rate and fees step up by a fixed
+secured) closing leverage, spread/fixed rate and fees step up by a fixed
 amount per turn. Applied after sizing (`structure.py`), since pricing
 depends on the resulting leverage but sizing/leverage don't depend on
 pricing -- there's no circularity to solve here, just a one-way dependency.
@@ -30,7 +30,7 @@ from corefin.transaction.sources_uses import compute_sources_and_uses
 
 
 def _basis_leverage(basis: LeverageBasis, leverage: ClosingLeverage) -> float:
-    return leverage.total_leverage if basis is LeverageBasis.TOTAL else leverage.senior_leverage
+    return leverage.total_leverage if basis is LeverageBasis.TOTAL else leverage.secured_leverage
 
 
 def _priced_tranche(

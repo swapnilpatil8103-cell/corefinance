@@ -62,7 +62,9 @@ def test_optimize_command_against_example_config(tmp_path):
     )
     assert result.exit_code == 0, result.stdout
     assert "Recommended structure" in result.stdout
-    assert "Binding constraints" in result.stdout
+    assert "Binding at the optimum" in result.stdout
+    assert "What's limiting adjacent" in result.stdout
+    assert "Relaxation sensitivity" in result.stdout
     assert "Comparison vs input config structure" in result.stdout
     assert output_path.exists()
     assert heatmap_path.exists()

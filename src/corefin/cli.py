@@ -17,11 +17,13 @@ from corefin.metrics.covenants import (
     low_headroom_warnings,
 )
 from corefin.metrics.credit_metrics import compute_credit_metrics
-from corefin.optimize.evaluate import binding_constraints, evaluate_candidate
+from corefin.optimize.diagnostics import compute_diagnostics
+from corefin.optimize.evaluate import evaluate_candidate
 from corefin.optimize.excel_export import export_optimization_to_excel
-from corefin.optimize.heatmap import render_objective_heatmap
+from corefin.optimize.heatmap import render_leverage_frontier, render_objective_heatmap
 from corefin.optimize.pricing import build_priced_structure
 from corefin.optimize.search import (
+    NoConfirmedStructureError,
     NoFeasibleStructureError,
     generate_search_drivers,
     run_optimization,
@@ -228,6 +230,11 @@ def optimize(
     heatmap: Path = typer.Option(
         Path("heatmap.png"), "--heatmap", help="Where to export the objective heatmap PNG."
     ),
+    leverage_frontier: Path = typer.Option(
+        Path("leverage_frontier.png"),
+        "--leverage-frontier",
+        help="Where to export the best-objective-by-leverage PNG.",
+    ),
 ) -> None:
     """Search for the debt structure that maximizes sponsor returns subject to
     the config's financing constraints (config must have an `optimizer:`
@@ -245,14 +252,17 @@ def optimize(
 
     try:
         result = run_optimization(root_config, timeline)
-    except NoFeasibleStructureError as exc:
+    except (NoFeasibleStructureError, NoConfirmedStructureError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
+
+    diagnostics = compute_diagnostics(root_config, timeline, result)
 
     optimizer = root_config.optimizer
     confirmation = result.confirmation
     candidate = confirmation.candidate
     cv = confirmation.constraint_values
+    search_cv = result.recommended.constraint_values
 
     recommended_credit_metrics = compute_credit_metrics(
         confirmation.result.debt_schedule,
@@ -276,13 +286,21 @@ def optimize(
         )
     typer.echo("")
 
+    if result.fallback is not None:
+        status = "succeeded" if result.fallback.succeeded else "FAILED"
+        typer.echo(
+            f"NOTE: the original search recommendation failed on confirmation; fell back "
+            f"to the next-best candidate after {result.fallback.attempts} attempt(s) ({status})."
+        )
+        typer.echo("")
+
     typer.echo("Recommended structure:")
     for name, multiple in candidate.decision_values.items():
         size_mm = multiple * candidate.entry_ebitda_mm
         typer.echo(f"  {name}: {size_mm:>8.1f}mm  ({multiple:.2f}x EBITDA)")
     typer.echo(
         f"  Total leverage: {candidate.leverage.total_leverage:.2f}x   "
-        f"Senior leverage: {candidate.leverage.senior_leverage:.2f}x"
+        f"Secured leverage: {candidate.leverage.secured_leverage:.2f}x"
     )
     equity_pct = (
         candidate.sources_and_uses.sponsor_equity_mm / candidate.sources_and_uses.total_uses_mm
@@ -311,21 +329,55 @@ def optimize(
         f"  IRR   mean={cv['mean_irr']:.1%}  median={cv['median_irr']:.1%}  p10={cv['p10_irr']:.1%}"
     )
     typer.echo(f"  MOIC  mean={cv['mean_moic']:.2f}x")
-    typer.echo(f"  Covenant breach probability:     {cv['covenant_breach_probability']:.1%}")
-    typer.echo(f"  Revolver shortfall probability:  {cv['revolver_shortfall_probability']:.1%}")
-    typer.echo(f"  Loss-of-capital probability:     {cv['loss_of_capital_probability']:.1%}")
     typer.echo("")
 
-    binding = binding_constraints(confirmation, root_config)
-    typer.echo(f"Binding constraints: {', '.join(binding) if binding else 'none'}")
+    typer.echo("Stochastic constraints, search sample -> confirmation sample:")
+    for label, key in (
+        ("Covenant breach probability", "covenant_breach_probability"),
+        ("Revolver shortfall probability", "revolver_shortfall_probability"),
+        ("Loss-of-capital probability", "loss_of_capital_probability"),
+    ):
+        typer.echo(f"  {label + ':':<32}{search_cv.get(key, float('nan')):>7.1%} -> {cv[key]:.1%}")
+    typer.echo("")
+
     if not confirmation.feasible:
-        typer.echo(
-            "WARNING: the confirmation run (larger sample) found this structure infeasible "
-            "-- the search sample missed this:"
-        )
+        typer.echo("WARNING: the confirmation run (larger sample) found this structure infeasible:")
         for v in confirmation.violations:
             typer.echo(f"  - {v.message}")
+        typer.echo("")
+
+    if diagnostics.binding:
+        typer.echo("Binding at the optimum:")
+        for item in diagnostics.binding:
+            typer.echo(
+                f"  [{item.kind:<10}] {item.name}: {item.actual:.3f} vs {item.direction} "
+                f"limit {item.limit:.3f} (gap {item.gap:.2f})"
+            )
+    else:
+        typer.echo("Binding at the optimum: none within tolerance")
     typer.echo("")
+
+    if diagnostics.limiting_constraints:
+        typer.echo("What's limiting adjacent (untried-better) candidates:")
+        for summary in diagnostics.limiting_constraints:
+            typer.echo(f"  {summary.name}: blocked {summary.count} neighboring candidate(s)")
+            typer.echo(f"    e.g. {summary.example_message}")
+    else:
+        typer.echo("What's limiting adjacent candidates: no infeasible neighbors found")
+    typer.echo("")
+
+    if diagnostics.relaxation:
+        typer.echo("Relaxation sensitivity (loosen one item, re-search, same random numbers):")
+        for r in diagnostics.relaxation:
+            delta_str = (
+                f"{r.delta_objective:+.2%}" if r.delta_objective == r.delta_objective else "n/a"
+            )
+            leverage_str = f"{r.leverage_before:.2f}x -> {r.leverage_after:.2f}x"
+            typer.echo(
+                f"  {r.item_name} [{r.kind}]: {r.original_limit:.2f} -> {r.relaxed_limit:.2f}   "
+                f"objective {delta_str}   leverage {leverage_str}"
+            )
+        typer.echo("")
 
     input_decision_values = {
         name: next(t for t in root_config.tranches if t.name == name).size_mm
@@ -357,11 +409,16 @@ def optimize(
     typer.echo(f"  {'Mean MOIC':<20}{input_moic:>11.2f}x{cv['mean_moic']:>13.2f}x")
     typer.echo("")
 
-    export_optimization_to_excel(str(output), timeline, result, recommended_credit_metrics)
+    export_optimization_to_excel(
+        str(output), timeline, result, diagnostics, recommended_credit_metrics
+    )
     typer.echo(f"Exported grid/frontier/recommended structure to {output}")
 
     render_objective_heatmap(result, str(heatmap))
     typer.echo(f"Exported objective heatmap to {heatmap}")
+
+    render_leverage_frontier(result, str(leverage_frontier))
+    typer.echo(f"Exported leverage frontier to {leverage_frontier}")
 
 
 if __name__ == "__main__":

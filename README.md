@@ -219,14 +219,37 @@ config's own `opening_balance_sheet`. A dedicated test
 `configs/example_midmarket.yaml`'s hand-entered opening balance sheet
 exactly, goodwill included.
 
+### Secured vs unsecured debt
+
+Every tranche resolves an `is_secured` property (`TrancheConfig.secured` in
+`assumptions/schema.py`): `None` (the default) falls back to a type-based
+default — revolver, term loan A and term loan B are secured; senior
+notes, subordinated and PIK tranches are not, matching how these are
+typically structured in a real LBO — and an explicit `secured: true/false`
+in config overrides that default for a specific tranche (e.g. an
+unsecured TLB or secured notes tranche). "Secured leverage" (the tranches
+where `is_secured` is true, excluding the revolver, which is excluded
+from closing leverage entirely — undrawn at close by convention) replaced
+what used to be called "senior leverage" everywhere: `ClosingLeverage.secured_leverage`,
+the `max_secured_leverage` constraint, `CreditMetrics.secured_net_leverage`,
+and the pricing grid's `secured_leverage` basis option. **A config using
+the old `max_senior_leverage` key or `basis: senior_leverage` is rejected
+with a clear pydantic error** (`DeterministicConstraintsConfig` and the
+pricing tranche model both set `extra="forbid"`) rather than silently
+ignored — there's no ambiguity-tolerant deprecation path for a field
+rename that changes which tranches are counted.
+
 ### Leverage-dependent pricing and market capacity
 
 `optimizer.pricing` is a linear ramp, per tranche: above a leverage
-threshold (total or senior closing leverage — gross of cash, computed
-once at close, distinct from the period-by-period *net* leverage the
-covenant system tracks), spread/fixed rate and fees step up by a fixed
-amount per turn. A tranche not listed in `pricing.tranches` is never
-repriced. `market_capacity_mm` (per tranche) and `pricing.total_market_capacity_mm`
+threshold (`total_leverage` or `secured_leverage` — gross of cash,
+computed once at close, distinct from the period-by-period *net*
+leverage the covenant system tracks), spread/fixed rate and fees step up
+by a fixed amount per turn. In `configs/example_midmarket.yaml`, the TLB
+(secured) is priced off secured leverage and the notes (unsecured) off
+total leverage, matching how the two are actually priced in a real deal.
+A tranche not listed in `pricing.tranches` is never repriced.
+`market_capacity_mm` (per tranche) and `pricing.total_market_capacity_mm`
 are hard limits — debt simply isn't available above them, so those
 candidates are marked infeasible before the (expensive) model even runs.
 **The pricing grid and capacity limits in `configs/example_midmarket.yaml`
@@ -236,7 +259,7 @@ market data.**
 ### Constraints and objective
 
 Each constraint is optional (unset = unconstrained). Deterministic, at
-close: `max_total_leverage`, `max_senior_leverage`,
+close: `max_total_leverage`, `max_secured_leverage`,
 `min_equity_pct_of_sources`, `min_interest_coverage_at_close` (the last
 evaluated on a deterministic, zero-vol run — same convention as covenant
 headroom). Stochastic, across the Monte Carlo scenarios:
@@ -249,8 +272,62 @@ exceeding total uses) is always infeasible, regardless of configured
 constraints — not a fundable structure. Every other constraint still runs
 the model and records the actual value even when violated, so the grid
 export shows near-misses, not just pass/fail.
-`optimize/evaluate.binding_constraints` reports which configured limits
-are within 2% (relative) of binding for a given evaluation.
+
+Stochastic constraints are checked on the search sample
+(`n_scenarios_search`, default 2,000) during the grid search, but the
+final confirmation run uses a larger sample (`n_scenarios_confirm`,
+default 10,000) — a structure that looked feasible on the smaller sample
+can fail a stochastic constraint the larger sample actually catches. The
+CLI prints each stochastic constraint's search-sample and
+confirmation-sample value side by side so a search/confirm gap is visible
+even when it doesn't flip feasibility. When the confirmation run *does*
+find a violation, `run_optimization` falls back automatically: it re-runs
+`confirm` against the next-best feasible-on-search candidates (ranked by
+objective, up to `search.max_confirmation_fallback_attempts`, default 5)
+until one actually confirms, and reports the fallback in
+`OptimizationResult.fallback` (attempts made, whether it succeeded, and
+the original recommendation that failed) — surfaced as a CLI `NOTE:` line.
+If every attempt fails, `NoConfirmedStructureError` is raised rather than
+silently returning a structure nothing has actually confirmed.
+
+### Binding-constraint diagnostics
+
+`optimize/diagnostics.py` answers "what's actually stopping the optimizer
+from adding more debt" at three levels, each more informative (and more
+expensive) than the last:
+
+1. **`binding_items`** — is the recommended structure's *own* value close
+   to one of its configured limits, or close to a decision-variable
+   bound? Tolerances are configurable per constraint type
+   (`optimizer.tolerances`): probabilities use an absolute
+   percentage-point tolerance (`probability_tolerance_pp`, default 2pp —
+   a relative tolerance is too tight near small probabilities, e.g. a
+   ~9.6% breach probability against a 10% limit is clearly binding but
+   only ~4% away in relative terms), everything else (leverage, coverage,
+   equity %) uses a relative tolerance (`relative_tolerance_pct`, default
+   5%). A decision variable within one refinement step of its configured
+   min/max is reported separately, labeled `[bound]` rather than
+   `[constraint]` — "the grid was too narrow" and "an economic limit was
+   hit" are different problems with different fixes.
+2. **`limiting_constraints_from_neighbors`** — among the grid/refinement
+   points immediately adjacent to the recommendation, which constraints
+   made the *infeasible* ones fail, and how often? This is the direct
+   answer to "what stops us adding more debt": not just what's
+   numerically close to binding at the optimum, but what actually
+   excluded the neighbors that would have had a better objective (this
+   can surface hard-infeasibility reasons like `market_capacity` too,
+   which have no single config field to relax — those show up here but
+   are skipped by the relaxation table below).
+3. **`relaxation_sensitivity`** — for each binding/limiting item, actually
+   loosen it by a configured amount (`optimizer.relaxation`:
+   `probability_relax_pp`, `leverage_relax_turns`, `equity_pct_relax_pp`,
+   `coverage_relax_turns`) and re-run a full grid search on the *same*
+   common random numbers, reporting the objective and leverage delta — a
+   shadow-price table: which constraint, if loosened, would actually
+   help, and by how much?
+
+`compute_diagnostics` runs all three and is what the CLI and Excel export
+both read from.
 
 The objective (`optimizer.objective.kind`) is mean, median or a percentile
 of IRR, or a mean-downside blend: `mean_irr - downside_lambda *
@@ -289,29 +366,55 @@ The problem is low-dimensional (2-4 variables) and the objective is noisy
 
 `search.n_scenarios_search` (default 2,000) drives the search; the chosen
 structure is then re-run at `search.n_scenarios_confirm` (default 10,000)
-for a more robust final read — if the confirmation run finds a constraint
-violation the smaller search sample missed, that's a genuine fragility
-signal, and the CLI prints a warning rather than hiding it.
-`run_optimization` orchestrates search → refine → confirm end to end; the
-same seed always gives the same answer.
+for a more robust final read (see the search/confirm fallback behavior
+above). `run_optimization` orchestrates search → refine → confirm end to
+end; the same seed always gives the same answer.
 
 ### Outputs
 
 `corefin optimize` prints the recommended structure (tranche sizes in $mm
 and x EBITDA, priced spread/fixed rate, equity check and %), the
-objective and IRR/MOIC distribution, breach/shortfall/loss probabilities,
-binding constraints, and a side-by-side comparison against the input
-config's own structure (evaluated with the same common random numbers).
-It exports two files: `optimization.xlsx` (`--output`) with every
-evaluated candidate (`Grid Results`), the feasible subset sorted by
-return with the recommendation flagged (`Efficient Frontier`), and the
-recommended structure's full statements/debt schedule/credit metrics —
-the last of these produced by the exact same sheet-writing code as
-`corefin run`'s export (`io/excel_export.write_scenario_sheets`, factored
-out for reuse); and `heatmap.png` (`--heatmap`), a matplotlib PNG of the
-objective surface over the first two decision variables (any other
-decision variable held at the recommended value — a 2D profile slice),
-infeasible cells masked gray, and the recommendation marked with a star.
+objective and IRR/MOIC distribution, each stochastic constraint's
+search-sample and confirmation-sample value side by side, a fallback
+`NOTE:` line when the search-sample recommendation failed confirmation
+and a different structure was substituted, the three-level binding-constraint
+diagnostics (binding items, what's limiting adjacent candidates, and the
+relaxation sensitivity table), and a side-by-side comparison against the
+input config's own structure (evaluated with the same common random
+numbers).
+
+It exports three files:
+
+- `optimization.xlsx` (`--output`): every evaluated candidate (`Grid
+  Results`), the feasible subset sorted by return with the recommendation
+  flagged (`Efficient Frontier`), the recommended structure's full
+  statements/debt schedule/credit metrics (produced by the exact same
+  sheet-writing code as `corefin run`'s export —
+  `io/excel_export.write_scenario_sheets`, factored out for reuse), and
+  two new sheets: `Binding & Limiting` (the binding items and the
+  limiting-constraints-from-neighbors table) and `Relaxation Sensitivity`
+  (the shadow-price table).
+- `heatmap.png` (`--heatmap`): a matplotlib PNG of the objective surface
+  over the first two decision variables (any other decision variable held
+  at the recommended value — a 2D profile slice). The infeasible region is
+  colored by *which* constraint made each cell infeasible (with a legend),
+  not plain gray, so the shape of each constraint's boundary is visible
+  directly on the grid; the recommendation is marked with a star.
+- `leverage_frontier.png` (`--leverage-frontier`): the best objective
+  achievable at each level of total closing leverage seen in the
+  grid/refinement pool — a green line for leverage levels where a feasible
+  candidate was found, a red dashed tail for levels where every attempt
+  was infeasible (labeled along the curve with the constraint that blocked
+  the most candidates there), and the recommendation marked with a star.
+  Read left to right, this chart *is* the answer to "why not more debt":
+  returns keep rising with leverage (cheaper, more debt-funded capital
+  boosting equity returns, as long as the deal's return exceeds the cost
+  of that debt) right up until the red tail — the point past which no
+  candidate the search tried satisfied every constraint. That returns keep
+  rising with leverage until something binds is normal, expected LBO
+  behavior, not a sign the model is missing a limit; the result is driven
+  by the configured constraints and decision-variable bounds, not by the
+  pricing grid arbitrarily topping out.
 
 ## Where the bank model plugs in
 

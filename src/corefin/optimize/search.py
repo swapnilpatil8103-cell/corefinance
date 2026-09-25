@@ -26,6 +26,10 @@ class NoFeasibleStructureError(RuntimeError):
     pass
 
 
+class NoConfirmedStructureError(RuntimeError):
+    pass
+
+
 def generate_search_drivers(
     root_config: RootConfig, timeline: Timeline, n_scenarios: int, seed: int
 ) -> DriverSet:
@@ -206,11 +210,44 @@ def confirm(
 
 
 @dataclass(frozen=True)
+class FallbackInfo:
+    """Populated only when the recommended structure failed its constraints
+    on the confirmation run and a fallback was attempted."""
+
+    succeeded: bool
+    attempts: int
+    original_decision_values: dict[str, float]
+
+
+@dataclass(frozen=True)
 class OptimizationResult:
     grid_result: GridSearchResult
     refinement_result: RefinementResult | None
     recommended: CandidateEvaluation
     confirmation: CandidateEvaluation
+    fallback: FallbackInfo | None
+    search_stochastic_drivers: DriverSet
+    search_deterministic_drivers: DriverSet
+
+
+def _rank_feasible_candidates(
+    grid_result: GridSearchResult, refinement_result: RefinementResult | None
+) -> list[CandidateEvaluation]:
+    """Every distinct feasible (on the search sample) candidate seen during
+    the grid search and refinement, best objective first."""
+    pool = list(grid_result.evaluations)
+    if refinement_result is not None:
+        pool += refinement_result.evaluations
+    feasible = [e for e in pool if e.feasible]
+    seen: set[tuple[tuple[str, float], ...]] = set()
+    ranked: list[CandidateEvaluation] = []
+    for e in sorted(feasible, key=lambda e: -e.objective_value):
+        key = tuple(sorted(e.candidate.decision_values.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        ranked.append(e)
+    return ranked
 
 
 def run_optimization(root_config: RootConfig, timeline: Timeline) -> OptimizationResult:
@@ -243,10 +280,44 @@ def run_optimization(root_config: RootConfig, timeline: Timeline) -> Optimizatio
         recommended = grid_result.best_feasible
 
     confirmation = confirm(root_config, recommended.candidate.decision_values, timeline)
+    fallback: FallbackInfo | None = None
+
+    if not confirmation.feasible:
+        original_decision_values = recommended.candidate.decision_values
+        ranked = _rank_feasible_candidates(grid_result, refinement_result)
+        alternatives = [
+            e for e in ranked if e.candidate.decision_values != original_decision_values
+        ][: optimizer.search.max_confirmation_fallback_attempts]
+
+        attempts = 1  # the original `recommended` already tried above
+        succeeded = False
+        for alternative in alternatives:
+            attempts += 1
+            trial = confirm(root_config, alternative.candidate.decision_values, timeline)
+            if trial.feasible:
+                confirmation = trial
+                recommended = alternative
+                succeeded = True
+                break
+
+        fallback = FallbackInfo(
+            succeeded=succeeded,
+            attempts=attempts,
+            original_decision_values=original_decision_values,
+        )
+        if not succeeded:
+            raise NoConfirmedStructureError(
+                f"tried {attempts} candidate(s) but none satisfied every constraint on the "
+                f"{optimizer.search.n_scenarios_confirm}-scenario confirmation run; widen "
+                "decision variable bounds, loosen a constraint, or increase n_scenarios_search"
+            )
 
     return OptimizationResult(
         grid_result=grid_result,
         refinement_result=refinement_result,
         recommended=recommended,
         confirmation=confirmation,
+        fallback=fallback,
+        search_stochastic_drivers=stochastic_drivers,
+        search_deterministic_drivers=det_drivers,
     )

@@ -12,7 +12,6 @@ from dataclasses import dataclass
 
 from corefin.assumptions.loader import expand_series
 from corefin.assumptions.schema import OpeningBalanceSheet, RootConfig, TrancheConfig
-from corefin.metrics.credit_metrics import is_senior
 from corefin.transaction.sources_uses import SourcesAndUses, compute_sources_and_uses
 
 
@@ -48,8 +47,8 @@ def size_tranches(
 class ClosingLeverage:
     total_debt_sources_mm: float
     total_leverage: float
-    senior_debt_sources_mm: float
-    senior_leverage: float
+    secured_debt_sources_mm: float
+    secured_leverage: float
 
 
 def compute_closing_leverage(
@@ -59,12 +58,12 @@ def compute_closing_leverage(
     distinct from the period-by-period *net* leverage the covenant system
     tracks. The revolver is excluded: undrawn at close by convention."""
     total_debt_sources_mm = sum(t.size_mm for t in tranches if not t.is_revolver)
-    senior_debt_sources_mm = sum(t.size_mm for t in tranches if not t.is_revolver and is_senior(t))
+    secured_debt_sources_mm = sum(t.size_mm for t in tranches if not t.is_revolver and t.is_secured)
     return ClosingLeverage(
         total_debt_sources_mm=total_debt_sources_mm,
         total_leverage=total_debt_sources_mm / entry_ebitda_mm,
-        senior_debt_sources_mm=senior_debt_sources_mm,
-        senior_leverage=senior_debt_sources_mm / entry_ebitda_mm,
+        secured_debt_sources_mm=secured_debt_sources_mm,
+        secured_leverage=secured_debt_sources_mm / entry_ebitda_mm,
     )
 
 

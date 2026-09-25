@@ -176,3 +176,35 @@ def test_no_capacity_limits_means_always_feasible():
     config = _config_with_pricing()
     candidate = build_priced_structure(config, {"TLB": 6.0, "Notes": 3.0})
     assert check_market_capacity(candidate, config.optimizer.pricing).feasible
+
+
+def test_secured_leverage_basis_steps_up_at_the_right_threshold():
+    # TLB (term_loan_b) is secured by default, Notes (senior_notes) is not --
+    # secured leverage here is TLB alone, so only TLB's own multiple should
+    # move it across the 3.0x threshold, regardless of how much Notes is
+    # layered on top.
+    config = _config_with_pricing(
+        tranches=[
+            {
+                "tranche_name": "TLB",
+                "basis": "secured_leverage",
+                "leverage_threshold": 3.0,
+                "spread_bps_per_turn": 0.004,
+            }
+        ]
+    )
+    original_spread = next(t for t in config.tranches if t.name == "TLB").spread
+
+    at_threshold = build_priced_structure(config, {"TLB": 3.0, "Notes": 2.5})
+    tlb_at_threshold = next(t for t in at_threshold.tranches if t.name == "TLB")
+    assert tlb_at_threshold.spread == pytest.approx(original_spread)
+
+    # Notes alone pushing total leverage above 3.0x must NOT bump TLB, since
+    # TLB's pricing basis is secured (TLB-only) leverage, not total.
+    notes_only_above = build_priced_structure(config, {"TLB": 3.0, "Notes": 2.9})
+    tlb_notes_above = next(t for t in notes_only_above.tranches if t.name == "TLB")
+    assert tlb_notes_above.spread == pytest.approx(original_spread)
+
+    above_threshold = build_priced_structure(config, {"TLB": 4.0, "Notes": 0.0})
+    tlb_above = next(t for t in above_threshold.tranches if t.name == "TLB")
+    assert tlb_above.spread == pytest.approx(original_spread + 0.004 * 1.0)

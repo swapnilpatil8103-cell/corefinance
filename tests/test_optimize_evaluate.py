@@ -2,11 +2,7 @@ import numpy as np
 import pytest
 
 from corefin.assumptions.schema import ObjectiveConfig, RootConfig
-from corefin.optimize.evaluate import (
-    binding_constraints,
-    compute_objective,
-    evaluate_candidate,
-)
+from corefin.optimize.evaluate import compute_objective, evaluate_candidate
 from corefin.optimize.pricing import build_priced_structure
 from corefin.optimize.structure import compute_entry_ebitda_mm
 from corefin.scenarios.generator import deterministic_drivers, generate_stochastic_drivers
@@ -224,24 +220,7 @@ def test_compute_objective_mean_downside_blend_halfway():
     assert compute_objective(objective, irr) == pytest.approx(expected)
 
 
-def test_binding_constraints_reports_violated_and_tight_limits():
-    data = _optimizer_data()
-    data["optimizer"]["deterministic_constraints"] = {
-        "max_total_leverage": 3.5,  # will be exactly hit -> binding
-        "min_equity_pct_of_sources": 0.01,  # trivially satisfied -> not binding
-    }
-    config = RootConfig.model_validate(data)
-    timeline, stochastic, det = _setup(config, 6)
-    candidate = build_priced_structure(config, {"TLB": 3.0, "Notes": 0.5})  # 3.5x exactly
-    evaluation = evaluate_candidate(config, candidate, timeline, stochastic, det)
-    names = binding_constraints(evaluation, config)
-    assert "max_total_leverage" in names
-    assert "min_equity_pct_of_sources" not in names
-
-
-def test_binding_constraints_empty_when_nothing_configured():
-    config = RootConfig.model_validate(_optimizer_data())
-    timeline, stochastic, det = _setup(config, 6)
-    candidate = build_priced_structure(config, {"TLB": 2.0, "Notes": 1.0})
-    evaluation = evaluate_candidate(config, candidate, timeline, stochastic, det)
-    assert binding_constraints(evaluation, config) == []
+# Binding-constraint reporting moved to optimize/diagnostics.py (needs
+# tolerance config, decision-variable bounds and grid step info a single
+# CandidateEvaluation + RootConfig can't provide) -- see
+# tests/test_optimize_diagnostics.py.

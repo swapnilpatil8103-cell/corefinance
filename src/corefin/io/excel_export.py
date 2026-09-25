@@ -111,7 +111,7 @@ def _credit_metrics_frame(
     return pd.DataFrame(
         {
             "Total Net Leverage": credit_metrics.total_net_leverage[s],
-            "Senior Net Leverage": credit_metrics.senior_net_leverage[s],
+            "Secured Net Leverage": credit_metrics.secured_net_leverage[s],
             "Interest Coverage": credit_metrics.interest_coverage[s],
             "FCCR": credit_metrics.fccr[s],
             "Cumulative Debt Paydown": credit_metrics.cumulative_debt_paydown[s],
