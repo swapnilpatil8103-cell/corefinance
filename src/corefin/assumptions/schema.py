@@ -207,6 +207,86 @@ DRIVER_ORDER = (
 )
 
 
+class PersistenceConfig(BaseModel):
+    """AR(1) autocorrelation on the per-period shock feeding revenue_growth
+    and ebitda_margin: shock_t = phi*shock_{t-1} + innovation_t. phi=0
+    reproduces the i.i.d.-shock (simple mode) behavior for that driver
+    exactly -- illustrative defaults, not calibrated to any real dataset."""
+
+    revenue_growth_phi: float = Field(default=0.0, ge=0.0, lt=1.0)
+    ebitda_margin_phi: float = Field(default=0.0, ge=0.0, lt=1.0)
+
+
+class RecessionRegimeConfig(BaseModel):
+    """Stochastic recession clustering: each period, while a scenario isn't
+    already in a recession, a new one starts with `annual_probability`;
+    once started it runs for a fixed `duration_years`, applying a constant
+    hit to revenue_growth and ebitda_margin each period of the recession
+    (no overlapping recessions). Illustrative defaults, not calibrated."""
+
+    annual_probability: float = Field(default=0.0, ge=0.0, le=1.0)
+    duration_years: int = Field(default=2, ge=1)
+    revenue_growth_hit: float = Field(
+        default=-0.10, description="Additive hit per recession period, e.g. -0.10 = 10pp lower."
+    )
+    ebitda_margin_hit: float = Field(
+        default=-0.03, description="Additive hit per recession period, e.g. -0.03 = 300bps lower."
+    )
+
+
+class FatTailsConfig(BaseModel):
+    """Student-t innovations (variance-normalized so driver_vol's std fields
+    keep their meaning) instead of normal, for every stochastic driver."""
+
+    degrees_of_freedom: float = Field(
+        default=5.0, gt=2.0, description="Must be > 2 for finite variance; lower = fatter tails."
+    )
+
+
+class RateMeanReversionConfig(BaseModel):
+    """Replaces base_rate's flat-deterministic-path-plus-noise default with
+    a discrete AR(1)/Ornstein-Uhlenbeck path: rate_t = rate_{t-1} +
+    kappa*(long_run_mean - rate_{t-1}) + shock_t, shock_t drawn at
+    driver_vol.base_rate_std same as before. Period 0 is unaffected
+    (anchored to the deterministic entry rate + its own shock, matching
+    simple mode), reversion starts from period 1."""
+
+    kappa: float = Field(
+        default=0.3, ge=0.0, le=1.0, description="Speed of reversion per period; 0=random walk."
+    )
+    long_run_mean: float = Field(gt=0.0)
+
+
+class ExitMultipleLinkConfig(BaseModel):
+    """Structural exit-multiple sensitivity, replacing the pure-noise
+    default: exit_multiple = scenario.exit_multiple + beta_growth*(EBITDA
+    CAGR from entry to exit - reference_cagr) + beta_rate*(exit-year
+    base_rate - reference_rate) + independent noise (still
+    driver_vol.exit_multiple_std, drawn fresh rather than reused from the
+    correlated shock cube, since the structural terms already capture the
+    fundamentals link). beta_rate is typically negative (higher rates
+    compress multiples); beta_growth typically positive."""
+
+    beta_growth: float = Field(default=0.0)
+    reference_cagr: float = Field(default=0.0)
+    beta_rate: float = Field(default=0.0)
+    reference_rate: float = Field(default=0.0)
+
+
+class AdvancedScenarioConfig(BaseModel):
+    """Opt-in richer scenario generation for the Monte Carlo engine. Every
+    field defaults to None/off; `scenario.advanced` itself defaults to None,
+    so `generate_stochastic_drivers` takes the exact same code path as
+    before this existed whenever it's absent -- corefin run/optimize are
+    unaffected unless a config explicitly adds this block."""
+
+    persistence: PersistenceConfig | None = None
+    regime: RecessionRegimeConfig | None = None
+    fat_tails: FatTailsConfig | None = None
+    rate_mean_reversion: RateMeanReversionConfig | None = None
+    exit_multiple_link: ExitMultipleLinkConfig | None = None
+
+
 class ScenarioConfig(BaseModel):
     n_scenarios: int = Field(default=1, gt=0)
     random_seed: int | None = None
@@ -214,6 +294,7 @@ class ScenarioConfig(BaseModel):
     base_rate: ScalarOrSeries
     driver_vol: DriverVolConfig = DriverVolConfig()
     driver_correlation: list[list[float]] | None = None
+    advanced: AdvancedScenarioConfig | None = None
 
     @model_validator(mode="after")
     def _check_correlation_shape(self) -> ScenarioConfig:
