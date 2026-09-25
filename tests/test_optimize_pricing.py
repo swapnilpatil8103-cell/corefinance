@@ -1,13 +1,21 @@
+from pathlib import Path
+
 import pytest
 
-from corefin.assumptions.schema import RootConfig
+from corefin.assumptions.loader import load_config
+from corefin.assumptions.schema import RateType, RootConfig, TrancheConfig, TrancheType
 from corefin.optimize.pricing import (
     apply_pricing_grid,
     build_priced_structure,
     check_market_capacity,
+    pricing_sanity_warnings,
 )
 from corefin.optimize.structure import build_structure, compute_entry_ebitda_mm, size_tranches
+from corefin.scenarios.generator import deterministic_drivers
+from corefin.timeline import Timeline
 from tests.test_debt_integration import debt_config_dict
+
+EXAMPLE_CONFIG_PATH = Path(__file__).resolve().parent.parent / "configs" / "example_midmarket.yaml"
 
 
 def _config_with_pricing(**pricing_overrides) -> RootConfig:
@@ -208,3 +216,63 @@ def test_secured_leverage_basis_steps_up_at_the_right_threshold():
     above_threshold = build_priced_structure(config, {"TLB": 4.0, "Notes": 0.0})
     tlb_above = next(t for t in above_threshold.tranches if t.name == "TLB")
     assert tlb_above.spread == pytest.approx(original_spread + 0.004 * 1.0)
+
+
+def _secured_tlb(spread: float = 0.05, rate_floor: float = 0.01) -> TrancheConfig:
+    return TrancheConfig(
+        name="TLB",
+        tranche_type=TrancheType.TERM_LOAN_B,
+        size_mm=100.0,
+        rate_type=RateType.FLOATING,
+        spread=spread,
+        rate_floor=rate_floor,
+    )
+
+
+def _unsecured_notes(**overrides) -> TrancheConfig:
+    defaults = dict(
+        name="Notes",
+        tranche_type=TrancheType.SENIOR_NOTES,
+        size_mm=50.0,
+        rate_type=RateType.FIXED,
+        fixed_rate=0.12,
+    )
+    defaults.update(overrides)
+    return TrancheConfig(**defaults)
+
+
+def test_pricing_warning_fires_when_unsecured_is_not_priced_above_secured():
+    # TLB all-in at base_rate=0.045: max(0.045, 0.01) + 0.05 = 0.095 -- notes
+    # at 0.08 fixed is cheaper, which is backwards for unsecured debt.
+    tlb = _secured_tlb()
+    notes = _unsecured_notes(fixed_rate=0.08)
+    warnings = pricing_sanity_warnings([tlb, notes], base_rate=0.045)
+    assert any("Notes" in w and "TLB" in w and "priced at or below" in w for w in warnings)
+
+
+def test_pricing_warning_silent_when_unsecured_is_priced_above_secured():
+    tlb = _secured_tlb()
+    notes = _unsecured_notes(fixed_rate=0.12)  # above TLB's 9.5% all-in
+    warnings = pricing_sanity_warnings([tlb, notes], base_rate=0.045)
+    assert warnings == []
+
+
+def test_pricing_warning_fires_for_sweep_eligible_unsecured_tranche():
+    tlb = _secured_tlb()
+    notes = _unsecured_notes(fixed_rate=0.12, cash_sweep_eligible=True, sweep_priority=2)
+    warnings = pricing_sanity_warnings([tlb, notes], base_rate=0.045)
+    assert any("cash-sweep eligible" in w for w in warnings)
+    # Properly priced above secured -- no separate rate warning.
+    assert not any("priced at or below" in w for w in warnings)
+
+
+def test_example_config_produces_no_pricing_warnings():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    timeline = Timeline.annual(
+        n_periods=config.timeline.n_periods,
+        n_historical=config.timeline.n_historical,
+        start_year=config.timeline.start_year,
+    )
+    base_drivers = deterministic_drivers(config, timeline)
+    warnings = pricing_sanity_warnings(config.tranches, float(base_drivers.base_rate[0, 0]))
+    assert warnings == []

@@ -239,6 +239,21 @@ pricing tranche model both set `extra="forbid"`) rather than silently
 ignored — there's no ambiguity-tolerant deprecation path for a field
 rename that changes which tranches are counted.
 
+`optimize/pricing.pricing_sanity_warnings` is a sanity check, not a hard
+constraint: it compares each unsecured tranche's all-in coupon (at the
+deterministic base-case base rate at close) against every secured
+tranche's, and warns — naming both tranches and their rates — if the
+unsecured one isn't priced above the secured one, since unsecured debt
+should command a premium for ranking behind secured debt in a default.
+It also warns if an unsecured tranche is cash-sweep eligible, since
+real high-yield notes are typically call-protected instead of being
+prepaid from excess cash. Both `corefin run` (against the config's
+tranches as given) and `corefin optimize` (against the final
+recommended/confirmed candidate's priced tranches) print these once per
+run — never per grid-search candidate, which would be both spammy and
+misleading, since the check is about the final structure being
+reported, not every candidate scanned along the way.
+
 ### Leverage-dependent pricing and market capacity
 
 `optimizer.pricing` is a linear ramp, per tranche: above a leverage

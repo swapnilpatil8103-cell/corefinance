@@ -21,7 +21,7 @@ from corefin.optimize.diagnostics import compute_diagnostics
 from corefin.optimize.evaluate import evaluate_candidate
 from corefin.optimize.excel_export import export_optimization_to_excel
 from corefin.optimize.heatmap import render_leverage_frontier, render_objective_heatmap
-from corefin.optimize.pricing import build_priced_structure
+from corefin.optimize.pricing import build_priced_structure, pricing_sanity_warnings
 from corefin.optimize.search import (
     NoConfirmedStructureError,
     NoFeasibleStructureError,
@@ -119,6 +119,9 @@ def run(
     )
     headrooms = compute_base_case_headroom(base_covenant_results, timeline)
     warnings = low_headroom_warnings(headrooms, min_headroom_pct)
+    pricing_warnings = pricing_sanity_warnings(
+        root_config.tranches, float(base_drivers.base_rate[0, 0])
+    )
 
     entry_ebitda_margin = expand_series(root_config.company.ebitda_margin, timeline.n_periods)[0]
     sau = compute_sources_and_uses(
@@ -141,6 +144,12 @@ def run(
     typer.echo(f"corefin -- {config.name}")
     typer.echo(f"  Scenarios: {drivers.n_scenarios}   Periods: {timeline.n_periods}")
     typer.echo("")
+
+    if pricing_warnings:
+        for w in pricing_warnings:
+            typer.echo(f"WARNING: {w}")
+        typer.echo("")
+
     typer.echo("Sources & Uses (at entry, deal-fixed):")
     typer.echo(f"  Entry EBITDA:        {sau.entry_ebitda_mm:>10.1f}")
     typer.echo(f"  Purchase Price:      {sau.purchase_price_mm:>10.1f}")
@@ -318,6 +327,14 @@ def optimize(
         )
         typer.echo(f"  {t.name}: {t.size_mm:>8.1f}mm, {rate_desc}")
     typer.echo("")
+
+    pricing_warnings = pricing_sanity_warnings(
+        candidate.tranches, float(result.search_deterministic_drivers.base_rate[0, 0])
+    )
+    if pricing_warnings:
+        for w in pricing_warnings:
+            typer.echo(f"WARNING: {w}")
+        typer.echo("")
 
     search_obj, confirm_obj = result.recommended.objective_value, confirmation.objective_value
     n_search, n_confirm = optimizer.search.n_scenarios_search, optimizer.search.n_scenarios_confirm

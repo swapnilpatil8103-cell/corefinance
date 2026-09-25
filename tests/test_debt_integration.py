@@ -198,6 +198,31 @@ def test_sweep_priority_respected():
     assert np.any(sum(result.debt_schedule.sweep_amort.values())[0] > 0)
 
 
+def test_sweep_priority_respected_with_a_single_eligible_tranche():
+    """Regression: with 0 or 1 sweep-eligible tranches there's no priority
+    ordering to violate, so the check must short-circuit to a pass rather
+    than crash -- it previously read a `.sweep_amort` attribute off the
+    TrancheConfig itself (which doesn't have one) instead of looking it up
+    on the debt schedule by name."""
+    data = debt_config_dict(n_periods=6)
+    notes = next(t for t in data["tranches"] if t["name"] == "Notes")
+    notes["cash_sweep_eligible"] = False
+    del notes["sweep_priority"]
+    config = RootConfig.model_validate(data)
+    timeline = Timeline.annual(n_periods=6)
+    drivers = deterministic_drivers(config, timeline)
+    result = run_corporate_model_with_debt(
+        config.company,
+        config.opening_balance_sheet,
+        config.tranches,
+        config.waterfall,
+        timeline,
+        drivers,
+    )
+    check = check_sweep_priority_respected(result.debt_schedule, config.tranches)
+    assert check.passed
+
+
 def test_zero_rate_debt_matches_no_debt_net_income():
     data = debt_config_dict(n_periods=5)
     for tranche in data["tranches"]:

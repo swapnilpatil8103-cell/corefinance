@@ -61,10 +61,14 @@ tranches:
     tranche_type: senior_notes
     size_mm: 175.0
     rate_type: fixed
-    fixed_rate: 0.085
+    # Unsecured -- prices above the TLB's ~9.5% all-in (4.5% base + 5.0%
+    # spread) since it ranks behind the secured TLB in a default.
+    # Illustrative, not market data.
+    fixed_rate: 0.1025
     oid_pct: 0.01
-    cash_sweep_eligible: true
-    sweep_priority: 2
+    # High-yield notes are typically call-protected rather than swept from
+    # excess cash; the sweep goes to the term loan (see TLB above).
+    cash_sweep_eligible: false
 
 covenants:
   # Max leverage starts ~25% above closing leverage (5.5x -> 7.0x) and

@@ -49,7 +49,7 @@ def check_sweep_priority_respected(
         key=lambda t: t.sweep_priority,
     )
     if len(eligible) < 2:
-        first = eligible[0].sweep_amort if eligible else np.array([[0.0]])
+        first = debt_schedule.sweep_amort[eligible[0].name] if eligible else np.array([[0.0]])
         return check_close_to_zero("sweep_priority_respected", np.zeros_like(first), tolerance)
 
     violation = None

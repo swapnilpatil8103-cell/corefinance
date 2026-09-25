@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from corefin.assumptions.schema import (
     LeverageBasis,
     PricingGridConfig,
@@ -19,6 +21,7 @@ from corefin.assumptions.schema import (
     TrancheConfig,
     TranchePricingConfig,
 )
+from corefin.debt.schedule import effective_rate
 from corefin.optimize.structure import (
     CandidateStructure,
     ClosingLeverage,
@@ -134,3 +137,32 @@ def check_market_capacity(
             f"market capacity {pricing.total_market_capacity_mm:.1f}mm"
         )
     return MarketCapacityCheck(feasible=not violations, violations=violations)
+
+
+def pricing_sanity_warnings(tranches: list[TrancheConfig], base_rate: float) -> list[str]:
+    """Sanity checks on relative pricing, not hard constraints: an unusual
+    structure (e.g. deliberately testing a subordinated-but-cheap tranche)
+    isn't blocked, just flagged. Rates are the tranches' own all-in coupon
+    (`debt/schedule.effective_rate` -- same floor/spread/fixed logic used
+    everywhere else) at the deterministic base-case base rate at close,
+    same "at close" convention as the interest-coverage constraint."""
+    rate_array = np.array([[base_rate]])
+    rates = {t.name: float(effective_rate(t, rate_array)[0, 0]) for t in tranches}
+    secured = [t for t in tranches if t.is_secured]
+    unsecured = [t for t in tranches if not t.is_secured]
+
+    warnings: list[str] = []
+    for u in unsecured:
+        for s in secured:
+            if rates[u.name] <= rates[s.name]:
+                warnings.append(
+                    f"unsecured {u.name} ({rates[u.name]:.2%}) is priced at or below secured "
+                    f"{s.name} ({rates[s.name]:.2%}) -- unsecured debt normally prices above "
+                    "secured debt, since it ranks behind it in a default"
+                )
+        if u.cash_sweep_eligible:
+            warnings.append(
+                f"unsecured {u.name} is cash-sweep eligible -- unsecured notes normally carry "
+                "call protection instead and aren't prepaid from excess cash"
+            )
+    return warnings
