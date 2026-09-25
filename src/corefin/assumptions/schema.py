@@ -518,6 +518,9 @@ class SimulateConfig(BaseModel):
     """Settings for the Sponsor LBO Monte Carlo engine (`corefin simulate`)."""
 
     stress_scenarios: list[NamedStressScenarioConfig] = Field(default_factory=list)
+    irr_hurdle: float = Field(
+        default=0.15, description="Illustrative -- P(IRR below this) is reported by the engine."
+    )
 
 
 class RootConfig(BaseModel):
