@@ -68,6 +68,21 @@ _DATES_OPTION_RE = re.compile(
     r'<option\s+(?:selected="selected"\s+)?value="(\d+)">([^<]+)</option>'
 )
 
+# cdr.ffiec.gov's WAF (Application Gateway) 403s the default python-requests
+# User-Agent outright -- verified live: identical requests succeed with a
+# browser-like User-Agent and fail with requests' default. Every session
+# must set one.
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _new_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": _BROWSER_USER_AGENT})
+    return session
+
 
 class FfiecPeriodNotFoundError(ValueError):
     pass
@@ -126,7 +141,7 @@ def list_available_periods(product: str = PRODUCT_SINGLE_PERIOD) -> list[str]:
     """Every available "MM/DD/YYYY" reporting-period end date for `product`,
     as currently offered by the FFIEC bulk-download page (sorted oldest
     to newest)."""
-    session = requests.Session()
+    session = _new_session()
     _, _, period_options = _select_product(session, product)
 
     def _sort_key(date_str: str) -> tuple[int, int, int]:
@@ -146,7 +161,7 @@ def fetch_bulk_call_report_zip(
     that period. Raises FfiecPeriodNotFoundError if the period isn't
     currently offered, FfiecBulkDownloadError if the site's response
     doesn't look like the expected ZIP (the form having changed)."""
-    session = requests.Session()
+    session = _new_session()
     viewstate, generator, period_options = _select_product(session, product)
 
     period_value = period_options.get(reporting_period_end_date)

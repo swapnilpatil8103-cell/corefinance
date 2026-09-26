@@ -27,3 +27,7 @@ wheels/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Credit-loss forecasting engine: raw downloads and processed panels --
+# never commit real Call Report / FRED / Fed-scenario data or API keys.
+/data/
