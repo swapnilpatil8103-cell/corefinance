@@ -127,3 +127,102 @@ def test_optimize_command_requires_optimizer_section(tmp_path):
     result = runner.invoke(app, ["optimize", "--config", str(config_path)])
     assert result.exit_code != 0
     assert "optimizer" in result.output.lower()
+
+
+def _simulate_config_path(tmp_path) -> Path:
+    data = debt_config_dict(n_periods=6)
+    data["optimizer"] = {
+        "decision_variables": [{"tranche_name": "TLB", "min_multiple": 1.0, "max_multiple": 5.0}],
+        "search": {
+            "grid_points_per_dimension": 5,
+            "n_scenarios_search": 200,
+            "n_scenarios_confirm": 300,
+        },
+    }
+    data["simulate"] = {
+        "stress_scenarios": [
+            {"name": "Recession", "shocks": {"recession": {"start_year_index": 2}}},
+        ]
+    }
+    config_path = tmp_path / "simulate_config.yaml"
+    with config_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f)
+    return config_path
+
+
+def test_simulate_command_both_structures_against_small_config(tmp_path):
+    config_path = _simulate_config_path(tmp_path)
+    charts_dir = tmp_path / "charts"
+    result = runner.invoke(
+        app,
+        [
+            "simulate",
+            "--config",
+            str(config_path),
+            "--scenarios",
+            "300",
+            "--output",
+            str(tmp_path / "simulation.xlsx"),
+            "--charts-dir",
+            str(charts_dir),
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "Structure comparison" in result.stdout
+    assert "Input" in result.stdout
+    assert "Optimized" in result.stdout
+    assert "Named stress scenarios" in result.stdout
+    assert "Recession" in result.stdout
+    assert "Value creation bridge" in result.stdout
+    assert "Driver importance" in result.stdout
+    assert "Tornado" in result.stdout
+    assert (tmp_path / "simulation.xlsx").exists()
+    for name in (
+        "irr_histogram.png",
+        "leverage_fan.png",
+        "breach_distress.png",
+        "value_bridge.png",
+        "tornado.png",
+        "structure_comparison.png",
+    ):
+        assert (charts_dir / name).exists()
+
+
+def test_simulate_command_input_only_skips_optimizer_run(tmp_path):
+    config_path = _simulate_config_path(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "simulate",
+            "--config",
+            str(config_path),
+            "--structure",
+            "input",
+            "--scenarios",
+            "200",
+            "--output",
+            str(tmp_path / "simulation.xlsx"),
+            "--charts-dir",
+            str(tmp_path / "charts"),
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "Detail for Input" in result.stdout
+    assert "Optimized" not in result.stdout
+
+
+def test_simulate_command_rejects_invalid_structure_option(tmp_path):
+    config_path = _simulate_config_path(tmp_path)
+    result = runner.invoke(app, ["simulate", "--config", str(config_path), "--structure", "bogus"])
+    assert result.exit_code != 0
+    assert "input/optimized/both" in result.output
+
+
+def test_simulate_command_requires_optimizer_section(tmp_path):
+    data = debt_config_dict(n_periods=4)
+    config_path = tmp_path / "no_optimizer.yaml"
+    with config_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f)
+    result = runner.invoke(app, ["simulate", "--config", str(config_path)])
+    assert result.exit_code != 0
+    assert "optimizer" in result.output.lower()

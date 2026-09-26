@@ -29,6 +29,25 @@ from corefin.optimize.search import (
     run_optimization,
 )
 from corefin.scenarios.generator import deterministic_drivers, generate_stochastic_drivers
+from corefin.simulate.attribution import (
+    compute_value_creation_bridge,
+    summarize_value_creation_bridge,
+)
+from corefin.simulate.charts import (
+    render_breach_distress_chart,
+    render_irr_histogram,
+    render_leverage_fan_chart,
+    render_structure_comparison_chart,
+    render_tornado_chart,
+    render_value_bridge_waterfall,
+)
+from corefin.simulate.compare import (
+    bump_decision_values,
+    compare_structures,
+    input_config_decision_values,
+)
+from corefin.simulate.excel_export import export_simulation_to_excel
+from corefin.simulate.importance import compute_driver_importance, compute_tornado_chart
 from corefin.statements.corporate_model import run_corporate_model_with_debt
 from corefin.timeline import Timeline
 from corefin.transaction.returns import compute_exit_and_returns
@@ -436,6 +455,192 @@ def optimize(
 
     render_leverage_frontier(result, str(leverage_frontier))
     typer.echo(f"Exported leverage frontier to {leverage_frontier}")
+
+
+@app.command()
+def simulate(
+    config: Path = typer.Option(
+        ..., "--config", exists=True, dir_okay=False, help="Path to a YAML assumptions file."
+    ),
+    structure: str = typer.Option(
+        "both", "--structure", help="Which structure(s) to run: input, optimized, or both."
+    ),
+    scenarios: int = typer.Option(5000, "--scenarios", help="Number of Monte Carlo scenarios."),
+    output: Path = typer.Option(
+        Path("simulation.xlsx"), "--output", help="Where to export the Excel workbook."
+    ),
+    charts_dir: Path = typer.Option(
+        Path("."), "--charts-dir", help="Directory to write the six chart PNGs into."
+    ),
+) -> None:
+    """Stress-tests a deal structure (typically the optimizer's
+    recommendation) with the Sponsor LBO Monte Carlo engine: richer
+    scenario generation, named stress scenarios, downside/distress
+    analytics, returns attribution, driver importance and structure
+    comparison. Config must have an `optimizer:` section (the structure
+    builder is reused from there) -- `simulate:` is optional and adds
+    stress scenarios and an IRR hurdle."""
+    if structure not in ("input", "optimized", "both"):
+        typer.echo(
+            f"Error: --structure must be one of input/optimized/both (got {structure!r}).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    root_config = load_config(config)
+    if root_config.optimizer is None:
+        typer.echo(f"Error: {config} has no 'optimizer:' section.", err=True)
+        raise typer.Exit(code=1)
+
+    timeline = Timeline.annual(
+        n_periods=root_config.timeline.n_periods,
+        n_historical=root_config.timeline.n_historical,
+        start_year=root_config.timeline.start_year,
+    )
+    irr_hurdle = root_config.simulate.irr_hurdle if root_config.simulate is not None else 0.15
+
+    named_decision_values: dict[str, dict[str, float]] = {}
+    if structure in ("input", "both"):
+        named_decision_values["Input"] = input_config_decision_values(root_config)
+    if structure in ("optimized", "both"):
+        try:
+            optimization_result = run_optimization(root_config, timeline)
+        except (NoFeasibleStructureError, NoConfirmedStructureError) as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+        recommended = optimization_result.recommended.candidate.decision_values
+        named_decision_values["Optimized"] = recommended
+        first_dv_name = root_config.optimizer.decision_variables[0].tranche_name
+        named_decision_values[f"Optimized +1.0x {first_dv_name}"] = bump_decision_values(
+            recommended, first_dv_name, 1.0
+        )
+    primary_name = "Optimized" if "Optimized" in named_decision_values else "Input"
+
+    typer.echo(f"corefin simulate -- {config.name}")
+    typer.echo(f"  Scenarios: {scenarios}   Structures: {', '.join(named_decision_values)}")
+    typer.echo("")
+
+    entries = compare_structures(
+        root_config,
+        timeline,
+        named_decision_values,
+        n_scenarios=scenarios,
+        seed=root_config.scenario.random_seed,
+        irr_hurdle=irr_hurdle,
+    )
+    entries_by_name = {e.name: e for e in entries}
+    primary = entries_by_name[primary_name]
+
+    typer.echo("Structure comparison (common random numbers):")
+    header = "".join(f"{name:>24}" for name in entries_by_name)
+    typer.echo(f"  {'':<30}{header}")
+
+    def _row(label: str, fmt, getter) -> None:
+        typer.echo(f"  {label:<30}" + "".join(f"{fmt(getter(e)):>24}" for e in entries))
+
+    _row("Total leverage", lambda v: f"{v:.2f}x", lambda e: e.candidate.leverage.total_leverage)
+    _row("Mean IRR", lambda v: f"{v:.1%}", lambda e: e.downside.returns.mean_irr)
+    _row("Median IRR", lambda v: f"{v:.1%}", lambda e: e.downside.returns.median_irr)
+    _row(
+        "Expected shortfall (worst 10%)",
+        lambda v: f"{v:.1%}",
+        lambda e: e.downside.returns.expected_shortfall_irr_10pct,
+    )
+    _row("P(MOIC < 1.0x)", lambda v: f"{v:.1%}", lambda e: e.downside.returns.prob_moic_below_1)
+    _row(
+        f"P(IRR < {irr_hurdle:.0%} hurdle)",
+        lambda v: f"{v:.1%}",
+        lambda e: e.downside.returns.prob_irr_below_hurdle,
+    )
+    _row(
+        "Covenant breach probability",
+        lambda v: f"{v:.1%}",
+        lambda e: e.downside.covenant_breaches.overall_breach_probability,
+    )
+    _row(
+        "Distress probability",
+        lambda v: f"{v:.1%}",
+        lambda e: e.downside.distress.overall_probability,
+    )
+    typer.echo("")
+
+    r = primary.downside.returns
+    typer.echo(f"Detail for {primary_name}:")
+    typer.echo(
+        "  IRR percentiles: " + "  ".join(f"p{p}={v:.1%}" for p, v in r.percentiles_irr.items())
+    )
+    typer.echo(
+        "  MOIC percentiles: " + "  ".join(f"p{p}={v:.2f}x" for p, v in r.percentiles_moic.items())
+    )
+    convergence = primary.downside.convergence
+    trace = " / ".join(f"{v:.2%}" for v in convergence.mean_irr_trace)
+    typer.echo(
+        f"  Convergence: mean IRR @ {convergence.scenario_counts} scenarios = {trace}  "
+        f"(stable: {convergence.is_stable})"
+    )
+    typer.echo("")
+
+    if primary.stress_results:
+        typer.echo(f"Named stress scenarios ({primary_name}):")
+        for s in primary.stress_results:
+            distress_label = "YES" if s.distress_overall else "no"
+            typer.echo(
+                f"  {s.name}: IRR={s.irr:.1%}  MOIC={s.moic:.2f}x  "
+                f"MinLiquidity=${s.min_liquidity_mm:.1f}mm  "
+                f"MaxRevolverDraw={s.max_revolver_draw_pct:.0%}  Distress={distress_label}"
+            )
+        typer.echo("")
+
+    bridge = compute_value_creation_bridge(root_config, primary.simulation)
+    bridge_summaries = summarize_value_creation_bridge(bridge, primary.simulation.exit_result.irr)
+    typer.echo(f"Value creation bridge ({primary_name}):")
+    for s in bridge_summaries:
+        typer.echo(
+            f"  {s.label:<8} EBITDA={s.ebitda_growth:>8.1f}  Multiple={s.multiple_change:>8.1f}  "
+            f"Debt/Cash={s.debt_paydown_and_cash:>8.1f}  Fees={s.fees_and_leakage:>7.1f}  "
+            f"Total={s.total_value_creation:>8.1f}"
+        )
+    typer.echo("")
+
+    driver_importance = compute_driver_importance(primary.simulation)
+    typer.echo(f"Driver importance ({primary_name}):")
+    for imp in driver_importance:
+        typer.echo(
+            f"  {imp.name:<20} beta={imp.standardized_coefficient:+.4f}  "
+            f"rank_corr={imp.rank_correlation:+.3f}"
+        )
+    typer.echo("")
+
+    tornado = compute_tornado_chart(root_config, primary.candidate, timeline, primary.simulation)
+    typer.echo(f"Tornado (p10 -> base -> p90), {primary_name}:")
+    for bar in sorted(tornado, key=lambda b: -b.irr_range):
+        typer.echo(
+            f"  {bar.name:<20} {bar.irr_at_p10:.1%} -> {bar.base_irr:.1%} -> {bar.irr_at_p90:.1%}  "
+            f"(range {bar.irr_range:.1%})"
+        )
+    typer.echo("")
+
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    render_irr_histogram(
+        primary.downside, primary.simulation.exit_result.irr, str(charts_dir / "irr_histogram.png")
+    )
+    render_leverage_fan_chart(primary.downside, timeline, str(charts_dir / "leverage_fan.png"))
+    render_breach_distress_chart(
+        primary.downside, timeline, str(charts_dir / "breach_distress.png")
+    )
+    render_value_bridge_waterfall(bridge_summaries[0], str(charts_dir / "value_bridge.png"))
+    render_tornado_chart(tornado, str(charts_dir / "tornado.png"))
+    render_structure_comparison_chart(entries, str(charts_dir / "structure_comparison.png"))
+
+    export_simulation_to_excel(
+        str(output), timeline, entries, primary_name, bridge_summaries, driver_importance, tornado
+    )
+
+    typer.echo(f"Exported workbook to {output}")
+    typer.echo(
+        f"Exported charts to {charts_dir}/ (irr_histogram.png, leverage_fan.png, "
+        "breach_distress.png, value_bridge.png, tornado.png, structure_comparison.png)"
+    )
 
 
 if __name__ == "__main__":

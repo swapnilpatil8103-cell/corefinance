@@ -185,3 +185,39 @@ optimizer:
     grid_points_per_dimension: 15
     refine: true
     refine_grid_points_per_dimension: 9
+
+# Sponsor LBO Monte Carlo Engine: `corefin simulate` stress-tests a
+# structure (by default the input config's own structure, the optimizer's
+# recommendation, and a +1.0x TLB more-levered variant) with richer
+# scenario generation, named deterministic stress scenarios, downside/
+# distress analytics, returns attribution and driver importance. The
+# hurdle and stress shocks below are illustrative, not market data.
+simulate:
+  irr_hurdle: 0.15 # illustrative sponsor return threshold
+  stress_scenarios:
+    - name: Recession in Year 2
+      shocks:
+        recession:
+          start_year_index: 2
+          revenue_growth_hit: -0.10 # 10pp lower growth at the peak
+          ebitda_margin_hit: -0.03 # 300bps lower margin at the peak
+          recovery_years: 2 # tapers back to zero over the following 2 years
+    - name: Rate Shock (+300bps)
+      shocks:
+        rate_shock:
+          bps: 0.03 # permanent, held base-rate increase
+    - name: Multiple Compression (-2.0x)
+      shocks:
+        multiple_compression:
+          delta: -2.0 # exit multiple 2.0x lower than the base case
+    - name: Combined Downside
+      shocks:
+        recession:
+          start_year_index: 2
+          revenue_growth_hit: -0.10
+          ebitda_margin_hit: -0.03
+          recovery_years: 2
+        rate_shock:
+          bps: 0.03
+        multiple_compression:
+          delta: -2.0

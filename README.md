@@ -27,6 +27,7 @@ uv run pytest -m slow               # performance tests (10k scenarios; 15x15 gr
 uv run ruff check . && uv run ruff format --check .
 uv run corefin run --config configs/example_midmarket.yaml
 uv run corefin optimize --config configs/example_midmarket.yaml
+uv run corefin simulate --config configs/example_midmarket.yaml
 ```
 
 The `run` command prints a summary (sources & uses, IRR/MOIC distribution
@@ -39,6 +40,15 @@ for the debt structure that maximizes sponsor returns subject to the
 configured constraints, and prints the recommendation alongside a
 side-by-side comparison against the input config's own structure — see
 [Financing Structure Optimizer](#financing-structure-optimizer) below.
+
+The `simulate` command (config must also have an `optimizer:` section)
+stress-tests a structure — by default the input config's own structure,
+the optimizer's recommendation, and a +1.0x-more-levered variant — with
+richer Monte Carlo scenario generation, named deterministic stress
+scenarios, downside/distress analytics, returns attribution and driver
+importance, answering the questions an investment committee actually
+asks about a deal — see
+[Sponsor LBO Monte Carlo Engine](#sponsor-lbo-monte-carlo-engine) below.
 
 ## Architecture
 
@@ -430,6 +440,188 @@ It exports three files:
   behavior, not a sign the model is missing a limit; the result is driven
   by the configured constraints and decision-variable bounds, not by the
   pricing grid arbitrarily topping out.
+
+## Sponsor LBO Monte Carlo Engine
+
+`corefin simulate --config <file>` stress-tests a deal structure —
+typically the Financing Structure Optimizer's recommendation — to answer
+the questions an investment committee actually asks: what's the realistic
+range of returns and how bad is the bad case, where do the returns come
+from, which assumptions drive the risk, how does the deal hold up in
+specific stress scenarios, and how much more fragile is a more levered
+structure. Everything here lives in `corefin/simulate/` and is built on
+the same core statement/debt/transaction modules as `run` and `optimize`
+— no parallel model.
+
+### Richer scenario generation
+
+`scenarios/generator.py`'s existing `generate_stochastic_drivers` (i.i.d.
+per-period normal shocks, Cholesky-correlated across drivers) is the
+*simple* mode and is completely untouched: it's still exactly what `run`
+and `optimize` use, and it's still what any `simulate` config gets unless
+it explicitly opts in to `scenario.advanced`. When that block is present,
+`generate_stochastic_drivers` dispatches to a richer generator instead,
+adding (each independently switchable, all illustrative defaults):
+
+- **Persistence**: AR(1) autocorrelation on the shock feeding
+  `revenue_growth` and `ebitda_margin` (`scenario.advanced.persistence`),
+  so a bad year has some probability of being followed by another bad
+  year, instead of every period being independent noise.
+- **Recession regimes**: a configurable annual probability of a new
+  downturn starting (`scenario.advanced.regime`), each one running a
+  fixed duration with a constant hit to growth and margin — bad years
+  cluster the way they do in reality, instead of averaging out.
+- **Fat tails**: Student-t innovations instead of normal
+  (`scenario.advanced.fat_tails`, configurable degrees of freedom,
+  variance-normalized so `driver_vol`'s configured stds keep their
+  meaning) — applies to every stochastic driver's innovation, composing
+  cleanly with persistence rather than being a separate mechanism.
+- **Mean-reverting base rate**: a discrete AR(1)/Ornstein-Uhlenbeck path
+  (`scenario.advanced.rate_mean_reversion`: `kappa` speed of reversion,
+  `long_run_mean`) instead of a flat path plus i.i.d. noise.
+- **Fundamentals-linked exit multiple**: `exit_multiple = base +
+  beta_growth*(EBITDA CAGR entry-to-exit - reference_cagr) +
+  beta_rate*(exit-year base rate - reference_rate) + independent noise`
+  (`scenario.advanced.exit_multiple_link`) — multiples compress when
+  rates rise or growth slows, instead of being pure noise uncorrelated
+  with fundamentals. The same `beta_rate` also fires inside a *stress*
+  scenario that includes a rate shock (see below), so the two features
+  stay consistent with each other.
+
+### Named stress scenarios
+
+`simulate/stress.py`'s `apply_stress_shock` applies one or more
+deterministic shocks on top of the zero-vol base case and runs it through
+the exact same model pipeline as everything else — a named scenario in
+`simulate.stress_scenarios` combines any subset of:
+
+- **Recession** — a peak-year growth/margin hit that tapers linearly back
+  to zero over a configurable recovery period.
+- **Rate shock** — a permanent, held base-rate increase. If
+  `scenario.advanced.exit_multiple_link` is configured, its `beta_rate`
+  also compresses the exit multiple by `beta_rate * bps` — a rate shock
+  that raises rates but leaves the exit multiple untouched would be
+  inconsistent with the engine's own Monte Carlo behavior, so it doesn't.
+- **Multiple compression** — a direct exit-multiple shift.
+
+"Combined downside" is just a scenario that sets all three at once. For
+each named scenario, `corefin simulate` reports IRR, MOIC, minimum
+liquidity, covenant breaches by year, revolver usage, and whether the
+deal hits **distress** — defined once, in `simulate/distress.py`, and
+reused everywhere: the revolver fully drawn with cash still below the
+minimum (`debt_schedule.shortfall_flag` is already exactly this
+condition, reused directly rather than recomputed), or cash interest
+coverage below 1.0x.
+
+**Liquidity** is cash *plus undrawn revolver capacity*
+(`simulate/liquidity.py`), not cash alone — a company with a large
+undrawn revolver is more liquid than its cash balance alone suggests.
+Cash-only is still reported separately (`min_cash_mm`, `cash_bands`),
+since the two mean different things to a lender.
+
+### Downside, distress and convergence analytics
+
+`simulate/engine.py`'s `run_simulation` is the batch Monte Carlo runner:
+one structure, N scenarios, the same corporate model/covenant/returns
+pipeline as everywhere else, packaged into a `SimulationResult`.
+`simulate/analytics.py`'s `compute_downside_analytics` turns that into:
+
+- IRR/MOIC distributions (mean, median, p5/10/25/75/90/95) and **expected
+  shortfall** — the average IRR in the worst 5%/10% of scenarios, which
+  by construction can never exceed the corresponding percentile.
+- P(MOIC < 1.0x) and P(IRR below a configurable hurdle,
+  `simulate.irr_hurdle`).
+- Covenant breach probability by year (per-covenant and combined across
+  every covenant) plus the distribution of time to first breach.
+- Distress probability by year and overall.
+- Leverage and liquidity percentile bands by year (the fan chart data).
+- A **convergence check**: the mean IRR traced at growing prefixes of the
+  same draw (25%/50%/100% of the sample — cheap, since scenarios are
+  i.i.d. and no re-draw is needed) alongside each statistic's Monte Carlo
+  standard error, so the reported numbers are shown to actually be stable
+  at the chosen scenario count, not just asserted to be.
+
+### Returns attribution (value creation bridge)
+
+`simulate/attribution.py` decomposes each scenario's sponsor equity value
+creation into four components that sum **exactly** to the change in
+equity value (realized exit equity value + dividends through exit, minus
+the entry equity check):
+
+1. **EBITDA growth** (at the entry multiple) and **multiple change** (at
+   exit EBITDA) — together, exactly `exit EV - entry EV`.
+2. **Debt paydown / cash generation** — entry debt raised minus net debt
+   at exit, plus dividends, plus a limited-liability floor adjustment (so
+   the identity still holds exactly even for a wipeout scenario, where
+   realized equity value is clamped at zero). Interest expense (cash and
+   PIK) has no separate bucket: it already reduced cash generation, so
+   its effect is already inside this one.
+3. **Fees and other leakage** — transaction and financing fees/OID paid
+   at entry, constant across scenarios.
+
+`summarize_value_creation_bridge` reports the average bridge plus the
+bridge for whichever real scenario's own IRR is closest to the p10,
+median and p90 of the full distribution — each one a real scenario's
+exact numbers, not an interpolated or synthetic one.
+
+### Driver importance
+
+`simulate/importance.py` keeps this deliberately simple and
+explainable — no black-box ML:
+
+- **Standardized regression coefficients**: OLS (`numpy.linalg.lstsq`, no
+  new dependency) of IRR on each driver's z-scored, path-averaged value —
+  directly comparable in magnitude across drivers.
+- **Spearman rank correlation** of each driver against IRR.
+- A **tornado chart**: each driver alone shifted to its Monte Carlo
+  sample's p10/p90 path-average, every other driver held at the
+  deterministic base case, and the corporate model actually *re-run* (not
+  a linear extrapolation from the regression) to get the resulting IRR —
+  an honest "what if this one assumption moved" answer.
+
+A driver with no configured volatility isn't *exactly* constant across
+scenarios in floating point (repeat/broadcast arithmetic leaves
+~1e-17-scale noise in its cross-scenario std) — both statistics compare
+against a small threshold rather than exact zero, so that noise can't get
+divided into a spurious "importance" score.
+
+### Structure comparison
+
+`simulate/compare.py`'s `compare_structures` runs the engine, analytics
+and stress scenarios on multiple named structures with **common random
+numbers** — calling `run_simulation` with the same seed and scenario
+count for every structure reproduces identical operating (revenue/EBITDA)
+drivers, since financing structure never affects them, so differences
+across structures reflect the structure, not fresh sampling noise.
+`input_config_decision_values` derives "the structure as configured" from
+`root_config.tranches`; `bump_decision_values` builds a levered variant
+(deliberately unclipped to the optimizer's search bounds — the point is
+exploring past what the grid search would try). Structures are built via
+`optimize/pricing.build_priced_structure`, the optimizer's own structure
+builder, reused rather than reimplemented.
+
+### CLI, Excel export and charts
+
+`corefin simulate --config <file> [--structure input|optimized|both]
+[--scenarios N] [--output out.xlsx] [--charts-dir dir]` prints a
+committee-style summary: the structure comparison table, then full
+distribution/stress/attribution/importance/tornado detail for one
+*primary* structure (the optimizer's recommendation when running
+`optimized` or `both`, else the input structure — whenever `optimized` is
+requested, a "+1.0x <first decision variable>" more-levered variant is
+also added automatically, demonstrating the return/risk trade-off of
+adding leverage). `--structure input` skips the (potentially expensive)
+optimizer search entirely when only the input structure is wanted.
+
+It exports `simulation.xlsx` with seven sheets — Summary, Distributions,
+Stress Scenarios, Breach & Distress by Year, Attribution, Driver
+Importance and Structure Comparison (the last is the only one covering
+every compared structure at once; the rest analyze the primary structure
+in depth) — and six PNGs into `--charts-dir`: an IRR histogram with
+percentile markers and a hurdle line, a net-leverage fan chart, a
+covenant-breach/distress-probability-by-year chart, a value-creation
+bridge waterfall, a tornado chart, and a return-vs-risk scatter across
+the compared structures.
 
 ## Where the bank model plugs in
 
