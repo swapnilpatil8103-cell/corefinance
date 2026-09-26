@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from corefin.credit.schema import CATEGORY_MDRM_CODES, LoanCategory
+from corefin.credit.schema import CATEGORY_MDRM_CODES, LoanCategory, MdrmCodeSet
 
 # CECL is mandatory for large SEC filers starting 2020Q1, phased in for
 # smaller/non-SEC filers through 2023. This default is only a fallback for
@@ -59,36 +59,136 @@ def annualized_nco_rate(
     return pd.Series(rate, index=gross_chargeoffs_quarterly.index)
 
 
-def apply_category_mapping(item_frame: pd.DataFrame, category: LoanCategory) -> pd.DataFrame:
-    """item_frame: one row per bank-quarter, one column per MDRM item code
-    (e.g. "RCON1766"). Returns a frame with standardized columns (balance,
-    past_due_30_89, past_due_90, nonaccrual, chargeoff_ytd, recovery_ytd)
-    for `category`, summing across item codes where a category maps to
-    more than one Call Report line. A field left empty in schema.py (e.g.
-    other_consumer's past-due items) produces an all-NaN column -- "not
-    available" and "zero" are not the same thing here. Any component item
-    that is NaN makes the sum NaN rather than silently treating it as
-    zero."""
-    codes = CATEGORY_MDRM_CODES[category]
+def code_set_for_quarter(category: LoanCategory, quarter: pd.Period) -> MdrmCodeSet:
+    """The MDRM code set covering `quarter` for `category`, per the
+    date-effective mapping in schema.CATEGORY_MDRM_CODES. Raises if no
+    code set covers that quarter (e.g. LoanCategory.AUTO before 2011Q1) --
+    that is a real "this category has no data here" condition, not
+    something to paper over with an empty/zero result."""
+    for code_set in CATEGORY_MDRM_CODES[category]:
+        if code_set.covers(quarter):
+            return code_set
+    raise ValueError(f"no MDRM code set covers {category} at {quarter}")
 
-    def _sum_or_nan(items: tuple[str, ...]) -> pd.Series:
+
+def apply_category_mapping(
+    item_frame: pd.DataFrame, category: LoanCategory, quarter_period: pd.Series
+) -> pd.DataFrame:
+    """item_frame: one row per bank-quarter, one column per MDRM item code
+    (e.g. "RCON1766"). `quarter_period`: aligned to item_frame's index,
+    used to pick the right date-effective MdrmCodeSet per row (a category
+    like cre_nonfarm_nonresidential uses different item codes before vs.
+    after 2007Q1). Returns a frame with standardized columns (balance,
+    past_due_30_89, past_due_90, nonaccrual, chargeoff_ytd, recovery_ytd).
+    A field left empty in schema.py (e.g. other_consumer's past-due items)
+    produces an all-NaN column -- "not available" and "zero" are not the
+    same thing here. Any component item that is NaN makes the sum NaN
+    rather than silently treating it as zero. Rows whose quarter isn't
+    covered by any code set for `category` (e.g. auto loans before
+    2011Q1) raise, rather than being silently dropped or zero-filled."""
+    quarters = pd.PeriodIndex(quarter_period).asfreq("Q")
+    columns = [
+        "balance",
+        "past_due_30_89",
+        "past_due_90",
+        "nonaccrual",
+        "chargeoff_ytd",
+        "recovery_ytd",
+    ]
+    result = pd.DataFrame(np.nan, index=item_frame.index, columns=columns)
+    unmatched = np.ones(len(item_frame), dtype=bool)
+
+    def _sum_or_nan(idx: pd.Index, items: tuple[str, ...]) -> pd.Series:
         if not items:
-            return pd.Series(np.nan, index=item_frame.index)
+            return pd.Series(np.nan, index=idx)
         missing = [c for c in items if c not in item_frame.columns]
         if missing:
             raise KeyError(f"item_frame is missing required columns: {missing}")
-        return item_frame[list(items)].sum(axis=1, skipna=False)
+        return item_frame.loc[idx, list(items)].sum(axis=1, skipna=False)
 
-    return pd.DataFrame(
-        {
-            "balance": _sum_or_nan(codes.balance_items),
-            "past_due_30_89": _sum_or_nan(codes.past_due_30_89_items),
-            "past_due_90": _sum_or_nan(codes.past_due_90_items),
-            "nonaccrual": _sum_or_nan(codes.nonaccrual_items),
-            "chargeoff_ytd": _sum_or_nan(codes.chargeoff_items),
-            "recovery_ytd": _sum_or_nan(codes.recovery_items),
-        }
+    for code_set in CATEGORY_MDRM_CODES[category]:
+        mask = np.array([code_set.covers(q) for q in quarters]) & unmatched
+        if not mask.any():
+            continue
+        idx = item_frame.index[mask]
+        result.loc[idx, "balance"] = _sum_or_nan(idx, code_set.balance_items)
+        result.loc[idx, "past_due_30_89"] = _sum_or_nan(idx, code_set.past_due_30_89_items)
+        result.loc[idx, "past_due_90"] = _sum_or_nan(idx, code_set.past_due_90_items)
+        result.loc[idx, "nonaccrual"] = _sum_or_nan(idx, code_set.nonaccrual_items)
+        result.loc[idx, "chargeoff_ytd"] = _sum_or_nan(idx, code_set.chargeoff_items)
+        result.loc[idx, "recovery_ytd"] = _sum_or_nan(idx, code_set.recovery_items)
+        unmatched &= ~mask
+
+    if unmatched.any():
+        bad_quarters = sorted({str(q) for q in quarters[unmatched]})
+        raise ValueError(f"no MDRM code set covers {category} for quarter(s) {bad_quarters}")
+
+    return result
+
+
+def apply_rcfd_fallback(
+    rcon_balance: pd.Series, rcfd_balance: pd.Series, reporting_form: pd.Series
+) -> pd.Series:
+    """For FFIEC 031 (large/international bank) filers, a balance item
+    could in principle be reported only on a consolidated (RCFD, domestic
+    + foreign) basis rather than the domestic-only RCON basis this panel
+    otherwise uses. Falls back to `rcfd_balance` only where `reporting_form
+    == "FFIEC 031"` and `rcon_balance` is missing -- FFIEC 041/051 filers
+    have no foreign offices and no RCFD equivalent, so they never fall
+    back. As of schema.py's MDRM verification, no current category
+    actually triggers this (RCON stays available on FFIEC 031 for every
+    category's whole reporting history); this function is a defensive
+    mechanism for whichever category eventually does, exercised in tests
+    with a synthetic gap."""
+    is_031 = reporting_form == "FFIEC 031"
+    use_fallback = is_031 & rcon_balance.isna()
+    return rcon_balance.where(~use_fallback, rcfd_balance)
+
+
+def build_coverage_report(panel: pd.DataFrame) -> pd.DataFrame:
+    """panel: long-format frame with columns "category", "quarter" (a
+    pandas Period or "YYYYQN" string) and "balance" (one row per
+    bank-category-quarter, already through `apply_category_mapping`).
+    Returns one row per (category, quarter) with:
+    - n_banks: number of bank-quarter rows in that group
+    - coverage_share: fraction with a non-missing balance
+    - aggregate_balance: sum of non-missing balances
+    - aggregate_pct_change: quarter-over-quarter change in aggregate_balance
+      within that category
+    - code_switch: True if `quarter` is a code set's `valid_from` boundary
+      for that category (per schema.CATEGORY_MDRM_CODES)
+    - possible_break: True if `code_switch` is True AND
+      abs(aggregate_pct_change) exceeds `break_threshold` (default 15%) --
+      a large jump exactly at a known code-set boundary is the signature
+      of an incomplete or mismatched mapping, not necessarily a real
+      economic move.
+    """
+    quarters = pd.PeriodIndex(panel["quarter"].astype(str), freq="Q")
+    working = panel.assign(quarter=quarters)
+
+    grouped = working.groupby(["category", "quarter"], observed=True)["balance"]
+    report = grouped.agg(
+        n_banks="size",
+        coverage_share=lambda s: s.notna().mean(),
+        aggregate_balance=lambda s: s.sum(skipna=True),
+    ).reset_index()
+    report = report.sort_values(["category", "quarter"]).reset_index(drop=True)
+    pct_change = report.groupby("category", observed=True)["aggregate_balance"].pct_change()
+    report["aggregate_pct_change"] = pct_change
+
+    switch_quarters: dict[str, set[pd.Period]] = {
+        category: {pd.Period(code_set.valid_from, freq="Q") for code_set in code_sets}
+        for category, code_sets in CATEGORY_MDRM_CODES.items()
+    }
+    report["code_switch"] = [
+        row.quarter in switch_quarters.get(row.category, set()) for row in report.itertuples()
+    ]
+
+    break_threshold = 0.15
+    report["possible_break"] = report["code_switch"] & (
+        report["aggregate_pct_change"].abs() > break_threshold
     )
+    return report
 
 
 def flag_merger_discontinuities(balance: pd.Series, jump_threshold: float = 0.5) -> pd.Series:

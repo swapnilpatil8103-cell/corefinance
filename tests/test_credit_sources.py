@@ -1,6 +1,7 @@
 """Offline tests for the credit data source clients -- every network call
 is mocked; no test here ever touches the network."""
 
+import sys
 from unittest import mock
 
 import pandas as pd
@@ -151,23 +152,132 @@ def test_fed_scenario_severely_adverse_uses_table_3a():
 
 # --------------------------------------------------------------- FFIEC ----
 
+_FFIEC_INITIAL_HTML = """
+<input type="hidden" id="__VIEWSTATE" value="initial-vs" />
+<input type="hidden" id="__VIEWSTATEGENERATOR" value="initial-vg" />
+"""
 
-def test_ffiec_requires_both_credentials(monkeypatch):
-    monkeypatch.delenv("FFIEC_PWS_USERNAME", raising=False)
-    monkeypatch.delenv("FFIEC_PWS_PASSWORD", raising=False)
-    with pytest.raises(ffiec.FfiecCredentialsMissingError, match="FFIEC_PWS"):
-        ffiec.fetch_call_report_bulk_data("ReportingSeriesSinglePeriod", "06/30/2026")
+_FFIEC_PRODUCT_SELECTED_HTML = """
+<input type="hidden" id="__VIEWSTATE" value="selected-vs" />
+<input type="hidden" id="__VIEWSTATEGENERATOR" value="selected-vg" />
+<select name="ctl00$MainContentHolder$DatesDropDownList" id="DatesDropDownList" class="valuelabel">
+\t<option selected="selected" value="152">06/30/2026</option>
+\t<option value="151">03/31/2026</option>
+\t<option value="130">12/31/2021</option>
+</select>
+"""
 
 
-def test_ffiec_requires_both_not_just_one_credential(monkeypatch):
-    monkeypatch.setenv("FFIEC_PWS_USERNAME", "someuser")
-    monkeypatch.delenv("FFIEC_PWS_PASSWORD", raising=False)
-    with pytest.raises(ffiec.FfiecCredentialsMissingError):
-        ffiec.fetch_call_report_bulk_data("ReportingSeriesSinglePeriod", "06/30/2026")
+def _ffiec_fake_html_response(html: str) -> mock.Mock:
+    resp = mock.Mock()
+    resp.text = html
+    resp.raise_for_status.side_effect = lambda: None
+    return resp
 
 
-def test_ffiec_raises_not_implemented_once_credentials_are_present(monkeypatch):
-    monkeypatch.setenv("FFIEC_PWS_USERNAME", "someuser")
-    monkeypatch.setenv("FFIEC_PWS_PASSWORD", "somepass")
-    with pytest.raises(NotImplementedError):
-        ffiec.fetch_call_report_bulk_data("ReportingSeriesSinglePeriod", "06/30/2026")
+def _ffiec_fake_zip_response(content: bytes = b"PK\x03\x04fakezipbytes") -> mock.Mock:
+    resp = mock.Mock()
+    resp.content = content
+    disposition = 'attachment; filename="FFIEC CDR Call Bulk All Schedules 12312021.zip"'
+    resp.headers = {"Content-Type": "application/octet-stream", "Content-Disposition": disposition}
+    resp.raise_for_status.side_effect = lambda: None
+    return resp
+
+
+def _mock_ffiec_session(post_side_effect):
+    session = mock.Mock()
+    session.get.return_value = _ffiec_fake_html_response(_FFIEC_INITIAL_HTML)
+    session.post.side_effect = post_side_effect
+    return session
+
+
+def test_fetch_bulk_call_report_zip_full_flow():
+    zip_response = _ffiec_fake_zip_response()
+    session = _mock_ffiec_session(
+        [_ffiec_fake_html_response(_FFIEC_PRODUCT_SELECTED_HTML), zip_response]
+    )
+    with mock.patch.object(ffiec.requests, "Session", return_value=session):
+        result = ffiec.fetch_bulk_call_report_zip("12/31/2021")
+
+    assert result == zip_response.content
+    select_call, download_call = session.post.call_args_list
+    assert select_call.kwargs["data"]["__EVENTTARGET"] == "ctl00$MainContentHolder$ListBox1"
+    assert select_call.kwargs["data"]["__VIEWSTATE"] == "initial-vs"
+    download_data = download_call.kwargs["data"]
+    assert download_data["__VIEWSTATE"] == "selected-vs"
+    assert download_data["ctl00$MainContentHolder$DatesDropDownList"] == "130"
+    assert download_data["ctl00$MainContentHolder$FormatType"] == "TSVRadioButton"
+
+
+def test_fetch_bulk_call_report_zip_raises_for_unavailable_period():
+    session = _mock_ffiec_session([_ffiec_fake_html_response(_FFIEC_PRODUCT_SELECTED_HTML)])
+    with mock.patch.object(ffiec.requests, "Session", return_value=session):
+        with pytest.raises(ffiec.FfiecPeriodNotFoundError, match="12/31/1999"):
+            ffiec.fetch_bulk_call_report_zip("12/31/1999")
+
+
+def test_fetch_bulk_call_report_zip_raises_when_response_is_not_a_zip():
+    bad_response = mock.Mock()
+    bad_response.headers = {"Content-Type": "text/html; charset=utf-8", "Content-Disposition": ""}
+    bad_response.raise_for_status.side_effect = lambda: None
+    session = _mock_ffiec_session(
+        [_ffiec_fake_html_response(_FFIEC_PRODUCT_SELECTED_HTML), bad_response]
+    )
+    with mock.patch.object(ffiec.requests, "Session", return_value=session):
+        with pytest.raises(ffiec.FfiecBulkDownloadError):
+            ffiec.fetch_bulk_call_report_zip("12/31/2021")
+
+
+def test_list_available_periods_returns_sorted_oldest_to_newest():
+    session = _mock_ffiec_session([_ffiec_fake_html_response(_FFIEC_PRODUCT_SELECTED_HTML)])
+    with mock.patch.object(ffiec.requests, "Session", return_value=session):
+        periods = ffiec.list_available_periods()
+    assert periods == ["12/31/2021", "03/31/2026", "06/30/2026"]
+
+
+# ------------------------------------------------- FFIEC REST adapter -----
+
+
+def test_ffiec_rest_requires_both_credentials(monkeypatch):
+    monkeypatch.delenv("FFIEC_USERNAME", raising=False)
+    monkeypatch.delenv("FFIEC_BEARER_TOKEN", raising=False)
+    with pytest.raises(ffiec.FfiecRestCredentialsMissingError, match="FFIEC_USERNAME"):
+        ffiec.fetch_single_bank_via_rest("480228", "12/31/2023")
+
+
+def test_ffiec_rest_requires_both_not_just_one_credential(monkeypatch):
+    monkeypatch.setenv("FFIEC_USERNAME", "someuser")
+    monkeypatch.delenv("FFIEC_BEARER_TOKEN", raising=False)
+    with pytest.raises(ffiec.FfiecRestCredentialsMissingError):
+        ffiec.fetch_single_bank_via_rest("480228", "12/31/2023")
+
+
+def test_ffiec_rest_raises_import_error_when_package_not_installed(monkeypatch):
+    monkeypatch.setenv("FFIEC_USERNAME", "someuser")
+    monkeypatch.setenv("FFIEC_BEARER_TOKEN", "sometoken")
+    with pytest.raises(ImportError, match="ffiec-data-connect"):
+        ffiec.fetch_single_bank_via_rest("480228", "12/31/2023")
+
+
+def test_ffiec_rest_calls_collect_data_with_expected_arguments(monkeypatch):
+    monkeypatch.setenv("FFIEC_USERNAME", "someuser")
+    monkeypatch.setenv("FFIEC_BEARER_TOKEN", "sometoken")
+
+    fake_module = mock.Mock()
+    fake_module.OAuth2Credentials = mock.Mock(return_value="creds-object")
+    fake_module.collect_data = mock.Mock(return_value="fake-dataframe")
+    monkeypatch.setitem(sys.modules, "ffiec_data_connect", fake_module)
+
+    result = ffiec.fetch_single_bank_via_rest("480228", "12/31/2023")
+
+    assert result == "fake-dataframe"
+    fake_module.OAuth2Credentials.assert_called_once_with(
+        username="someuser", bearer_token="sometoken"
+    )
+    fake_module.collect_data.assert_called_once_with(
+        "creds-object",
+        reporting_period="12/31/2023",
+        rssd_id="480228",
+        series="call",
+        output_type="pandas",
+    )
