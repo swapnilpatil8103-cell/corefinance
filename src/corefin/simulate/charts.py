@@ -11,6 +11,7 @@ matplotlib.use("Agg")  # headless: writing PNG files, no display needed
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import PercentFormatter
 
 from corefin.simulate.analytics import DownsideAnalytics
 from corefin.simulate.attribution import BridgeSummary
@@ -158,16 +159,31 @@ def render_tornado_chart(bars: list[TornadoBar], path: str) -> None:
 def render_structure_comparison_chart(
     entries: list[StructureComparisonEntry],
     path: str,
-    risk_metric: str = "prob_irr_below_hurdle",
+    risk_metric: str = "prob_moic_below_1",
 ) -> None:
     """Mean IRR (return, higher = better) against a risk measure where
     HIGHER always means riskier, so "further right and up" reads as
     unambiguously better on both axes and "further right" always reads as
-    worse on the risk axis specifically. Defaults to P(IRR < hurdle);
-    "expected_shortfall_10pct" plots the *negative* of expected shortfall
-    (still higher = riskier, since a lower/more-negative raw expected
-    shortfall is the worse outcome) as the alternative."""
-    if risk_metric == "prob_irr_below_hurdle":
+    worse on the risk axis specifically.
+
+    Defaults to P(MOIC < 1.0x) -- outright loss-of-capital probability,
+    which rises monotonically with leverage the way risk actually should.
+    P(IRR < hurdle) is *not* the default despite reading naturally as a
+    risk measure: it falls as leverage rises whenever leverage lifts the
+    median IRR above the hurdle, which would make a riskier structure
+    look safer on this chart -- still selectable via risk_metric for
+    comparison, but not the default. "expected_shortfall_10pct" plots the
+    *negative* of expected shortfall (still higher = riskier, since a
+    lower/more-negative raw expected shortfall is the worse outcome) as a
+    third alternative."""
+    if risk_metric == "prob_moic_below_1":
+
+        def risk_value(r):
+            return r.prob_moic_below_1
+
+        def risk_label(r):
+            return "P(MOIC < 1.0x) -- risk (higher = riskier)"
+    elif risk_metric == "prob_irr_below_hurdle":
 
         def risk_value(r):
             return r.prob_irr_below_hurdle
@@ -184,7 +200,7 @@ def render_structure_comparison_chart(
     else:
         raise ValueError(
             f"unknown risk_metric {risk_metric!r}, expected "
-            "'prob_irr_below_hurdle' or 'expected_shortfall_10pct'"
+            "'prob_moic_below_1', 'prob_irr_below_hurdle' or 'expected_shortfall_10pct'"
         )
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
@@ -197,6 +213,8 @@ def render_structure_comparison_chart(
         )
     ax.set_xlabel(risk_label(entries[0].downside.returns) if entries else "Risk")
     ax.set_ylabel("Mean IRR -- return (higher = better)")
+    ax.xaxis.set_major_formatter(PercentFormatter(xmax=1.0))
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
     ax.set_title("Return vs risk across structures")
     fig.tight_layout()
     fig.savefig(path, dpi=150)

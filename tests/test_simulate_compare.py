@@ -1,8 +1,10 @@
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+from corefin.assumptions.loader import load_config
 from corefin.assumptions.schema import RootConfig
 from corefin.checks.corporate_checks import check_balance_sheet_balances
 from corefin.checks.framework import run_checks
@@ -14,6 +16,10 @@ from corefin.simulate.compare import (
 )
 from corefin.timeline import Timeline
 from tests.conftest import minimal_config_dict
+
+EXAMPLE_STRESS_CONFIG_PATH = (
+    Path(__file__).resolve().parent.parent / "configs" / "example_midmarket_stress.yaml"
+)
 
 
 def _config(n_periods: int = 6, **scenario_overrides) -> RootConfig:
@@ -156,3 +162,32 @@ def test_ten_thousand_scenarios_with_regimes_and_fat_tails_two_structures_within
     for entry in entries:
         assert entry.simulation.exit_result.irr.shape == (10_000,)
         run_checks([check_balance_sheet_balances(entry.simulation.model_result.balance_sheet)])
+
+
+def test_default_risk_metric_ranks_most_levered_structure_riskiest_on_stress_config():
+    """P(MOIC < 1.0x) -- the return-vs-risk chart's default risk_metric --
+    must rank structures by leverage the way risk actually should,
+    unlike P(IRR < hurdle) (which can fall as leverage rises). Uses the
+    real advanced-generator example config, not a synthetic one."""
+    config = load_config(EXAMPLE_STRESS_CONFIG_PATH)
+    timeline = Timeline.annual(
+        n_periods=config.timeline.n_periods,
+        n_historical=config.timeline.n_historical,
+        start_year=config.timeline.start_year,
+    )
+    input_values = input_config_decision_values(config)
+    first_dv_name = config.optimizer.decision_variables[0].tranche_name
+    named = {
+        "Low": input_values,
+        "Medium": bump_decision_values(input_values, first_dv_name, 1.0),
+        "High": bump_decision_values(input_values, first_dv_name, 2.0),
+    }
+    entries = compare_structures(config, timeline, named, n_scenarios=3000, seed=7)
+    by_name = {e.name: e for e in entries}
+
+    leverages = [by_name[n].candidate.leverage.total_leverage for n in ("Low", "Medium", "High")]
+    risks = [by_name[n].downside.returns.prob_moic_below_1 for n in ("Low", "Medium", "High")]
+
+    assert leverages == sorted(leverages)  # sanity: the bumps actually increased leverage
+    assert risks == sorted(risks)  # P(MOIC < 1.0x) rises monotonically with leverage
+    assert risks[-1] > risks[0]  # and it's a real, not a flat, difference

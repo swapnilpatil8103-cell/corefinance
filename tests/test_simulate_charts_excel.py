@@ -112,7 +112,7 @@ def test_render_structure_comparison_chart_writes_png(tmp_path, comparison_bundl
     assert path.stat().st_size > 1000
 
 
-def test_structure_comparison_chart_default_risk_axis_is_prob_below_hurdle(
+def test_structure_comparison_chart_default_risk_axis_is_prob_moic_below_1(
     tmp_path, comparison_bundle
 ):
     _, _, entries, _, _, _, _ = comparison_bundle
@@ -121,6 +121,29 @@ def test_structure_comparison_chart_default_risk_axis_is_prob_below_hurdle(
         with mock.patch("corefin.simulate.charts.plt.subplots", return_value=(fig, ax)):
             with mock.patch("corefin.simulate.charts.plt.close"):
                 render_structure_comparison_chart(entries, str(tmp_path / "unused.png"))
+        plotted_x = sorted(c.get_offsets()[0][0] for c in ax.collections)
+        expected_x = sorted(e.downside.returns.prob_moic_below_1 for e in entries)
+        assert plotted_x == pytest.approx(expected_x)
+        assert "riskier" in ax.get_xlabel().lower()
+        assert "moic" in ax.get_xlabel().lower()
+        # Both axes formatted as percentages.
+        assert "%" in ax.xaxis.get_major_formatter()(0.05)
+        assert "%" in ax.yaxis.get_major_formatter()(0.05)
+    finally:
+        plt.close(fig)
+
+
+def test_structure_comparison_chart_prob_irr_below_hurdle_is_selectable(
+    tmp_path, comparison_bundle
+):
+    _, _, entries, _, _, _, _ = comparison_bundle
+    fig, ax = plt.subplots()
+    try:
+        with mock.patch("corefin.simulate.charts.plt.subplots", return_value=(fig, ax)):
+            with mock.patch("corefin.simulate.charts.plt.close"):
+                render_structure_comparison_chart(
+                    entries, str(tmp_path / "unused.png"), risk_metric="prob_irr_below_hurdle"
+                )
         plotted_x = sorted(c.get_offsets()[0][0] for c in ax.collections)
         expected_x = sorted(e.downside.returns.prob_irr_below_hurdle for e in entries)
         assert plotted_x == pytest.approx(expected_x)

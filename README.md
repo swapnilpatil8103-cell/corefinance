@@ -622,9 +622,14 @@ percentile markers and a hurdle line, a net-leverage fan chart, a
 covenant-breach/distress-probability-by-year chart, a value-creation
 bridge waterfall, a tornado chart, and a return-vs-risk scatter across
 the compared structures (mean IRR against a risk measure where **higher
-always means riskier** — P(IRR below the hurdle) by default, so "further
-right" never means anything but worse; `expected_shortfall_10pct`, sign-
-flipped so higher still means riskier, is available as an alternative).
+always means riskier** — P(MOIC < 1.0x) by default, so "further right"
+never means anything but worse. P(IRR < hurdle) is deliberately *not*
+the default despite looking like a natural risk axis: it falls as
+leverage rises whenever leverage lifts the median IRR above the hurdle,
+which would make a riskier structure look safer on this chart — it's
+still selectable via `risk_metric`, alongside `expected_shortfall_10pct`
+(sign-flipped so higher still means riskier). Both axes are formatted as
+percentages.
 
 Named stress scenarios are timestamped in the output with the calendar
 year (or "Period N" if the config has no `start_year`) the shock actually
@@ -667,8 +672,10 @@ leverage lifts the middle of the distribution enough that fewer scenarios
 fall short of the 15% hurdle specifically, even though the tail is worse.
 That's not a contradiction — it's two different questions ("how often do
 we miss the hurdle" vs. "how bad is the worst case") with different
-answers, which is exactly why the engine reports both instead of
-collapsing risk into one number.
+answers — but it's exactly why the return-vs-risk chart defaults to
+P(MOIC < 1.0x) rather than P(IRR < hurdle): a risk axis that can make a
+more levered, genuinely riskier structure look safer would be actively
+misleading.
 
 ![Structure comparison: return vs risk](docs/simulate/structure_comparison.png)
 
