@@ -1,3 +1,6 @@
+from unittest import mock
+
+import matplotlib.pyplot as plt
 import openpyxl
 import pytest
 
@@ -107,6 +110,49 @@ def test_render_structure_comparison_chart_writes_png(tmp_path, comparison_bundl
     render_structure_comparison_chart(entries, str(path))
     assert path.exists()
     assert path.stat().st_size > 1000
+
+
+def test_structure_comparison_chart_default_risk_axis_is_prob_below_hurdle(
+    tmp_path, comparison_bundle
+):
+    _, _, entries, _, _, _, _ = comparison_bundle
+    fig, ax = plt.subplots()
+    try:
+        with mock.patch("corefin.simulate.charts.plt.subplots", return_value=(fig, ax)):
+            with mock.patch("corefin.simulate.charts.plt.close"):
+                render_structure_comparison_chart(entries, str(tmp_path / "unused.png"))
+        plotted_x = sorted(c.get_offsets()[0][0] for c in ax.collections)
+        expected_x = sorted(e.downside.returns.prob_irr_below_hurdle for e in entries)
+        assert plotted_x == pytest.approx(expected_x)
+        assert "riskier" in ax.get_xlabel().lower()
+        assert "hurdle" in ax.get_xlabel().lower()
+    finally:
+        plt.close(fig)
+
+
+def test_structure_comparison_chart_expected_shortfall_metric_is_sign_flipped(
+    tmp_path, comparison_bundle
+):
+    _, _, entries, _, _, _, _ = comparison_bundle
+    fig, ax = plt.subplots()
+    try:
+        with mock.patch("corefin.simulate.charts.plt.subplots", return_value=(fig, ax)):
+            with mock.patch("corefin.simulate.charts.plt.close"):
+                render_structure_comparison_chart(
+                    entries, str(tmp_path / "unused.png"), risk_metric="expected_shortfall_10pct"
+                )
+        plotted_x = sorted(c.get_offsets()[0][0] for c in ax.collections)
+        expected_x = sorted(-e.downside.returns.expected_shortfall_irr_10pct for e in entries)
+        assert plotted_x == pytest.approx(expected_x)
+        assert "riskier" in ax.get_xlabel().lower()
+    finally:
+        plt.close(fig)
+
+
+def test_structure_comparison_chart_rejects_unknown_risk_metric(comparison_bundle):
+    _, _, entries, _, _, _, _ = comparison_bundle
+    with pytest.raises(ValueError, match="risk_metric"):
+        render_structure_comparison_chart(entries, "unused.png", risk_metric="bogus")
 
 
 def test_export_simulation_to_excel_writes_all_expected_sheets(tmp_path, comparison_bundle):

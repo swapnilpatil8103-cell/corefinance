@@ -1,7 +1,12 @@
-# Fictional mid-market services company LBO.
-# ~$500mm revenue, ~20% EBITDA margin, 5.5x total leverage (3.75x TLB + 1.75x
-# senior notes; revolver undrawn at close). All dollar figures are $mm, all
-# rates/margins/percentages are decimal fractions, multiples are bare floats.
+# Same fictional mid-market services company LBO as example_midmarket.yaml,
+# with a scenario.advanced block added to demonstrate the Sponsor LBO Monte
+# Carlo engine's richer scenario generation (persistence, recession regimes,
+# fat tails, mean-reverting rates, a fundamentals-linked exit multiple).
+# Every value in the advanced block is illustrative, not calibrated to any
+# real dataset or company -- it exists to demonstrate the mechanism, not to
+# represent this fictional company's true risk. All dollar figures are $mm,
+# all rates/margins/percentages are decimal fractions, multiples are bare
+# floats.
 
 timeline:
   n_periods: 7
@@ -103,6 +108,44 @@ scenario:
     nwc_pct_revenue_std: 0.01
     exit_multiple_std: 0.5
     base_rate_std: 0.005
+
+  # Richer Monte Carlo generation (Stage 2 of the Sponsor LBO Monte Carlo
+  # engine) -- every field below is illustrative, not calibrated. Leaving
+  # this whole block out (as example_midmarket.yaml does) reproduces the
+  # simple i.i.d.-shock generator exactly; corefin run/optimize never read
+  # this block at all.
+  advanced:
+    persistence:
+      # AR(1) autocorrelation: a bad (or good) year has some tendency to be
+      # followed by another one, instead of every period being independent
+      # noise. 0.5 is a moderate, illustrative persistence.
+      revenue_growth_phi: 0.5
+      ebitda_margin_phi: 0.5
+    regime:
+      # ~10%/year chance of a new 2-year recession starting -- illustrative,
+      # not fit to any macro dataset. Hits reuse the same magnitudes as the
+      # deterministic "Recession in Year 2" stress scenario below.
+      annual_probability: 0.10
+      duration_years: 2
+      revenue_growth_hit: -0.10
+      ebitda_margin_hit: -0.03
+    fat_tails:
+      # Student-t innovations instead of normal; lower degrees of freedom =
+      # fatter tails. 5 is a common illustrative choice, not fit to data.
+      degrees_of_freedom: 5.0
+    rate_mean_reversion:
+      # Illustrative speed of reversion and long-run level, below the 4.5%
+      # entry base rate -- demonstrates the mechanism, not a rate forecast.
+      kappa: 0.3
+      long_run_mean: 0.04
+    exit_multiple_link:
+      # Illustrative sensitivities, not fit to any comparable transaction
+      # data. reference_cagr matches the base case's own ~5% EBITDA CAGR
+      # (flat margin), so the growth term is ~0 in the unshocked case.
+      beta_growth: 3.0
+      reference_cagr: 0.05
+      beta_rate: -3.0
+      reference_rate: 0.045
 
 waterfall:
   minimum_cash_mm: 15.0

@@ -48,6 +48,7 @@ from corefin.simulate.compare import (
 )
 from corefin.simulate.excel_export import export_simulation_to_excel
 from corefin.simulate.importance import compute_driver_importance, compute_tornado_chart
+from corefin.simulate.stress import stress_shock_start_year_label
 from corefin.statements.corporate_model import run_corporate_model_with_debt
 from corefin.timeline import Timeline
 from corefin.transaction.returns import compute_exit_and_returns
@@ -581,11 +582,16 @@ def simulate(
     typer.echo("")
 
     if primary.stress_results:
+        stress_configs = (
+            root_config.simulate.stress_scenarios if root_config.simulate is not None else []
+        )
         typer.echo(f"Named stress scenarios ({primary_name}):")
-        for s in primary.stress_results:
+        for s, sc in zip(primary.stress_results, stress_configs, strict=True):
             distress_label = "YES" if s.distress_overall else "no"
+            year_label = stress_shock_start_year_label(sc.shocks, timeline)
+            name_label = f"{s.name} ({year_label})" if year_label is not None else s.name
             typer.echo(
-                f"  {s.name}: IRR={s.irr:.1%}  MOIC={s.moic:.2f}x  "
+                f"  {name_label}: IRR={s.irr:.1%}  MOIC={s.moic:.2f}x  "
                 f"MinLiquidity=${s.min_liquidity_mm:.1f}mm  "
                 f"MaxRevolverDraw={s.max_revolver_draw_pct:.0%}  Distress={distress_label}"
             )

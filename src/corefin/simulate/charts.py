@@ -155,17 +155,48 @@ def render_tornado_chart(bars: list[TornadoBar], path: str) -> None:
     plt.close(fig)
 
 
-def render_structure_comparison_chart(entries: list[StructureComparisonEntry], path: str) -> None:
+def render_structure_comparison_chart(
+    entries: list[StructureComparisonEntry],
+    path: str,
+    risk_metric: str = "prob_irr_below_hurdle",
+) -> None:
+    """Mean IRR (return, higher = better) against a risk measure where
+    HIGHER always means riskier, so "further right and up" reads as
+    unambiguously better on both axes and "further right" always reads as
+    worse on the risk axis specifically. Defaults to P(IRR < hurdle);
+    "expected_shortfall_10pct" plots the *negative* of expected shortfall
+    (still higher = riskier, since a lower/more-negative raw expected
+    shortfall is the worse outcome) as the alternative."""
+    if risk_metric == "prob_irr_below_hurdle":
+
+        def risk_value(r):
+            return r.prob_irr_below_hurdle
+
+        def risk_label(r):
+            return f"P(IRR < {r.irr_hurdle:.0%} hurdle) -- risk (higher = riskier)"
+    elif risk_metric == "expected_shortfall_10pct":
+
+        def risk_value(r):
+            return -r.expected_shortfall_irr_10pct
+
+        def risk_label(r):
+            return "Negative expected shortfall, worst 10% (IRR) -- risk (higher = riskier)"
+    else:
+        raise ValueError(
+            f"unknown risk_metric {risk_metric!r}, expected "
+            "'prob_irr_below_hurdle' or 'expected_shortfall_10pct'"
+        )
+
     fig, ax = plt.subplots(figsize=(9, 5.5))
     for entry in entries:
-        risk = entry.downside.returns.expected_shortfall_irr_10pct
+        risk = risk_value(entry.downside.returns)
         ret = entry.downside.returns.mean_irr
         ax.scatter(risk, ret, s=140, zorder=3)
         ax.annotate(
             entry.name, (risk, ret), textcoords="offset points", xytext=(8, 6), fontsize="small"
         )
-    ax.set_xlabel("Expected shortfall, worst 10% (IRR) -- risk")
-    ax.set_ylabel("Mean IRR -- return")
+    ax.set_xlabel(risk_label(entries[0].downside.returns) if entries else "Risk")
+    ax.set_ylabel("Mean IRR -- return (higher = better)")
     ax.set_title("Return vs risk across structures")
     fig.tight_layout()
     fig.savefig(path, dpi=150)

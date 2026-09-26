@@ -44,6 +44,20 @@ from corefin.timeline import Timeline
 from corefin.transaction.returns import compute_exit_and_returns
 
 
+def stress_shock_start_year_label(shock: StressShockConfig, timeline: Timeline) -> str | None:
+    """The calendar year (or "Period N" label, if the config has no
+    start_year) the shock first takes effect -- the earliest of the
+    recession/rate-shock start years configured on this scenario, if any.
+    None for a scenario with neither (e.g. multiple compression alone,
+    which has no start year -- it only acts at exit)."""
+    start_indices = [
+        s.start_year_index for s in (shock.recession, shock.rate_shock) if s is not None
+    ]
+    if not start_indices:
+        return None
+    return timeline.year_labels[min(start_indices)]
+
+
 def apply_stress_shock(
     base: DriverSet,
     timeline: Timeline,

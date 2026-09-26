@@ -15,7 +15,12 @@ from corefin.checks.framework import run_checks
 from corefin.optimize.structure import build_structure
 from corefin.scenarios.generator import deterministic_drivers
 from corefin.simulate.liquidity import compute_liquidity
-from corefin.simulate.stress import apply_stress_shock, run_stress_scenario, run_stress_scenarios
+from corefin.simulate.stress import (
+    apply_stress_shock,
+    run_stress_scenario,
+    run_stress_scenarios,
+    stress_shock_start_year_label,
+)
 from corefin.statements.corporate_model import run_corporate_model_with_debt
 from corefin.timeline import Timeline
 from tests.conftest import minimal_config_dict
@@ -299,3 +304,30 @@ def test_stress_scenario_balance_sheet_and_debt_integrity():
             check_debt_rollforward(result.debt_schedule),
         ]
     )
+
+
+def test_start_year_label_uses_calendar_year_when_configured():
+    timeline = Timeline.annual(n_periods=5, start_year=2025)
+    shock = StressShockConfig(recession=RecessionStressConfig(start_year_index=1))
+    assert stress_shock_start_year_label(shock, timeline) == "2026"
+
+
+def test_start_year_label_falls_back_to_period_label_without_start_year():
+    timeline = Timeline.annual(n_periods=5)  # no start_year
+    shock = StressShockConfig(recession=RecessionStressConfig(start_year_index=1))
+    assert stress_shock_start_year_label(shock, timeline) == "Period 2"
+
+
+def test_start_year_label_is_none_for_multiple_compression_alone():
+    timeline = Timeline.annual(n_periods=5, start_year=2025)
+    shock = StressShockConfig(multiple_compression=MultipleCompressionStressConfig(delta=-2.0))
+    assert stress_shock_start_year_label(shock, timeline) is None
+
+
+def test_start_year_label_uses_earliest_shock_when_combined():
+    timeline = Timeline.annual(n_periods=5, start_year=2025)
+    shock = StressShockConfig(
+        recession=RecessionStressConfig(start_year_index=2),
+        rate_shock=RateShockStressConfig(start_year_index=0),
+    )
+    assert stress_shock_start_year_label(shock, timeline) == "2025"

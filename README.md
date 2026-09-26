@@ -621,7 +621,61 @@ in depth) — and six PNGs into `--charts-dir`: an IRR histogram with
 percentile markers and a hurdle line, a net-leverage fan chart, a
 covenant-breach/distress-probability-by-year chart, a value-creation
 bridge waterfall, a tornado chart, and a return-vs-risk scatter across
-the compared structures.
+the compared structures (mean IRR against a risk measure where **higher
+always means riskier** — P(IRR below the hurdle) by default, so "further
+right" never means anything but worse; `expected_shortfall_10pct`, sign-
+flipped so higher still means riskier, is available as an alternative).
+
+Named stress scenarios are timestamped in the output with the calendar
+year (or "Period N" if the config has no `start_year`) the shock actually
+first takes effect — e.g. "Recession in Year 2 (2026)" — derived from the
+scenario's own `start_year_index`, not just its name, so a config edit to
+the timing can never silently drift out of sync with what's printed.
+
+### Walkthrough: the richer Monte Carlo generator
+
+`configs/example_midmarket_stress.yaml` is the same deal as
+`configs/example_midmarket.yaml`, with a `scenario.advanced` block added
+(illustrative persistence, recession regime, fat tails, mean-reverting
+rate and exit-multiple link — see
+[Richer scenario generation](#richer-scenario-generation) above).
+`example_midmarket.yaml` itself is untouched and still exercises the
+simple generator, exactly as `run` and `optimize` expect.
+
+```bash
+uv run corefin simulate --config configs/example_midmarket_stress.yaml
+```
+
+Structure comparison, Input vs. the optimizer's recommendation vs. a
++1.0x-TLB more-levered variant, common random numbers throughout:
+
+|                                 |   Input |   Optimized | Optimized +1.0x TLB |
+| ------------------------------- | ------: | ----------: | -------------------: |
+| Total leverage                  |   5.50x |       3.46x |                4.46x |
+| Mean IRR                        |   11.6% |       10.8% |                11.5% |
+| Expected shortfall (worst 10%)  |  -11.3% |        0.9% |               -1.3% |
+| P(MOIC < 1.0x)                  |    9.0% |        2.7% |                4.8% |
+| P(IRR < 15% hurdle)             |   57.1% |       79.2% |               67.5% |
+
+Expected shortfall and loss probability both worsen monotonically with
+leverage (0.9% → -1.3% → -11.3% expected shortfall; 2.7% → 4.8% → 9.0%
+P(MOIC < 1.0x), reading low-leverage → high-leverage) — the fat tails and
+clustered recessions in the advanced generator make the downside of
+extra leverage bite harder than the simple generator would show. Notice
+P(IRR < hurdle) moves the *other* way (79.2% → 67.5% → 57.1%): more
+leverage lifts the middle of the distribution enough that fewer scenarios
+fall short of the 15% hurdle specifically, even though the tail is worse.
+That's not a contradiction — it's two different questions ("how often do
+we miss the hurdle" vs. "how bad is the worst case") with different
+answers, which is exactly why the engine reports both instead of
+collapsing risk into one number.
+
+![Structure comparison: return vs risk](docs/simulate/structure_comparison.png)
+
+Value creation bridge for the optimizer's recommendation, averaged across
+scenarios — the four components sum exactly to the total:
+
+![Value creation bridge](docs/simulate/value_bridge.png)
 
 ## Where the bank model plugs in
 
