@@ -18,6 +18,11 @@ wheels/
 # Generated model output
 *.xlsx
 !configs/*.xlsx
+# corefin run/optimize/simulate default their chart/workbook output paths to
+# the current working directory -- ignore stray PNGs written to the repo
+# root, but keep docs/simulate/*.png (embedded in the README) tracked; the
+# root-anchored pattern below never matches that subdirectory anyway.
+/*.png
 
 # OS files
 .DS_Store
