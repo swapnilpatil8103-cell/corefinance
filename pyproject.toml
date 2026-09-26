@@ -14,6 +14,17 @@ dependencies = [
     "typer>=0.12",
 ]
 
+[project.optional-dependencies]
+# Credit-Loss Forecasting Engine (corefin/credit/): data fetch, panel storage
+# and the model families. Kept optional so the core LBO/optimizer/simulate
+# install stays light for users who don't need the FIG credit-risk track.
+fig = [
+    "pyarrow>=15.0",
+    "requests>=2.31",
+    "scikit-learn>=1.4",
+    "statsmodels>=0.14",
+]
+
 [project.scripts]
 corefin = "corefin.cli:app"
 
