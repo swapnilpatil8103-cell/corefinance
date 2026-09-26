@@ -8,6 +8,16 @@ configurable recovery period), rate shock (a permanent, held base_rate
 shift), and multiple compression (an exit-multiple shift). A named
 scenario can combine any subset of these -- "combined downside" sets all
 three at once.
+
+Exit-multiple/rate interaction: if `scenario.advanced.exit_multiple_link`
+is configured (Stage 2's structural link between the exit multiple and
+exit-year fundamentals -- see scenarios/generator.py), a stress scenario
+that includes a rate shock also applies that link's `beta_rate`
+sensitivity to the exit multiple (`beta_rate * shock.rate_shock.bps`),
+stacking additively with any explicit `multiple_compression` in the same
+scenario. Without a rate shock component, or without the link configured,
+a stress scenario's exit multiple is unaffected by this -- the link only
+fires for the rate change the scenario actually tests.
 """
 
 from __future__ import annotations
@@ -16,22 +26,35 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from corefin.assumptions.schema import NamedStressScenarioConfig, RootConfig, StressShockConfig
+from corefin.assumptions.schema import (
+    ExitMultipleLinkConfig,
+    NamedStressScenarioConfig,
+    RootConfig,
+    StressShockConfig,
+)
 from corefin.metrics.covenants import evaluate_covenants
 from corefin.metrics.credit_metrics import compute_credit_metrics
 from corefin.optimize.structure import CandidateStructure
 from corefin.scenarios.drivers import DriverSet
 from corefin.scenarios.generator import deterministic_drivers
 from corefin.simulate.distress import compute_distress_flags
+from corefin.simulate.liquidity import compute_liquidity
 from corefin.statements.corporate_model import run_corporate_model_with_debt
 from corefin.timeline import Timeline
 from corefin.transaction.returns import compute_exit_and_returns
 
 
-def apply_stress_shock(base: DriverSet, timeline: Timeline, shock: StressShockConfig) -> DriverSet:
+def apply_stress_shock(
+    base: DriverSet,
+    timeline: Timeline,
+    shock: StressShockConfig,
+    exit_multiple_link: ExitMultipleLinkConfig | None = None,
+) -> DriverSet:
     """Applies `shock`'s configured components on top of `base` (typically
     the deterministic zero-vol case). Any component left unset (None)
-    leaves that part of the path untouched."""
+    leaves that part of the path untouched. `exit_multiple_link` is the
+    root config's scenario.advanced.exit_multiple_link, if any -- see the
+    module docstring for how it interacts with a rate shock."""
     revenue_growth = base.revenue_growth.copy()
     ebitda_margin = base.ebitda_margin.copy()
     base_rate = base.base_rate.copy()
@@ -55,6 +78,8 @@ def apply_stress_shock(base: DriverSet, timeline: Timeline, shock: StressShockCo
     if shock.rate_shock is not None:
         rs = shock.rate_shock
         base_rate[:, rs.start_year_index :] += rs.bps
+        if exit_multiple_link is not None:
+            exit_multiple = exit_multiple + exit_multiple_link.beta_rate * rs.bps
 
     if shock.multiple_compression is not None:
         exit_multiple = exit_multiple + shock.multiple_compression.delta
@@ -74,7 +99,8 @@ class StressScenarioResult:
     name: str
     irr: float
     moic: float
-    min_liquidity_mm: float
+    min_liquidity_mm: float  # cash + undrawn revolver capacity
+    min_cash_mm: float  # cash alone, kept separate since the two mean different things
     max_revolver_draw_pct: float
     covenant_breach_by_year: dict[str, np.ndarray]
     distress_by_year: np.ndarray
@@ -91,7 +117,9 @@ def run_stress_scenario(
     optimizer's recommended structure, or the input config's own structure
     -- see optimize/structure.py, reused rather than reimplemented here)."""
     base = deterministic_drivers(root_config, timeline)
-    shocked = apply_stress_shock(base, timeline, scenario_config.shocks)
+    advanced = root_config.scenario.advanced
+    exit_multiple_link = advanced.exit_multiple_link if advanced is not None else None
+    shocked = apply_stress_shock(base, timeline, scenario_config.shocks, exit_multiple_link)
 
     result = run_corporate_model_with_debt(
         root_config.company,
@@ -122,6 +150,9 @@ def run_stress_scenario(
         result.cash_flow_statement.dividends,
     )
     distress = compute_distress_flags(result.debt_schedule, credit_metrics)[0]
+    liquidity = compute_liquidity(
+        result.balance_sheet.cash, result.debt_schedule, candidate.tranches
+    )
 
     revolver = next(t for t in candidate.tranches if t.is_revolver)
     revolver_draw_pct = (
@@ -134,7 +165,8 @@ def run_stress_scenario(
         name=scenario_config.name,
         irr=float(exit_result.irr[0]),
         moic=float(exit_result.moic[0]),
-        min_liquidity_mm=float(result.balance_sheet.cash[0].min()),
+        min_liquidity_mm=float(liquidity[0].min()),
+        min_cash_mm=float(result.balance_sheet.cash[0].min()),
         max_revolver_draw_pct=float(revolver_draw_pct.max()),
         covenant_breach_by_year={cov.name: cov.breach[0] for cov in covenant_results},
         distress_by_year=distress,

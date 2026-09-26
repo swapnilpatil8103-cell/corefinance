@@ -14,6 +14,7 @@ from corefin.checks.debt_checks import check_debt_rollforward
 from corefin.checks.framework import run_checks
 from corefin.optimize.structure import build_structure
 from corefin.scenarios.generator import deterministic_drivers
+from corefin.simulate.liquidity import compute_liquidity
 from corefin.simulate.stress import apply_stress_shock, run_stress_scenario, run_stress_scenarios
 from corefin.statements.corporate_model import run_corporate_model_with_debt
 from corefin.timeline import Timeline
@@ -158,6 +159,115 @@ def test_run_stress_scenarios_returns_one_result_per_config_in_order():
     ]
     results = run_stress_scenarios(config, candidate, timeline, configs)
     assert [r.name for r in results] == ["Base", "Rate"]
+
+
+def test_liquidity_falls_when_revolver_is_drawn_in_a_stress_scenario():
+    data = minimal_config_dict(n_periods=6)
+    data["optimizer"] = {
+        "decision_variables": [{"tranche_name": "TLB", "min_multiple": 1.0, "max_multiple": 5.0}]
+    }
+    config = RootConfig.model_validate(data)
+    timeline = Timeline.annual(n_periods=6)
+    candidate = build_structure(config, {"TLB": 4.5})  # highly levered -- thin cash cushion
+    revolver = next(t for t in candidate.tranches if t.is_revolver)
+
+    severe = StressShockConfig(
+        recession=RecessionStressConfig(
+            start_year_index=0, revenue_growth_hit=-0.6, ebitda_margin_hit=-0.18, recovery_years=0
+        )
+    )
+    shocked = apply_stress_shock(deterministic_drivers(config, timeline), timeline, severe)
+    result = run_corporate_model_with_debt(
+        config.company,
+        candidate.opening_balance_sheet,
+        candidate.tranches,
+        config.waterfall,
+        timeline,
+        shocked,
+    )
+
+    drawn = result.debt_schedule.ending_balance[revolver.name][0]
+    assert np.any(drawn > 0)  # the shock must actually force a draw, or this test proves nothing
+
+    liquidity = compute_liquidity(
+        result.balance_sheet.cash, result.debt_schedule, candidate.tranches
+    )[0]
+    cash = result.balance_sheet.cash[0]
+    np.testing.assert_allclose(liquidity, cash + (revolver.size_mm - drawn))
+    drawn_periods = drawn > 0
+    assert np.all(liquidity[drawn_periods] < cash[drawn_periods] + revolver.size_mm)
+
+
+def test_stress_scenario_result_reports_liquidity_and_cash_separately():
+    config = _config(n_periods=6)
+    timeline = Timeline.annual(n_periods=6)
+    candidate = build_structure(config, {"TLB": 2.0})
+    revolver = next(t for t in candidate.tranches if t.is_revolver)
+
+    baseline = run_stress_scenario(config, candidate, timeline, _baseline_scenario())
+    assert baseline.max_revolver_draw_pct == pytest.approx(0.0, abs=1e-9)
+    # Undrawn revolver -- liquidity is exactly cash plus the full commitment.
+    assert baseline.min_liquidity_mm == pytest.approx(baseline.min_cash_mm + revolver.size_mm)
+    # General invariant regardless of draw: liquidity[t] >= cash[t] for every t
+    # (undrawn capacity is never negative), so the minimum over time can only rise.
+    assert baseline.min_liquidity_mm >= baseline.min_cash_mm
+
+
+def test_rate_shock_applies_exit_multiple_link_rate_sensitivity_when_configured():
+    data = minimal_config_dict(n_periods=5)
+    data["scenario"]["advanced"] = {
+        "exit_multiple_link": {"beta_rate": -3.0, "reference_rate": 0.03}
+    }
+    config = RootConfig.model_validate(data)
+    timeline = Timeline.annual(n_periods=5)
+    base = deterministic_drivers(config, timeline)
+    link = config.scenario.advanced.exit_multiple_link
+
+    shock = StressShockConfig(rate_shock=RateShockStressConfig(bps=0.03))
+    shocked = apply_stress_shock(base, timeline, shock, exit_multiple_link=link)
+    expected = base.exit_multiple[0] + link.beta_rate * 0.03
+    assert shocked.exit_multiple[0] == pytest.approx(expected)
+
+
+def test_rate_shock_without_link_configured_leaves_exit_multiple_unaffected():
+    config = _config(n_periods=5)
+    timeline = Timeline.annual(n_periods=5)
+    base = deterministic_drivers(config, timeline)
+    shock = StressShockConfig(rate_shock=RateShockStressConfig(bps=0.03))
+    shocked = apply_stress_shock(base, timeline, shock)  # exit_multiple_link defaults to None
+    assert shocked.exit_multiple[0] == pytest.approx(base.exit_multiple[0])
+
+
+def test_run_stress_scenario_rate_shock_exit_multiple_link_lowers_irr_further():
+    def _make(beta_rate: float) -> RootConfig:
+        data = minimal_config_dict(n_periods=5)
+        data["optimizer"] = {
+            "decision_variables": [
+                {"tranche_name": "TLB", "min_multiple": 1.0, "max_multiple": 3.0}
+            ]
+        }
+        if beta_rate != 0.0:
+            data["scenario"]["advanced"] = {"exit_multiple_link": {"beta_rate": beta_rate}}
+        return RootConfig.model_validate(data)
+
+    timeline = Timeline.annual(n_periods=5)
+    rate_shock_scenario = NamedStressScenarioConfig(
+        name="Rate", shocks=StressShockConfig(rate_shock=RateShockStressConfig(bps=0.03))
+    )
+
+    config_no_link = _make(0.0)
+    config_with_link = _make(-5.0)
+    result_no_link = run_stress_scenario(
+        config_no_link, build_structure(config_no_link, {"TLB": 2.0}), timeline, rate_shock_scenario
+    )
+    result_with_link = run_stress_scenario(
+        config_with_link,
+        build_structure(config_with_link, {"TLB": 2.0}),
+        timeline,
+        rate_shock_scenario,
+    )
+
+    assert result_with_link.irr < result_no_link.irr
 
 
 def test_stress_scenario_balance_sheet_and_debt_integrity():

@@ -18,6 +18,7 @@ from corefin.optimize.search import generate_search_drivers
 from corefin.optimize.structure import CandidateStructure
 from corefin.scenarios.drivers import DriverSet
 from corefin.simulate.distress import compute_distress_flags
+from corefin.simulate.liquidity import compute_liquidity
 from corefin.statements.corporate_model import (
     CorporateModelWithDebtResult,
     run_corporate_model_with_debt,
@@ -36,6 +37,7 @@ class SimulationResult:
     covenant_results: list[CovenantResult]
     exit_result: ExitResult
     distress_by_year: np.ndarray  # (n_scenarios, n_periods) bool
+    liquidity_mm: np.ndarray  # (n_scenarios, n_periods) cash + undrawn revolver capacity
 
 
 def run_simulation(
@@ -88,6 +90,9 @@ def run_simulation(
         model_result.cash_flow_statement.dividends,
     )
     distress_by_year = compute_distress_flags(model_result.debt_schedule, credit_metrics)
+    liquidity_mm = compute_liquidity(
+        model_result.balance_sheet.cash, model_result.debt_schedule, candidate.tranches
+    )
 
     return SimulationResult(
         candidate=candidate,
@@ -98,4 +103,5 @@ def run_simulation(
         covenant_results=covenant_results,
         exit_result=exit_result,
         distress_by_year=distress_by_year,
+        liquidity_mm=liquidity_mm,
     )

@@ -173,7 +173,8 @@ class DownsideAnalytics:
     covenant_breaches: CovenantBreachAnalytics
     distress: DistressAnalytics
     leverage_bands: PathPercentileBands
-    liquidity_bands: PathPercentileBands
+    liquidity_bands: PathPercentileBands  # cash + undrawn revolver capacity
+    cash_bands: PathPercentileBands  # cash alone, kept separate -- see simulate/liquidity.py
     convergence: ConvergenceCheck
 
 
@@ -188,8 +189,7 @@ def compute_downside_analytics(
         leverage_bands=compute_path_percentile_bands(
             simulation_result.credit_metrics.total_net_leverage
         ),
-        liquidity_bands=compute_path_percentile_bands(
-            simulation_result.model_result.balance_sheet.cash
-        ),
+        liquidity_bands=compute_path_percentile_bands(simulation_result.liquidity_mm),
+        cash_bands=compute_path_percentile_bands(simulation_result.model_result.balance_sheet.cash),
         convergence=compute_convergence_check(exit_result.irr, exit_result.moic),
     )
