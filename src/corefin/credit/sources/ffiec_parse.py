@@ -31,7 +31,18 @@ _ITEM_PREFIXES = ("RCON", "RCFD", "RIAD")
 def _read_schedule_part(zf: zipfile.ZipFile, name: str) -> pd.DataFrame:
     with zf.open(name) as fh:
         text = TextIOWrapper(fh, encoding="latin1")
-        return pd.read_csv(text, sep="\t", dtype=str, skiprows=[1])
+        # on_bad_lines="skip": confirmed against real data (2004Q1's RIE
+        # schedule) that a rare row has one extra tab-separated field --
+        # a stray literal tab inside one of that schedule's free-text
+        # narrative columns (a bank's own description of a misc income/
+        # expense line), not a structural problem with the file. Skipping
+        # that one bank's one row for that one schedule/quarter is far
+        # better than the whole build crashing; an outer merge elsewhere
+        # in this module means the bank still appears via its OTHER
+        # schedules, just missing the columns unique to this one.
+        return pd.read_csv(
+            text, sep="\t", dtype=str, skiprows=[1], on_bad_lines="skip", engine="c"
+        )
 
 
 def _read_schedule(zf: zipfile.ZipFile, name_contains: str) -> pd.DataFrame | None:

@@ -110,3 +110,28 @@ def test_parse_bulk_zip_coerces_non_numeric_cells_to_nan():
     zip_bytes = _make_zip({"FFIEC CDR Call Schedule RCCI 12312021.txt": rcci})
     result = ffiec_parse.parse_bulk_zip(zip_bytes, pd.Period("2021Q4", freq="Q"))
     assert result.loc[result["bank_id"] == "37", "RCON1766"].isna().iloc[0]
+
+
+def test_parse_bulk_zip_skips_a_malformed_row_instead_of_crashing():
+    # Confirmed against real data (2004Q1's RIE schedule): a rare row has
+    # one extra tab-separated field (a stray literal tab inside a
+    # free-text narrative column) -- must be skipped, not crash the parse.
+    rcci = '"IDRSSD"\tRCON1766\n\tdesc\n37\t100\n'
+    malformed_rie = (
+        '"IDRSSD"\tRIADJJ26\n'
+        "\tdesc\n"
+        "37\t1500\n"
+        "242\t1\t2\n"  # malformed: one extra field
+        "555\t900\n"
+    )
+    zip_bytes = _make_zip(
+        {
+            "FFIEC CDR Call Schedule RCCI 12312021.txt": rcci,
+            "FFIEC CDR Call Schedule RIE 12312021.txt": malformed_rie,
+        }
+    )
+    result = ffiec_parse.parse_bulk_zip(zip_bytes, pd.Period("2021Q4", freq="Q"))
+    # bank 242's malformed row is skipped -- bank 242 itself never appears
+    # in RCCI here, so it's simply absent from the result entirely.
+    assert "242" not in set(result["bank_id"])
+    assert result.loc[result["bank_id"] == "37", "RIADJJ26"].iloc[0] == pytest.approx(1500.0)
