@@ -85,6 +85,19 @@ def test_parse_bulk_zip_reads_the_plain_rc_schedule_for_allowance_items():
     assert "RCONXXXX" not in result.columns
 
 
+def test_parse_bulk_zip_reads_the_rie_schedule_for_cecl_adoption_items():
+    rie = '"IDRSSD"\tRIADJJ26\tRIADJJ28\n\tdesc\tdesc\n37\t1500\t1500\n'
+    zip_bytes = _make_zip(
+        {
+            "FFIEC CDR Call Schedule RCCI 12312021.txt": '"IDRSSD"\tRCON1766\n\tdesc\n37\t100\n',
+            "FFIEC CDR Call Schedule RIE 12312021.txt": rie,
+        }
+    )
+    result = ffiec_parse.parse_bulk_zip(zip_bytes, pd.Period("2021Q4", freq="Q"))
+    assert result["RIADJJ26"].iloc[0] == pytest.approx(1500.0)
+    assert result["RIADJJ28"].iloc[0] == pytest.approx(1500.0)
+
+
 def test_parse_bulk_zip_raises_when_no_expected_schedule_is_present():
     rca = '"IDRSSD"\tRCON1\n\tdesc\n37\t1\n'
     zip_bytes = _make_zip({"FFIEC CDR Call Schedule RCA 12312021.txt": rca})

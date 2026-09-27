@@ -221,11 +221,84 @@ def test_flag_merger_discontinuities_flags_large_jump_only():
 # --------------------------------------------------------------- CECL ------
 
 
-def test_cecl_regime_dummy_flips_at_adoption_quarter():
+def test_cecl_regime_dummy_uses_default_when_no_adoption_quarters_given():
     quarters = _quarters(["2019Q4", "2020Q1", "2020Q2"])
-    adoption_quarter = pd.Period("2020Q1", freq="Q")
-    dummy = panel.apply_cecl_regime_dummy(quarters, cecl_adoption_quarter=adoption_quarter)
+    bank_id = pd.Series(["A", "A", "A"])
+    default_quarter = pd.Period("2020Q1", freq="Q")
+    dummy = panel.apply_cecl_regime_dummy(
+        bank_id, quarters, adoption_quarters=None, default_adoption_quarter=default_quarter
+    )
     assert dummy.tolist() == [0, 1, 1]
+
+
+def test_cecl_regime_dummy_uses_each_banks_own_adoption_quarter():
+    bank_id = pd.Series(["A", "A", "B", "B"])
+    quarters = _quarters(["2019Q4", "2020Q1", "2019Q4", "2020Q1"])
+    adoption_quarters = pd.Series(
+        {"A": pd.Period("2020Q1", freq="Q"), "B": pd.Period("2023Q1", freq="Q")}
+    )
+    dummy = panel.apply_cecl_regime_dummy(bank_id, quarters, adoption_quarters)
+    # bank A adopted 2020Q1 -> [0, 1]; bank B adopted 2023Q1, hasn't yet -> [0, 0]
+    assert dummy.tolist() == [0, 1, 0, 0]
+
+
+def test_cecl_regime_dummy_falls_back_to_default_for_banks_missing_from_adoption_quarters():
+    bank_id = pd.Series(["A", "B"])
+    quarters = _quarters(["2020Q1", "2020Q1"])
+    adoption_quarters = pd.Series({"A": pd.Period("2020Q1", freq="Q")})  # B is missing
+    dummy = panel.apply_cecl_regime_dummy(
+        bank_id, quarters, adoption_quarters, default_adoption_quarter=pd.Period("2019Q1", freq="Q")
+    )
+    # bank A: real adoption quarter (2020Q1) -> regime starts now -> 1
+    # bank B: falls back to default (2019Q1), which is already past -> 1
+    assert dummy.tolist() == [1, 1]
+
+
+def test_derive_cecl_adoption_quarters_picks_the_first_nonzero_signal_quarter():
+    item_frame = pd.DataFrame(
+        {
+            "bank_id": ["A", "A", "A", "B", "B"],
+            "quarter": _quarters(["2019Q4", "2020Q1", "2020Q2", "2019Q4", "2023Q1"]),
+            "RIADJJ26": [0.0, 1500.0, 1500.0, 0.0, 800.0],
+            "RIADJJ28": [0.0, 0.0, 0.0, 0.0, 0.0],
+        }
+    )
+    result = panel.derive_cecl_adoption_quarters(item_frame)
+    assert result["A"] == pd.Period("2020Q1", freq="Q")
+    assert result["B"] == pd.Period("2023Q1", freq="Q")
+
+
+def test_derive_cecl_adoption_quarters_uses_either_indicator_item():
+    item_frame = pd.DataFrame(
+        {
+            "bank_id": ["A", "A"],
+            "quarter": _quarters(["2019Q4", "2020Q1"]),
+            "RIADJJ26": [0.0, 0.0],
+            "RIADJJ28": [0.0, 2000.0],  # only JJ28 is nonzero
+        }
+    )
+    result = panel.derive_cecl_adoption_quarters(item_frame)
+    assert result["A"] == pd.Period("2020Q1", freq="Q")
+
+
+def test_derive_cecl_adoption_quarters_returns_empty_when_columns_absent():
+    item_frame = pd.DataFrame({"bank_id": ["A"], "quarter": _quarters(["2020Q1"])})
+    result = panel.derive_cecl_adoption_quarters(item_frame)
+    assert result.empty
+
+
+def test_summarize_cecl_adoption_counts_reports_bank_count_per_quarter():
+    adoption_quarters = pd.Series(
+        {
+            "A": pd.Period("2020Q1", freq="Q"),
+            "B": pd.Period("2020Q1", freq="Q"),
+            "C": pd.Period("2023Q1", freq="Q"),
+        }
+    )
+    counts = panel.summarize_cecl_adoption_counts(adoption_quarters)
+    assert counts[pd.Period("2020Q1", freq="Q")] == 2
+    assert counts[pd.Period("2023Q1", freq="Q")] == 1
+    assert counts.index.tolist() == sorted(counts.index.tolist())
 
 
 # --------------------------------------------------------- min balance -----
@@ -490,6 +563,67 @@ def test_split_by_merger_flag_separates_flagged_rows():
     clean, flagged = panel.split_by_merger_flag(rollforward)
     assert clean["bank_id"].tolist() == ["A"]
     assert flagged["bank_id"].tolist() == ["B"]
+
+
+def test_split_by_cecl_adoption_flag_separates_flagged_rows():
+    rollforward = pd.DataFrame(
+        {
+            "bank_id": ["A", "B"],
+            "residual": [5.0, 999.0],
+            "cecl_adoption_flag": [False, True],
+        }
+    )
+    clean, flagged = panel.split_by_cecl_adoption_flag(rollforward)
+    assert clean["bank_id"].tolist() == ["A"]
+    assert flagged["bank_id"].tolist() == ["B"]
+
+
+def test_compute_bank_allowance_rollforward_flags_each_banks_own_adoption_quarter():
+    item_frame = _allowance_item_frame(
+        bank_id=["A", "A", "B", "B"],
+        quarter=_quarters(["2019Q4", "2020Q1", "2019Q4", "2020Q1"]),
+        RCON3123=[100.0, 110.0, 200.0, 210.0],
+        RIAD4230=[5.0, 5.0, 5.0, 5.0],
+        RIADC079=[2.0, 2.0, 2.0, 2.0],
+        RIAD4605=[1.0, 1.0, 1.0, 1.0],
+    )
+    allowance_panel = panel.build_allowance_panel(item_frame)
+    category_panel = pd.DataFrame(
+        {
+            "bank_id": [],
+            "quarter": pd.Series([], dtype="object"),
+            "category": [],
+            "chargeoff_quarterly": [],
+            "recovery_quarterly": [],
+        }
+    )
+    # bank A adopted 2020Q1; bank B never adopted within this fixture's window
+    adoption_quarters = pd.Series({"A": pd.Period("2020Q1", freq="Q")})
+    result = panel.compute_bank_allowance_rollforward(
+        allowance_panel, category_panel, categories=[], cecl_adoption_quarters=adoption_quarters
+    )
+    result = result.set_index(["bank_id", "quarter"])
+    assert result.loc[("A", pd.Period("2020Q1", freq="Q")), "cecl_adoption_flag"]
+    assert not result.loc[("A", pd.Period("2019Q4", freq="Q")), "cecl_adoption_flag"]
+    assert not result.loc[("B", pd.Period("2020Q1", freq="Q")), "cecl_adoption_flag"]
+
+
+def test_compute_bank_allowance_rollforward_defaults_cecl_adoption_flag_to_false():
+    item_frame = _allowance_item_frame()
+    allowance_panel = panel.build_allowance_panel(item_frame)
+    category_panel = pd.DataFrame(
+        {
+            "bank_id": [],
+            "quarter": pd.Series([], dtype="object"),
+            "category": [],
+            "chargeoff_quarterly": [],
+            "recovery_quarterly": [],
+        }
+    )
+    result = panel.compute_bank_allowance_rollforward(
+        allowance_panel, category_panel, categories=[]
+    )
+    assert not result["cecl_adoption_flag"].any()
 
 
 def test_summarize_mapped_category_coverage_computes_share_by_quarter():

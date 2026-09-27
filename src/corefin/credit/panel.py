@@ -14,6 +14,7 @@ import pandas as pd
 
 from corefin.credit.schema import (
     CATEGORY_MDRM_CODES,
+    CECL_ADOPTION_INDICATOR_ITEMS,
     PROVISION_EXPENSE_ITEM,
     TOTAL_ALLOWANCE_ITEM,
     TOTAL_CHARGEOFF_ITEM,
@@ -222,16 +223,57 @@ def flag_merger_discontinuities(balance: pd.Series, jump_threshold: float = 0.5)
     return (pct_change.abs() > jump_threshold).fillna(False)
 
 
+def derive_cecl_adoption_quarters(item_frame: pd.DataFrame) -> pd.Series:
+    """Returns a Series indexed by bank_id: each bank's own CECL adoption
+    quarter, derived as the FIRST quarter in `item_frame` where either
+    CECL_ADOPTION_INDICATOR_ITEMS column (RIADJJ26/RIADJJ28, only ever
+    populated 2019Q1-2023Q4) is reported non-null and nonzero -- see
+    schema.py's note for the real-data verification behind this. Banks
+    with no such quarter in `item_frame` (not covered by this window, or
+    the columns are entirely absent) are simply not included in the
+    result -- callers should fall back to a default adoption quarter for
+    them (see `apply_cecl_regime_dummy`'s `default_adoption_quarter`),
+    not treat their absence as "never adopted.\""""
+    available = [c for c in CECL_ADOPTION_INDICATOR_ITEMS if c in item_frame.columns]
+    if not available:
+        return pd.Series(dtype="object")
+    is_adoption_signal = (item_frame[available].fillna(0) != 0).any(axis=1)
+    signal_rows = item_frame.loc[is_adoption_signal, ["bank_id", "quarter"]]
+    return signal_rows.groupby("bank_id")["quarter"].min()
+
+
+def summarize_cecl_adoption_counts(adoption_quarters: pd.Series) -> pd.Series:
+    """adoption_quarters: from `derive_cecl_adoption_quarters`. Returns
+    the number of banks whose derived adoption quarter falls in each
+    quarter, sorted chronologically -- expect two clusters, one around
+    2020Q1 (large SEC filers' mandatory date) and a larger one around
+    2023Q1 (the final mandatory date for smaller/private companies)."""
+    return adoption_quarters.value_counts().sort_index()
+
+
 def apply_cecl_regime_dummy(
+    bank_id: pd.Series,
     quarter_period: pd.Series,
-    cecl_adoption_quarter: pd.Period = DEFAULT_CECL_TRANSITION_QUARTER,
+    adoption_quarters: pd.Series | None = None,
+    default_adoption_quarter: pd.Period = DEFAULT_CECL_TRANSITION_QUARTER,
 ) -> pd.Series:
-    """Returns a 0/1 regime dummy: 1 from `cecl_adoption_quarter` onward
-    (inclusive), 0 before. Real per-bank adoption quarter varies (large
-    SEC filers: 2020Q1; smaller/non-SEC filers phased through 2023) --
-    pass each bank's own adoption quarter when building a real panel."""
+    """Returns a 0/1 regime dummy: 1 from each bank's OWN adoption quarter
+    onward (inclusive), 0 before. `adoption_quarters` (e.g. from
+    `derive_cecl_adoption_quarters`): a Series indexed by bank_id giving
+    each bank's real adoption quarter. A bank missing from
+    `adoption_quarters` (or `adoption_quarters=None` entirely) uses
+    `default_adoption_quarter` instead -- a real approximation applied
+    uniformly, not a per-bank fact, so prefer passing
+    `derive_cecl_adoption_quarters`'s output whenever `item_frame` covers
+    2019Q1-2023Q4."""
     quarters = pd.PeriodIndex(quarter_period).asfreq("Q")
-    return pd.Series((quarters >= cecl_adoption_quarter).astype(int), index=quarter_period.index)
+    if adoption_quarters is not None:
+        mapped = bank_id.map(adoption_quarters)
+        per_row_adoption = mapped.where(mapped.notna(), default_adoption_quarter)
+    else:
+        per_row_adoption = pd.Series(default_adoption_quarter, index=quarter_period.index)
+    regime = quarters.to_numpy() >= per_row_adoption.to_numpy()
+    return pd.Series(regime.astype(int), index=quarter_period.index)
 
 
 def apply_min_balance_filter(balance: pd.Series, minimum: float) -> pd.Series:
@@ -246,7 +288,7 @@ def build_panel(
     item_frame: pd.DataFrame,
     categories: list[LoanCategory] | None = None,
     min_balance: float = 1_000.0,
-    cecl_adoption_quarter: pd.Period = DEFAULT_CECL_TRANSITION_QUARTER,
+    default_cecl_adoption_quarter: pd.Period = DEFAULT_CECL_TRANSITION_QUARTER,
     merger_jump_threshold: float = 0.5,
 ) -> pd.DataFrame:
     """Orchestrates the whole per-category panel build. `item_frame` needs
@@ -267,10 +309,17 @@ def build_panel(
     recovery_quarterly (`ytd_to_quarterly`, per bank), average_balance
     (`average_balance`, per bank), annualized_nco_rate
     (`annualized_nco_rate`), merger_flag (`flag_merger_discontinuities`,
-    per bank), cecl_regime (`apply_cecl_regime_dummy`) and keep (the
-    min-balance mask from `apply_min_balance_filter` -- filtering on it is
-    the caller's choice, not applied here)."""
+    per bank), cecl_regime and keep (the min-balance mask from
+    `apply_min_balance_filter` -- filtering on it is the caller's choice,
+    not applied here).
+
+    cecl_regime uses each bank's OWN CECL adoption quarter, derived from
+    `item_frame` via `derive_cecl_adoption_quarters` (needs RIADJJ26/JJ28,
+    only present 2019Q1-2023Q4 -- if `item_frame` doesn't cover that
+    window, or a specific bank never shows the signal within it, that
+    bank falls back to `default_cecl_adoption_quarter` uniformly)."""
     categories = categories if categories is not None else list(LoanCategory)
+    adoption_quarters = derive_cecl_adoption_quarters(item_frame)
     category_frames = []
 
     for category in categories:
@@ -320,7 +369,10 @@ def build_panel(
         cat_panel["merger_flag"] = (pct_change.abs() > merger_jump_threshold).fillna(False)
 
         cat_panel["cecl_regime"] = apply_cecl_regime_dummy(
-            cat_panel["quarter"], cecl_adoption_quarter
+            cat_panel["bank_id"],
+            cat_panel["quarter"],
+            adoption_quarters,
+            default_cecl_adoption_quarter,
         )
         cat_panel["keep"] = apply_min_balance_filter(cat_panel["balance"], min_balance)
         cat_panel["category"] = category
@@ -487,6 +539,7 @@ def compute_bank_allowance_rollforward(
     allowance_panel: pd.DataFrame,
     category_panel: pd.DataFrame,
     categories: list[LoanCategory] | None = None,
+    cecl_adoption_quarters: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Joins `allowance_panel` (from `build_allowance_panel`) with
     `category_panel` (from `build_panel`) to compute the bank-quarter
@@ -504,17 +557,28 @@ def compute_bank_allowance_rollforward(
     (summing it alongside AUTO/OTHER_CONSUMER would double-count, per
     schema.py's module docstring) -- pass an explicit list to change that.
 
+    `cecl_adoption_quarters` (e.g. from `derive_cecl_adoption_quarters`):
+    a Series indexed by bank_id giving each bank's CECL adoption quarter.
+    When given, `cecl_adoption_flag` is True for exactly the bank-quarter
+    row that IS that bank's own adoption quarter -- a bank's one-time
+    CECL transition adjustment to the allowance isn't organic provision/
+    charge-off activity either, so (like a merger) it breaks the
+    roll-forward identity for a known, different reason and should be
+    excluded from summary statistics the same way (see
+    `split_by_cecl_adoption_flag`). Omit it (or pass None) to get an
+    all-False column.
+
     Returns bank_id, quarter, allowance_balance, beginning_allowance (the
     prior quarter's allowance_balance, per bank -- NaN for each bank's
     first quarter), provision_quarterly, total_net_chargeoffs (bank-level,
     used in the residual), mapped_category_net_chargeoffs (this project's
-    categories, informational only), allowance_merger_flag, and residual.
-    A nonzero residual is expected against real data (a small "other
-    adjustments" Call Report line isn't modeled here); large residuals for
-    bank-quarters NOT flagged by allowance_merger_flag point to a mapping
-    or differencing error, not just real-world noise -- flagged
-    bank-quarters break the identity for a known, different reason (a
-    merger/acquisition's lump-sum allowance addition) and should be
+    categories, informational only), allowance_merger_flag,
+    cecl_adoption_flag, and residual. A nonzero residual is expected
+    against real data (a small "other adjustments" Call Report line isn't
+    modeled here); large residuals for bank-quarters flagged by NEITHER
+    allowance_merger_flag NOR cecl_adoption_flag point to a mapping or
+    differencing error, not just real-world noise -- flagged bank-quarters
+    break the identity for a known, different reason and should be
     excluded from summary statistics on the residual, not blamed on the
     mapping."""
     categories = (
@@ -543,6 +607,13 @@ def compute_bank_allowance_rollforward(
     merged["total_net_chargeoffs"] = (
         merged["total_chargeoff_quarterly"] - merged["total_recovery_quarterly"]
     )
+    if cecl_adoption_quarters is not None:
+        expected_adoption_quarter = merged["bank_id"].map(cecl_adoption_quarters)
+        merged["cecl_adoption_flag"] = (merged["quarter"] == expected_adoption_quarter).fillna(
+            False
+        )
+    else:
+        merged["cecl_adoption_flag"] = False
     merged["residual"] = allowance_rollforward_residual(
         merged["beginning_allowance"],
         merged["provision_quarterly"],
@@ -559,6 +630,7 @@ def compute_bank_allowance_rollforward(
             "total_net_chargeoffs",
             "mapped_category_net_chargeoffs",
             "allowance_merger_flag",
+            "cecl_adoption_flag",
             "residual",
         ]
     ]
@@ -573,6 +645,21 @@ def split_by_merger_flag(rollforward: pd.DataFrame) -> tuple[pd.DataFrame, pd.Da
     by design (the acquired allowance arrives as a lump sum, not through
     organic provision/charge-off activity), not because of a mapping bug."""
     flagged_mask = rollforward["allowance_merger_flag"].fillna(False)
+    return rollforward[~flagged_mask], rollforward[flagged_mask]
+
+
+def split_by_cecl_adoption_flag(rollforward: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Returns (clean, flagged) -- `rollforward` split by
+    cecl_adoption_flag (present when `compute_bank_allowance_rollforward`
+    was given `cecl_adoption_quarters`). A bank's one-time CECL transition
+    adjustment to the allowance (RIADJJ26/JJ28) isn't organic provision/
+    charge-off activity either, so it breaks the roll-forward identity for
+    the same structural reason a merger does -- exclude it from summary
+    statistics the same way. The two flags are independent (rarely but not
+    never both true for the same bank-quarter); apply both splits (this
+    one and `split_by_merger_flag`) to get a "clean" set excluding either
+    reason."""
+    flagged_mask = rollforward["cecl_adoption_flag"].fillna(False)
     return rollforward[~flagged_mask], rollforward[flagged_mask]
 
 

@@ -69,11 +69,13 @@ def parse_bulk_zip(zip_bytes: bytes, quarter: pd.Period) -> pd.DataFrame:
         _read_schedule(zf, "Schedule RCN "),
         _read_schedule(zf, "Schedule RIBI "),
         _read_schedule(zf, "Schedule RIBII "),
+        # RIADJJ26/JJ28 (CECL adoption indicators, 2019Q1-2023Q4 only) live here
+        _read_schedule(zf, "Schedule RIE "),
     ]
     present = [s for s in schedules if s is not None]
     if not present:
         raise ValueError(
-            "none of the expected schedule files (RC/RCCI/RCCII/RCN/RIBI/RIBII) "
+            "none of the expected schedule files (RC/RCCI/RCCII/RCN/RIBI/RIBII/RIE) "
             "were found in the ZIP"
         )
 

@@ -433,3 +433,19 @@ PROVISION_EXPENSE_ITEM = "RIAD4230"
 # RIBI or RIBII, across all 4887 banks in the 2021Q4 file.
 TOTAL_CHARGEOFF_ITEM = "RIADC079"
 TOTAL_RECOVERY_ITEM = "RIAD4605"
+
+# CECL (ASU 2016-13) adoption indicators -- both confirmed present in real
+# 2020Q1/2023Q1 bulk data, both ItemType "F" (a reported dollar figure, not
+# a boolean flag despite the names): RIADJJ26 "Adoption of Current Expected
+# Credit Losses Methodology" and its companion RIADJJ28 "Effect of adoption
+# of current expected credit losses methodology on allowances...". Per
+# MDRM, both are valid ONLY 2019Q1-2023Q4 (the item was retired once every
+# bank had transitioned) and, per the Call Report instructions, are
+# reported non-zero starting the bank's own adoption quarter -- confirmed
+# against real data: 220 of 5167 banks show a nonzero RIADJJ26 in 2020Q1
+# (the mandatory date for large SEC filers) and a much larger cohort
+# (~1800-1900 of ~4700) from 2023Q1 onward (the final mandatory date for
+# smaller/private companies), matching ASU 2016-13's known two-wave
+# rollout. See panel.py's `derive_cecl_adoption_quarters`, which takes the
+# first quarter either item is nonzero as that bank's adoption quarter.
+CECL_ADOPTION_INDICATOR_ITEMS = ("RIADJJ26", "RIADJJ28")
