@@ -25,9 +25,15 @@ def _quarter_range(start: str, end: str) -> list[pd.Period]:
 
 
 def _quarter_to_ffiec_date(quarter: pd.Period) -> str:
-    """Quarter-end date in the "MM/DD/YYYY" format `ffiec.py` expects."""
+    """Quarter-end date in the "MM/DD/YYYY" format the FFIEC site's own
+    dropdown uses -- confirmed live, months ARE zero-padded there
+    ("03/31/2001", not "3/31/2001"); day is always 30 or 31 so padding
+    doesn't matter for it, but getting the month wrong here silently
+    misses every real dropdown entry for Q1/Q2/Q3 (Q4's December never
+    needed padding, which is why this bug only showed up on 3 out of 4
+    quarters a year)."""
     end_timestamp = quarter.end_time
-    return f"{end_timestamp.month}/{end_timestamp.day}/{end_timestamp.year}"
+    return f"{end_timestamp.month:02d}/{end_timestamp.day:02d}/{end_timestamp.year}"
 
 
 def _cached_zip_path(raw_dir: Path, quarter: pd.Period) -> Path:

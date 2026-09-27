@@ -273,22 +273,35 @@ def build_panel(
         cat_panel = pd.concat(quarter_frames, ignore_index=True)
         cat_panel = cat_panel.sort_values(["bank_id", "quarter"]).reset_index(drop=True)
 
-        grouped = cat_panel.groupby("bank_id", group_keys=False, sort=False)
-        cat_panel["chargeoff_quarterly"] = grouped.apply(
-            lambda g: ytd_to_quarterly(g["chargeoff_ytd"], g["quarter"])
+        # Vectorized per-bank "prior quarter" lookups via groupby().shift() --
+        # NOT per-group .apply(pure_function), which scales terribly across
+        # the tens of thousands of (bank, category) groups a full historical
+        # build produces. Every formula below is identical to the
+        # corresponding pure function (ytd_to_quarterly/average_balance/
+        # flag_merger_discontinuities), just applied across all banks in one
+        # vectorized pass instead of one Python-level call per bank.
+        by_bank = cat_panel.groupby("bank_id", sort=False)
+        is_q1 = pd.PeriodIndex(cat_panel["quarter"]).quarter == 1
+        prior_chargeoff_ytd = by_bank["chargeoff_ytd"].shift(1)
+        prior_recovery_ytd = by_bank["recovery_ytd"].shift(1)
+        cat_panel["chargeoff_quarterly"] = np.where(
+            is_q1, cat_panel["chargeoff_ytd"], cat_panel["chargeoff_ytd"] - prior_chargeoff_ytd
         )
-        cat_panel["recovery_quarterly"] = grouped.apply(
-            lambda g: ytd_to_quarterly(g["recovery_ytd"], g["quarter"])
+        cat_panel["recovery_quarterly"] = np.where(
+            is_q1, cat_panel["recovery_ytd"], cat_panel["recovery_ytd"] - prior_recovery_ytd
         )
-        cat_panel["average_balance"] = grouped["balance"].apply(average_balance)
+
+        prior_balance = by_bank["balance"].shift(1)
+        cat_panel["average_balance"] = (cat_panel["balance"] + prior_balance) / 2.0
         cat_panel["annualized_nco_rate"] = annualized_nco_rate(
             cat_panel["chargeoff_quarterly"],
             cat_panel["recovery_quarterly"],
             cat_panel["average_balance"],
         )
-        cat_panel["merger_flag"] = grouped["balance"].apply(
-            lambda s: flag_merger_discontinuities(s, jump_threshold=merger_jump_threshold)
-        )
+
+        pct_change = (cat_panel["balance"] - prior_balance) / prior_balance.replace(0, np.nan)
+        cat_panel["merger_flag"] = (pct_change.abs() > merger_jump_threshold).fillna(False)
+
         cat_panel["cecl_regime"] = apply_cecl_regime_dummy(
             cat_panel["quarter"], cecl_adoption_quarter
         )
