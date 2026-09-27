@@ -1,5 +1,9 @@
 """Offline tests for the credit panel's pure transformation functions,
-against synthetic fixtures only -- no network, no real Call Report data."""
+against synthetic fixtures only -- no network, no real Call Report data
+(one test reads an already-cached local bulk ZIP if present as a
+regression guard, and skips itself if that cache isn't there)."""
+
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -8,6 +12,7 @@ import pytest
 from corefin.checks.framework import check_close_to_zero
 from corefin.credit import panel
 from corefin.credit.schema import CATEGORY_MDRM_CODES, LoanCategory, MdrmCodeSet
+from corefin.credit.sources import ffiec_parse
 
 
 def _quarters(labels: list[str]) -> pd.Series:
@@ -128,6 +133,86 @@ def test_category_mapping_raises_for_a_quarter_with_no_code_set():
         panel.apply_category_mapping(item_frame, LoanCategory.AUTO, quarters)
 
 
+def test_category_mapping_applies_per_row_fallback_within_a_transition_code_set(monkeypatch):
+    # Synthetic 2007-style transition: two banks in the SAME quarter, one
+    # still reporting the old combined item, one already on the new split.
+    synthetic_category = LoanCategory.CI
+    transition_code_set = MdrmCodeSet(
+        valid_from="2007Q1",
+        valid_to="2007Q4",
+        balance_items=("RCONSPLIT1", "RCONSPLIT2"),
+        chargeoff_items=("RIADSPLIT",),
+        recovery_items=("RIADSPLIT_R",),
+        fallback_balance_items=("RCONCOMBINED",),
+        fallback_chargeoff_items=("RIADCOMBINED",),
+        fallback_recovery_items=("RIADCOMBINED_R",),
+    )
+    monkeypatch.setitem(CATEGORY_MDRM_CODES, synthetic_category, (transition_code_set,))
+
+    item_frame = pd.DataFrame(
+        {
+            # bank A: only the combined (old) item is populated
+            # bank B: only the split (new) items are populated
+            "RCONSPLIT1": [np.nan, 600.0],
+            "RCONSPLIT2": [np.nan, 450.0],
+            "RCONCOMBINED": [1000.0, np.nan],
+            "RIADSPLIT": [np.nan, 20.0],
+            "RIADSPLIT_R": [np.nan, 5.0],
+            "RIADCOMBINED": [40.0, np.nan],
+            "RIADCOMBINED_R": [10.0, np.nan],
+        }
+    )
+    quarters = _quarters(["2007Q1", "2007Q1"])
+    mapped = panel.apply_category_mapping(item_frame, synthetic_category, quarters)
+
+    assert mapped["balance"].tolist() == pytest.approx([1000.0, 1050.0])
+    assert mapped["chargeoff_ytd"].tolist() == pytest.approx([40.0, 20.0])
+    assert mapped["recovery_ytd"].tolist() == pytest.approx([10.0, 5.0])
+
+
+def test_category_mapping_fallback_is_per_row_not_all_or_nothing(monkeypatch):
+    # A bank with the split PARTIALLY populated (one of two split items
+    # missing) must NOT silently fall back -- that's a real missing-data
+    # case (the sum is NaN), not a transition case; only a bank with
+    # NEITHER split item present should fall back.
+    synthetic_category = LoanCategory.CI
+    transition_code_set = MdrmCodeSet(
+        valid_from="2007Q1",
+        valid_to="2007Q4",
+        balance_items=("RCONSPLIT1", "RCONSPLIT2"),
+        fallback_balance_items=("RCONCOMBINED",),
+    )
+    monkeypatch.setitem(CATEGORY_MDRM_CODES, synthetic_category, (transition_code_set,))
+
+    item_frame = pd.DataFrame(
+        {
+            "RCONSPLIT1": [600.0],  # only ONE of two split items present
+            "RCONSPLIT2": [np.nan],
+            "RCONCOMBINED": [1000.0],
+        }
+    )
+    quarters = _quarters(["2007Q1"])
+    mapped = panel.apply_category_mapping(item_frame, synthetic_category, quarters)
+    # sum(600, NaN) = NaN with skipna=False, so this row uses the fallback
+    assert mapped["balance"].iloc[0] == pytest.approx(1000.0)
+
+
+def test_real_2007q1_cre_construction_coverage_is_full_with_fallback():
+    # Regression guard for the real bug this fallback fixes: verified
+    # against a real 2007Q1 bulk file that ALL banks report either the
+    # split or the combined construction item that quarter -- coverage
+    # must be ~100%, not the ~60% an earlier version of this module
+    # produced by only trying the split codes.
+    zip_path = Path("data/raw/ffiec/03-31-2007.zip")
+    if not zip_path.exists():
+        pytest.skip("real 2007Q1 bulk ZIP not cached locally")
+    item_frame, _ = ffiec_parse.parse_bulk_zip(zip_path.read_bytes(), pd.Period("2007Q1", freq="Q"))
+    mapped = panel.apply_category_mapping(
+        item_frame, LoanCategory.CRE_CONSTRUCTION, item_frame["quarter"]
+    )
+    assert mapped["balance"].notna().mean() > 0.99
+
+
 def test_category_mapping_picks_the_right_code_set_on_each_side_of_a_switch_date():
     # cre_nonfarm_nonresidential switches from RCON1480 to RCONF160+RCONF161 at 2007Q1.
     item_frame = pd.DataFrame(
@@ -197,16 +282,54 @@ def test_aggregate_balance_is_continuous_across_a_synthetic_code_switch():
 # --------------------------------------------------------- RCFD fallback ---
 
 
-def test_rcfd_fallback_only_applies_to_ffiec_031_with_missing_rcon():
-    rcon = pd.Series([100.0, np.nan, np.nan])
-    rcfd = pd.Series([999.0, 999.0, 999.0])
-    reporting_form = pd.Series(["FFIEC 031", "FFIEC 031", "FFIEC 041"])
-    resolved = panel.apply_rcfd_fallback(rcon, rcfd, reporting_form)
-    # row 0: RCON present -> keep RCON. row 1: FFIEC031 + missing RCON -> use RCFD.
-    # row 2: FFIEC041 + missing RCON -> stays missing (no RCFD equivalent exists).
+def test_rcfd_fallback_applies_when_rcon_is_missing_or_zero():
+    rcon = pd.Series([100.0, np.nan, 0.0, 0.0])
+    rcfd = pd.Series([999.0, 999.0, 999.0, np.nan])
+    resolved = panel.apply_rcfd_fallback(rcon, rcfd)
+    # row 0: RCON present and nonzero -> keep RCON.
+    # row 1: RCON missing -> use RCFD.
+    # row 2: RCON exactly zero (the bank 476810 case) -> use RCFD.
+    # row 3: RCON zero AND no RCFD available -> stays missing.
     assert resolved.iloc[0] == pytest.approx(100.0)
     assert resolved.iloc[1] == pytest.approx(999.0)
-    assert pd.isna(resolved.iloc[2])
+    assert resolved.iloc[2] == pytest.approx(999.0)
+    assert pd.isna(resolved.iloc[3])
+
+
+def test_category_mapping_applies_rcfd_fallback_for_a_zero_balance(monkeypatch):
+    # Regression guard for the real bug this fixes: bank 476810's
+    # RCONB538 is a literal 0 for five straight quarters while RCFDB538
+    # has the real balance.
+    synthetic_category = LoanCategory.CI
+    code_set = MdrmCodeSet(
+        valid_from="2010Q1",
+        valid_to=None,
+        balance_items=("RCONBAL",),
+        rcfd_items=("RCFDBAL",),
+    )
+    monkeypatch.setitem(CATEGORY_MDRM_CODES, synthetic_category, (code_set,))
+
+    item_frame = pd.DataFrame({"RCONBAL": [0.0, 500.0], "RCFDBAL": [35_000_000.0, 999.0]})
+    quarters = _quarters(["2010Q2", "2010Q2"])
+    mapped = panel.apply_category_mapping(item_frame, synthetic_category, quarters)
+    assert mapped["balance"].iloc[0] == pytest.approx(35_000_000.0)
+    assert mapped["balance"].iloc[1] == pytest.approx(500.0)  # real nonzero RCON kept as-is
+
+
+def test_category_mapping_skips_rcfd_fallback_when_column_absent(monkeypatch):
+    synthetic_category = LoanCategory.CI
+    code_set = MdrmCodeSet(
+        valid_from="2010Q1",
+        valid_to=None,
+        balance_items=("RCONBAL",),
+        rcfd_items=("RCFDBAL",),  # not present in item_frame below
+    )
+    monkeypatch.setitem(CATEGORY_MDRM_CODES, synthetic_category, (code_set,))
+
+    item_frame = pd.DataFrame({"RCONBAL": [0.0]})
+    quarters = _quarters(["2010Q2"])
+    mapped = panel.apply_category_mapping(item_frame, synthetic_category, quarters)
+    assert mapped["balance"].iloc[0] == pytest.approx(0.0)  # no RCFD column -> stays as reported
 
 
 # ------------------------------------------------------------ mergers ------
@@ -216,6 +339,25 @@ def test_flag_merger_discontinuities_flags_large_jump_only():
     balance = pd.Series([100.0, 105.0, 400.0, 410.0])  # 3rd quarter ~4x jump
     flags = panel.flag_merger_discontinuities(balance, jump_threshold=0.5)
     assert flags.tolist() == [False, False, True, False]
+
+
+def test_flag_merger_discontinuities_flags_a_jump_from_zero():
+    # A plain pct-change check can't catch this at all (division by the
+    # zero prior balance is undefined) -- regression guard for bank
+    # 476810's real case: RCONB538 reported as a literal 0 for several
+    # quarters, then a real balance appears.
+    balance = pd.Series([0.0, 0.0, 107_815_000.0])
+    flags = panel.flag_merger_discontinuities(balance, near_zero_threshold=1_000.0)
+    assert flags.tolist() == [False, False, True]
+
+
+def test_flag_merger_discontinuities_does_not_flag_zero_to_small_growth():
+    # Growing from zero to something still below the near-zero threshold
+    # is not a merger signal -- both a new tiny bank and a tiny org're
+    # unremarkable, only a jump to something MATERIAL should flag.
+    balance = pd.Series([0.0, 500.0])  # both under the 1,000 threshold
+    flags = panel.flag_merger_discontinuities(balance, near_zero_threshold=1_000.0)
+    assert flags.tolist() == [False, False]
 
 
 # --------------------------------------------------------------- CECL ------
@@ -399,6 +541,24 @@ def test_build_panel_computes_per_bank_quarterly_flows_and_nco_rate():
     assert not bank_a["merger_flag"].any()
 
 
+def test_build_panel_flags_merger_from_zero_balance():
+    item_frame = pd.DataFrame(
+        {
+            "bank_id": ["A", "A"],
+            "quarter": _quarters(["2019Q1", "2019Q2"]),
+            "RCON1766": [0.0, 5_000_000.0],
+            "RCON1606": [0.0, 0.0],
+            "RCON1607": [0.0, 0.0],
+            "RCON1608": [0.0, 0.0],
+            "RIAD4638": [0.0, 10.0],
+            "RIAD4608": [0.0, 2.0],
+        }
+    )
+    result = panel.build_panel(item_frame, categories=[LoanCategory.CI], min_balance=500.0)
+    result = result.sort_values("quarter")
+    assert result["merger_flag"].tolist() == [False, True]
+
+
 def test_build_panel_excludes_categories_with_no_covering_code_set():
     # AUTO has no code set before 2011Q1 -- pre-2011 rows must simply be
     # absent for that category, not raise or zero-fill (unlike passing a
@@ -428,6 +588,98 @@ def test_build_industry_nco_rate_report_aggregates_across_banks():
     expected_rate = (45.0 - 9.0) / 3100.0 * 4.0
     assert q2["industry_nco_rate"] == pytest.approx(expected_rate)
     assert bool(q2["has_chargeoff_data"])
+
+
+def test_build_industry_nco_rate_report_excludes_merger_flagged_rows_by_default():
+    panel_frame = pd.DataFrame(
+        {
+            "category": [LoanCategory.CI, LoanCategory.CI],
+            "quarter": _quarters(["2010Q1", "2010Q1"]),
+            "chargeoff_quarterly": [10.0, 999.0],  # bank B's flow is merger-contaminated
+            "recovery_quarterly": [2.0, 0.0],
+            "average_balance": [1000.0, 5_000_000.0],
+            "merger_flag": [False, True],
+        }
+    )
+    excluded = panel.build_industry_nco_rate_report(panel_frame)
+    included = panel.build_industry_nco_rate_report(panel_frame, exclude_merger_flagged=False)
+
+    excluded_rate = excluded.iloc[0]["industry_nco_rate"]
+    included_rate = included.iloc[0]["industry_nco_rate"]
+    assert excluded_rate == pytest.approx((10.0 - 2.0) / 1000.0 * 4.0)
+    assert included_rate != pytest.approx(excluded_rate)
+
+
+def test_build_industry_nco_rate_report_excludes_below_min_balance():
+    panel_frame = pd.DataFrame(
+        {
+            "category": [LoanCategory.CI, LoanCategory.CI],
+            "quarter": _quarters(["2010Q1", "2010Q1"]),
+            "chargeoff_quarterly": [10.0, 500.0],
+            "recovery_quarterly": [2.0, 0.0],
+            "average_balance": [1000.0, 5.0],  # bank B is a near-zero-balance outlier
+            "merger_flag": [False, False],
+        }
+    )
+    report = panel.build_industry_nco_rate_report(panel_frame, min_balance=100.0)
+    assert report.iloc[0]["industry_nco_rate"] == pytest.approx((10.0 - 2.0) / 1000.0 * 4.0)
+
+
+def test_winsorize_nco_rates_clips_extreme_values_per_category():
+    panel_frame = pd.DataFrame(
+        {
+            "category": [LoanCategory.CI] * 100,
+            "annualized_nco_rate": [0.01] * 98 + [-5.0, 50.0],  # two extreme outliers
+            "average_balance": [1_000_000.0] * 100,
+        }
+    )
+    winsorized = panel.winsorize_nco_rates(panel_frame, lower_quantile=0.01, upper_quantile=0.99)
+    assert winsorized.max() < 50.0
+    assert winsorized.min() > -5.0
+    # the bulk of normal values must be untouched
+    assert np.allclose(winsorized.iloc[:98].to_numpy(), 0.01)
+
+
+def test_winsorize_nco_rates_does_not_mutate_the_raw_panel():
+    panel_frame = pd.DataFrame(
+        {
+            "category": [LoanCategory.CI] * 5,
+            "annualized_nco_rate": [0.01, 0.02, 0.03, 0.04, 100.0],
+            "average_balance": [1_000_000.0] * 5,
+        }
+    )
+    raw_before = panel_frame["annualized_nco_rate"].copy()
+    panel.winsorize_nco_rates(panel_frame)
+    pd.testing.assert_series_equal(panel_frame["annualized_nco_rate"], raw_before)
+
+
+def test_winsorize_nco_rates_is_independent_per_category():
+    panel_frame = pd.DataFrame(
+        {
+            "category": [LoanCategory.CI] * 3 + [LoanCategory.CREDIT_CARD] * 3,
+            # CI's scale is tiny; credit card's is large -- winsorization
+            # must not let one category's distribution affect the other's.
+            "annualized_nco_rate": [0.01, 0.02, 0.03, 0.10, 0.20, 0.30],
+            "average_balance": [1_000_000.0] * 6,
+        }
+    )
+    winsorized = panel.winsorize_nco_rates(panel_frame, lower_quantile=0.0, upper_quantile=1.0)
+    # with quantile bounds at 0/1 (no clipping at all), values pass through unchanged
+    assert winsorized.tolist() == pytest.approx([0.01, 0.02, 0.03, 0.10, 0.20, 0.30])
+
+
+def test_winsorize_nco_rates_excludes_rows_below_min_balance_from_bounds_and_output():
+    panel_frame = pd.DataFrame(
+        {
+            "category": [LoanCategory.CI] * 5,
+            "annualized_nco_rate": [0.01, 0.02, 0.03, 0.04, 999.0],
+            "average_balance": [1_000_000.0, 1_000_000.0, 1_000_000.0, 1_000_000.0, 1.0],
+        }
+    )
+    winsorized = panel.winsorize_nco_rates(panel_frame, min_balance=100.0)
+    assert pd.isna(winsorized.iloc[-1])  # excluded row -> NaN, not clipped-and-kept
+    # the extreme value must not have widened the clipping bounds for the rest
+    assert winsorized.iloc[:4].max() <= 0.04
 
 
 def test_flag_chargeoff_gaps_detects_a_missing_quarter_in_the_window():
@@ -533,6 +785,21 @@ def test_build_allowance_panel_flags_a_merger_sized_balance_jump():
     result = panel.build_allowance_panel(item_frame)
     result = result.sort_values("quarter")
     assert result["allowance_merger_flag"].tolist() == [False, True]
+
+
+def test_build_allowance_panel_flags_a_merger_from_zero_allowance():
+    item_frame = _allowance_item_frame(RCON3123=[0.0, 2_000_000.0])
+    result = panel.build_allowance_panel(item_frame)
+    result = result.sort_values("quarter")
+    assert result["allowance_merger_flag"].tolist() == [False, True]
+
+
+def test_build_allowance_panel_rcfd_fallback_applies_on_zero_rcon():
+    item_frame = _allowance_item_frame(
+        RCON3123=[0.0, 0.0], RCFD3123=[35_000_000.0, 36_000_000.0]
+    )
+    result = panel.build_allowance_panel(item_frame)
+    assert result["allowance_balance"].tolist() == pytest.approx([35_000_000.0, 36_000_000.0])
 
 
 def test_compute_bank_allowance_rollforward_uses_bank_level_totals_not_mapped_categories():
@@ -678,6 +945,34 @@ def test_summarize_mapped_category_coverage_computes_share_by_quarter():
     assert row["mapped_category_net_chargeoffs"] == pytest.approx(10.0)
     assert row["total_net_chargeoffs"] == pytest.approx(15.0)
     assert row["mapped_category_share"] == pytest.approx(10.0 / 15.0)
+
+
+def test_summarize_mapped_category_coverage_excludes_2001q1_by_default():
+    # Regression guard for the real anomaly this fixes: RIADC079 doesn't
+    # exist as a column in real 2001Q1 data, so a 2001Q1 row here would
+    # spuriously undercount total_net_chargeoffs and blow the ratio > 1.
+    rollforward = pd.DataFrame(
+        {
+            "quarter": _quarters(["2001Q1", "2001Q2"]),
+            "mapped_category_net_chargeoffs": [100.0, 8.0],
+            "total_net_chargeoffs": [1.0, 10.0],  # 2001Q1's total is artificially tiny
+        }
+    )
+    result = panel.summarize_mapped_category_coverage(rollforward)
+    assert result["quarter"].tolist() == [pd.Period("2001Q2", freq="Q")]
+    assert result.iloc[0]["mapped_category_share"] == pytest.approx(0.8)
+
+
+def test_summarize_mapped_category_coverage_min_quarter_none_disables_filter():
+    rollforward = pd.DataFrame(
+        {
+            "quarter": _quarters(["2001Q1", "2001Q2"]),
+            "mapped_category_net_chargeoffs": [100.0, 8.0],
+            "total_net_chargeoffs": [1.0, 10.0],
+        }
+    )
+    result = panel.summarize_mapped_category_coverage(rollforward, min_quarter=None)
+    assert len(result) == 2
 
 
 # --------------------------------------------------------- coverage report -

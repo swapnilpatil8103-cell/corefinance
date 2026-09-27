@@ -20,13 +20,23 @@ restructurings drove this:
 
 - CRE construction and CRE nonfarm-nonresidential both split at 2007Q1,
   confirmed against real 2006Q4 (pre-split codes present) and 2008Q4/
-  2021Q4 (post-split codes present, pre-split codes absent) bulk files:
-  the pre-2007 combined items (RCON1415 construction balance; RCON1480
-  nonfarm-nonresidential balance; RCON2759/2769/3492 and RCON3502/3503/
-  3504 past-due/nonaccrual; RIAD3582/3583 and RIAD3590/3591 charge-off/
-  recovery) are absent from bulk data from 2007Q1 onward despite MDRM
-  listing several of them as still "active" through 12/31/9999. The
-  replacements, confirmed present in 2008Q4/2021Q4/2026Q2: balance splits
+  2021Q4 (post-split codes present) bulk files -- but 2007 itself is a
+  full-year TRANSITION period, not a clean cutover: verified directly
+  against a real 2007Q1 bulk file, ALL 7,896 banks still report the
+  combined item (RCON1480) that quarter, while only 4,724 (~60%) ALSO
+  report the new split items (RCONF160/F161) -- an earlier version of
+  this module wrongly assumed a clean 2007Q1 cutover (based on 2008Q4/
+  2021Q4/2026Q2 data, where the combined items really are gone) and
+  treated banks still using the combined codes during 2007 as missing
+  data, producing spuriously low (~58-60%) coverage for all four 2007
+  quarters. The fix: 2007Q1-2007Q4 get their OWN `MdrmCodeSet` whose
+  PRIMARY items are the new split codes and whose `fallback_*_items` are
+  the old combined codes, applied per bank-quarter row (not per quarter)
+  by `panel.apply_category_mapping` -- a bank reporting the split uses
+  it, a bank still on the combined item that quarter falls back to it,
+  and coverage is ~100% either way. By 2008Q1 the combined items are
+  confirmed fully retired (verified against 2008Q4/2021Q4/2026Q2), so the
+  fallback isn't needed from then on. The replacements: balance splits
   into owner-occupied/other (RCONF160/RCONF161 for nonfarm-nonresidential)
   or 1-4-family/other (RCONF158/RCONF159 for construction); past-due and
   nonaccrual split the same way (RCONF172-177 for construction, RCONF178-
@@ -36,7 +46,14 @@ restructurings drove this:
   nonfarm-nonresidential) -- an earlier version of this module wrongly
   concluded no charge-off/recovery breakout existed at this granularity;
   it does, just under a different (C8xx) item-code range than the
-  balance/past-due F-series.
+  balance/past-due F-series. The SAME split-vs-combined coexistence
+  pattern was verified for charge-offs/recoveries too, in the same real
+  2007Q1 file: RIADC891/C893 (construction) and RIADC895/C897 (nonfarm-
+  nonresidential) are each populated for only ~4,712 of 7,896 banks,
+  while their combined-era predecessors RIAD3582/3583 (construction) and
+  RIAD3590/3591 (nonfarm-nonresidential) are populated for all 7,896 --
+  so the 2007 transition code sets' chargeoff_items/recovery_items ALSO
+  carry a fallback, mirroring the balance/past-due fields exactly.
 - Automobile loans were not broken out as their own Call Report line
   until 2011Q1 (RCONK137 balance; RCONK213/K214/K215 past-due/nonaccrual;
   RIADK129/K133 charge-off/recovery -- confirmed present in 2021Q4/2026Q2
@@ -140,9 +157,21 @@ class MdrmCodeSet:
     `nonaccrual_items` (RC-N) and `chargeoff_items`/`recovery_items`
     (RI-B, year-to-date) are summed across their tuple when more than one
     Call Report line applies. `rcfd_items` (optional) is the RCFD
-    (consolidated) equivalent of `balance_items`, used only as an
-    RCON-unavailable fallback for FFIEC 031 filers -- see panel.py's
-    `apply_rcfd_fallback`."""
+    (consolidated) equivalent of `balance_items`, used as a fallback --
+    for a bank-quarter row where the primary RCON figure is missing OR
+    exactly zero, not only missing (see panel.py's `apply_rcfd_fallback`
+    and its module docstring for why a zero, not just a missing value,
+    needs this).
+
+    `fallback_*_items` (optional, one per primary field): a PER-ROW
+    fallback to an entirely different item code, used during a genuine
+    reporting transition where some banks have switched to this code
+    set's primary items and others are still using an older set -- unlike
+    a plain "old code set, then new code set" quarter boundary (most
+    categories), a transition quarter needs BOTH available at once,
+    because which one an individual bank uses varies row by row, not
+    quarter by quarter. See CRE_CONSTRUCTION/CRE_NONFARM_NONRESIDENTIAL's
+    2007Q1-2007Q4 code sets for the confirmed real case this exists for."""
 
     valid_from: str
     valid_to: str | None
@@ -153,6 +182,12 @@ class MdrmCodeSet:
     chargeoff_items: tuple[str, ...] = ()
     recovery_items: tuple[str, ...] = ()
     rcfd_items: tuple[str, ...] = ()
+    fallback_balance_items: tuple[str, ...] = ()
+    fallback_past_due_30_89_items: tuple[str, ...] = ()
+    fallback_past_due_90_items: tuple[str, ...] = ()
+    fallback_nonaccrual_items: tuple[str, ...] = ()
+    fallback_chargeoff_items: tuple[str, ...] = ()
+    fallback_recovery_items: tuple[str, ...] = ()
     confidence: str = "verified"  # "verified" or "needs_confirmation"
     note: str = ""
 
@@ -196,8 +231,32 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
         ),
         MdrmCodeSet(
             valid_from="2007Q1",
-            valid_to=None,
+            valid_to="2007Q4",
             balance_items=("RCONF158", "RCONF159"),  # 1-4 family resi construction + other
+            past_due_30_89_items=("RCONF172", "RCONF173"),
+            past_due_90_items=("RCONF174", "RCONF175"),
+            nonaccrual_items=("RCONF176", "RCONF177"),
+            chargeoff_items=("RIADC891", "RIADC893"),
+            recovery_items=("RIADC892", "RIADC894"),
+            fallback_balance_items=("RCON1415",),
+            fallback_past_due_30_89_items=("RCON2759",),
+            fallback_past_due_90_items=("RCON2769",),
+            fallback_nonaccrual_items=("RCON3492",),
+            fallback_chargeoff_items=("RIAD3582",),
+            fallback_recovery_items=("RIAD3583",),
+            note="2007 is a full-year TRANSITION period, not a clean cutover --"
+            "verified against a real 2007Q1 bulk file: the combined items (RCON1415,"
+            " RCON2759/2769/3492, RIAD3582/3583) are populated for ALL 7,896 banks"
+            " that quarter, while the new split items (primary, above) are populated"
+            " for only ~4,712-4,722 (~60%). Every field here has a matching fallback"
+            " to the pre-2007 combined item, applied per bank-quarter row by"
+            " panel.apply_category_mapping -- a bank using the split reports it, a"
+            " bank still on the combined item that quarter falls back to it.",
+        ),
+        MdrmCodeSet(
+            valid_from="2008Q1",
+            valid_to=None,
+            balance_items=("RCONF158", "RCONF159"),
             past_due_30_89_items=("RCONF172", "RCONF173"),
             past_due_90_items=("RCONF174", "RCONF175"),
             nonaccrual_items=("RCONF176", "RCONF177"),
@@ -206,10 +265,8 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
             note="Verified present in real 2008Q4/2021Q4 bulk data (every item in "
             "this code set, including the charge-off/recovery split RIADC891-894, "
             "found in Schedule RIBI). RCON1415/RIAD3582/RIAD3583 (pre-2007 combined "
-            "items) are confirmed ABSENT from bulk data from this point on despite "
-            "MDRM listing them 'active' -- replaced by the 1-4-family "
-            "(RCONF158/F172/F174/F176/RIADC891/C892) / other "
-            "(RCONF159/F173/F175/F177/RIADC893/C894) split.",
+            "items) are confirmed ABSENT from bulk data from this point on -- no "
+            "fallback needed from 2008Q1, unlike the 2007 transition code set above.",
         ),
     ),
     LoanCategory.CRE_MULTIFAMILY: (
@@ -241,6 +298,30 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
         ),
         MdrmCodeSet(
             valid_from="2007Q1",
+            valid_to="2007Q4",
+            balance_items=("RCONF160", "RCONF161"),
+            past_due_30_89_items=("RCONF178", "RCONF179"),
+            past_due_90_items=("RCONF180", "RCONF181"),
+            nonaccrual_items=("RCONF182", "RCONF183"),
+            chargeoff_items=("RIADC895", "RIADC897"),
+            recovery_items=("RIADC896", "RIADC898"),
+            fallback_balance_items=("RCON1480",),
+            fallback_past_due_30_89_items=("RCON3502",),
+            fallback_past_due_90_items=("RCON3503",),
+            fallback_nonaccrual_items=("RCON3504",),
+            fallback_chargeoff_items=("RIAD3590",),
+            fallback_recovery_items=("RIAD3591",),
+            note="2007 is a full-year TRANSITION period, not a clean cutover --"
+            "verified against a real 2007Q1 bulk file: the combined items (RCON1480,"
+            " RCON3502/3503/3504, RIAD3590/3591) are populated for ALL 7,896 banks"
+            " that quarter, while the new split items (primary, above) are populated"
+            " for only ~4,712-4,717 (~60%). Every field here has a matching fallback"
+            " to the pre-2007 combined item, applied per bank-quarter row by"
+            " panel.apply_category_mapping -- a bank using the split reports it, a"
+            " bank still on the combined item that quarter falls back to it.",
+        ),
+        MdrmCodeSet(
+            valid_from="2008Q1",
             valid_to=None,
             balance_items=("RCONF160", "RCONF161"),
             past_due_30_89_items=("RCONF178", "RCONF179"),
@@ -252,9 +333,8 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
             "this code set, including the charge-off/recovery split RIADC895-898, "
             "found in Schedule RIBI). RCON1480/RCON3502-3504/RIAD3590/RIAD3591 "
             "(pre-2007 combined items) are confirmed ABSENT from bulk data from "
-            "this point on despite MDRM listing them 'active' -- replaced by the "
-            "owner-occupied (RCONF160/F178/F180/F182/RIADC895/C896) / other "
-            "(RCONF161/F179/F181/F183/RIADC897/C898) split.",
+            "this point on -- no fallback needed from 2008Q1, unlike the 2007 "
+            "transition code set above.",
         ),
     ),
     LoanCategory.RESIDENTIAL_MORTGAGE: (

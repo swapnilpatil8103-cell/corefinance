@@ -32,6 +32,29 @@ from corefin.credit.schema import (
 # defensive and never triggered in practice.
 TOTAL_ALLOWANCE_RCFD_FALLBACK_ITEM = "RCFD3123"
 
+# "Essentially zero" for merger-from-zero detection (flag_merger_discontinuities,
+# build_panel's per-category merger_flag, build_allowance_panel's
+# allowance_merger_flag) -- thousands of dollars, so 1.0 = $1,000 actual
+# dollars, small enough to mean "reported as a literal zero or a rounding
+# artifact" without colliding with `min_balance` (typically ~1_000.0 =
+# $1M), a DIFFERENT threshold for a different question ("is this balance
+# big enough to matter for a rate calculation," not "is this essentially
+# zero"). Reusing min_balance for both was a real bug: a bank's genuinely
+# normal balance sitting near the min_balance cutoff (e.g. exactly
+# $1,000 thousand) was wrongly flagged as a "jump from near-zero" merger
+# the very first time it crossed that value, caught by this project's own
+# test suite.
+NEAR_ZERO_BALANCE_THRESHOLD = 1.0
+
+# First quarter TOTAL_CHARGEOFF_ITEM (RIADC079) exists as a column at all in
+# real bulk data -- confirmed: 2001Q1's real bulk file has no RIADC079
+# column whatsoever (its predecessor, RIAD4635, existed but is scoped
+# differently -- see schema.py's TOTAL_CHARGEOFF_ITEM note); 2001Q2 onward
+# it's present and fully populated. Any quarter before this has no
+# meaningful bank-level "true total" to compare a category mapping's
+# coverage against -- see `summarize_mapped_category_coverage`.
+TOTAL_CHARGEOFF_SERIES_START = pd.Period("2001Q2", freq="Q")
+
 # CECL is mandatory for large SEC filers starting 2020Q1, phased in for
 # smaller/non-SEC filers through 2023Q1. This is the fallback used for
 # banks `derive_cecl_adoption_quarters` never detects a signal for --
@@ -149,17 +172,44 @@ def apply_category_mapping(
             raise KeyError(f"item_frame is missing required columns: {missing}")
         return item_frame.loc[idx, list(items)].sum(axis=1, skipna=False)
 
+    # (output column, primary MdrmCodeSet field, fallback MdrmCodeSet field).
+    # The fallback is a PER-ROW fallback within the same code set/quarter --
+    # see MdrmCodeSet's docstring and CRE_CONSTRUCTION/CRE_NONFARM_NONRESIDENTIAL's
+    # 2007 transition code sets for the confirmed real case this exists for
+    # (some banks still reporting the old combined item that quarter, others
+    # already on the new split items -- which one varies bank by bank, not
+    # just quarter by quarter).
+    field_specs = (
+        ("balance", "balance_items", "fallback_balance_items"),
+        ("past_due_30_89", "past_due_30_89_items", "fallback_past_due_30_89_items"),
+        ("past_due_90", "past_due_90_items", "fallback_past_due_90_items"),
+        ("nonaccrual", "nonaccrual_items", "fallback_nonaccrual_items"),
+        ("chargeoff_ytd", "chargeoff_items", "fallback_chargeoff_items"),
+        ("recovery_ytd", "recovery_items", "fallback_recovery_items"),
+    )
+
     for code_set in CATEGORY_MDRM_CODES[category]:
         mask = np.array([code_set.covers(q) for q in quarters]) & unmatched
         if not mask.any():
             continue
         idx = item_frame.index[mask]
-        result.loc[idx, "balance"] = _sum_or_nan(idx, code_set.balance_items)
-        result.loc[idx, "past_due_30_89"] = _sum_or_nan(idx, code_set.past_due_30_89_items)
-        result.loc[idx, "past_due_90"] = _sum_or_nan(idx, code_set.past_due_90_items)
-        result.loc[idx, "nonaccrual"] = _sum_or_nan(idx, code_set.nonaccrual_items)
-        result.loc[idx, "chargeoff_ytd"] = _sum_or_nan(idx, code_set.chargeoff_items)
-        result.loc[idx, "recovery_ytd"] = _sum_or_nan(idx, code_set.recovery_items)
+        for out_col, primary_attr, fallback_attr in field_specs:
+            values = _sum_or_nan(idx, getattr(code_set, primary_attr))
+            fallback_items = getattr(code_set, fallback_attr)
+            if fallback_items:
+                still_missing = values.isna()
+                if still_missing.any():
+                    fallback_idx = idx[still_missing.to_numpy()]
+                    values.loc[fallback_idx] = _sum_or_nan(fallback_idx, fallback_items)
+            # RCON->RCFD fallback (missing OR reported-zero) is a balance-only
+            # concern -- see apply_rcfd_fallback's docstring for the real case
+            # (bank 476810's RCONB538) this exists for. Graceful no-op if the
+            # RCFD columns aren't in item_frame for this quarter at all.
+            if out_col == "balance" and code_set.rcfd_items:
+                if all(c in item_frame.columns for c in code_set.rcfd_items):
+                    rcfd_values = _sum_or_nan(idx, code_set.rcfd_items)
+                    values = apply_rcfd_fallback(values, rcfd_values)
+            result.loc[idx, out_col] = values
         unmatched &= ~mask
 
     if unmatched.any():
@@ -169,22 +219,21 @@ def apply_category_mapping(
     return result
 
 
-def apply_rcfd_fallback(
-    rcon_balance: pd.Series, rcfd_balance: pd.Series, reporting_form: pd.Series
-) -> pd.Series:
-    """For FFIEC 031 (large/international bank) filers, a balance item
-    could in principle be reported only on a consolidated (RCFD, domestic
-    + foreign) basis rather than the domestic-only RCON basis this panel
-    otherwise uses. Falls back to `rcfd_balance` only where `reporting_form
-    == "FFIEC 031"` and `rcon_balance` is missing -- FFIEC 041/051 filers
-    have no foreign offices and no RCFD equivalent, so they never fall
-    back. As of schema.py's MDRM verification, no current category
-    actually triggers this (RCON stays available on FFIEC 031 for every
-    category's whole reporting history); this function is a defensive
-    mechanism for whichever category eventually does, exercised in tests
-    with a synthetic gap."""
-    is_031 = reporting_form == "FFIEC 031"
-    use_fallback = is_031 & rcon_balance.isna()
+def apply_rcfd_fallback(rcon_balance: pd.Series, rcfd_balance: pd.Series) -> pd.Series:
+    """A balance item could be reported only on a consolidated (RCFD,
+    domestic + foreign) basis rather than the domestic-only RCON basis
+    this panel otherwise uses. Falls back to `rcfd_balance` wherever
+    `rcon_balance` is missing OR exactly zero -- a real, confirmed case,
+    not just a defensive one: bank 476810's RCONB538 (domestic credit
+    card balance) is reported as a literal zero for five straight
+    quarters (2010Q2-2011Q2) while RCFDB538 (consolidated) shows real,
+    substantial values ($35-37B); treating a reported zero as equivalent
+    to missing (rather than a genuine zero-balance bank) catches this.
+    No reporting-form check is needed: FFIEC 041/051 filers have no
+    foreign offices, so their RCFD columns are naturally absent/NaN
+    regardless of filer type, making the fallback a no-op for them
+    without needing to know which form they filed."""
+    use_fallback = rcon_balance.isna() | (rcon_balance == 0)
     return rcon_balance.where(~use_fallback, rcfd_balance)
 
 
@@ -234,18 +283,34 @@ def build_coverage_report(panel: pd.DataFrame) -> pd.DataFrame:
     return report
 
 
-def flag_merger_discontinuities(balance: pd.Series, jump_threshold: float = 0.5) -> pd.Series:
+def flag_merger_discontinuities(
+    balance: pd.Series,
+    jump_threshold: float = 0.5,
+    near_zero_threshold: float = NEAR_ZERO_BALANCE_THRESHOLD,
+) -> pd.Series:
     """Flags (does not drop) bank-quarters where balance jumps more than
     `jump_threshold` (50% default) quarter-over-quarter -- a cheap proxy
     for an unreported merger/acquisition or a large loan-portfolio sale,
     pending a real merger-history join (FDIC's `institutions`/`financials`
     endpoints don't expose merger events directly; a dedicated M&A-history
-    source is a follow-up, not built here). Returns a boolean Series
-    aligned to `balance`'s index; the first observation in any series
-    can't be evaluated and is False."""
+    source is a follow-up, not built here). ALSO flags a jump FROM a
+    near-zero prior balance (<= `near_zero_threshold`, in thousands of
+    dollars, same default as the project's standard min-balance filter)
+    TO a material one (> `near_zero_threshold`) -- the plain percentage
+    check can't catch this (a percentage change off a ~zero base is
+    undefined/enormous either way, so it's evaluated separately rather
+    than relying on the ratio). Returns a boolean Series aligned to
+    `balance`'s index; the first observation in any series can't be
+    evaluated and is False."""
     prior = balance.shift(1)
     pct_change = (balance - prior) / prior.replace(0, np.nan)
-    return (pct_change.abs() > jump_threshold).fillna(False)
+    pct_change_flag = (pct_change.abs() > jump_threshold).fillna(False)
+    from_near_zero_flag = (
+        prior.notna()
+        & (prior.abs() <= near_zero_threshold)
+        & (balance.abs() > near_zero_threshold)
+    )
+    return pct_change_flag | from_near_zero_flag
 
 
 def derive_cecl_adoption_quarters(item_frame: pd.DataFrame) -> pd.Series:
@@ -433,7 +498,17 @@ def build_panel(
         )
 
         pct_change = (cat_panel["balance"] - prior_balance) / prior_balance.replace(0, np.nan)
-        cat_panel["merger_flag"] = (pct_change.abs() > merger_jump_threshold).fillna(False)
+        pct_change_flag = (pct_change.abs() > merger_jump_threshold).fillna(False)
+        # prior essentially zero (NEAR_ZERO_BALANCE_THRESHOLD, NOT min_balance --
+        # a genuinely normal balance sitting near min_balance shouldn't be
+        # mistaken for "near zero") jumping to something min_balance itself
+        # already calls meaningful.
+        from_near_zero_flag = (
+            prior_balance.notna()
+            & (prior_balance.abs() <= NEAR_ZERO_BALANCE_THRESHOLD)
+            & (cat_panel["balance"].abs() > min_balance)
+        )
+        cat_panel["merger_flag"] = pct_change_flag | from_near_zero_flag
 
         cat_panel["cecl_regime"] = apply_cecl_regime_dummy(
             cat_panel["bank_id"],
@@ -469,16 +544,41 @@ def build_panel(
     return pd.concat(category_frames, ignore_index=True)
 
 
-def build_industry_nco_rate_report(panel: pd.DataFrame) -> pd.DataFrame:
+def build_industry_nco_rate_report(
+    panel: pd.DataFrame,
+    exclude_merger_flagged: bool = True,
+    min_balance: float | None = None,
+) -> pd.DataFrame:
     """panel: long-format frame (as produced by `build_panel`) with
     columns "category", "quarter", "chargeoff_quarterly",
-    "recovery_quarterly", "average_balance". Returns one row per
-    (category, quarter) with the aggregate industry annualized NCO rate --
-    sum(chargeoff_quarterly) - sum(recovery_quarterly), divided by
-    sum(average_balance), annualized by x4 -- and `has_chargeoff_data`
-    (True if at least one bank has a non-missing chargeoff_quarterly that
-    quarter; see `flag_chargeoff_gaps`)."""
-    grouped = panel.groupby(["category", "quarter"], observed=True)
+    "recovery_quarterly", "average_balance" (and "merger_flag" if
+    `exclude_merger_flagged`). Returns one row per (category, quarter)
+    with the aggregate industry annualized NCO rate -- sum(
+    chargeoff_quarterly) - sum(recovery_quarterly), divided by sum(
+    average_balance), annualized by x4 -- and `has_chargeoff_data` (True
+    if at least one bank has a non-missing chargeoff_quarterly that
+    quarter; see `flag_chargeoff_gaps`).
+
+    `exclude_merger_flagged` (default True): drops bank-quarters where
+    `merger_flag` is True before aggregating -- a real, confirmed
+    problem, not just a defensive filter: when a bank acquires another
+    mid-year, its YTD charge-off figure jumps to include the acquired
+    bank's own prior-quarter activity, so the *quarterly* flow derived by
+    differencing (`ytd_to_quarterly`) is contaminated for that
+    bank-quarter and shouldn't be blended into an industry rate or used
+    for model training.
+
+    `min_balance` (optional): also drops bank-quarters where
+    `average_balance` is below this threshold -- a near-zero denominator
+    produces a NCO rate that's numerically extreme (or literally
+    undefined) and dominated by noise, not a real crisis signal."""
+    scoped = panel
+    if exclude_merger_flagged and "merger_flag" in scoped.columns:
+        scoped = scoped[~scoped["merger_flag"].fillna(False)]
+    if min_balance is not None:
+        scoped = scoped[scoped["average_balance"] >= min_balance]
+
+    grouped = scoped.groupby(["category", "quarter"], observed=True)
     agg = grouped.agg(
         aggregate_chargeoff=("chargeoff_quarterly", lambda s: s.sum(skipna=True)),
         aggregate_recovery=("recovery_quarterly", lambda s: s.sum(skipna=True)),
@@ -492,6 +592,43 @@ def build_industry_nco_rate_report(panel: pd.DataFrame) -> pd.DataFrame:
         rate = np.where(avg > 0, (nco.to_numpy() / avg) * 4.0, np.nan)
     agg["industry_nco_rate"] = rate
     return agg.sort_values(["category", "quarter"]).reset_index(drop=True)
+
+
+def winsorize_nco_rates(
+    panel: pd.DataFrame,
+    lower_quantile: float = 0.01,
+    upper_quantile: float = 0.99,
+    min_balance: float | None = None,
+) -> pd.Series:
+    """panel: long-format frame (as produced by `build_panel`) with
+    columns "category" and "annualized_nco_rate". Returns a new Series,
+    aligned to `panel`'s index, with each category's OWN bank-level
+    annualized_nco_rate values clipped to that category's
+    [lower_quantile, upper_quantile] percentile range (1st/99th by
+    default) -- a handful of extreme bank-quarter rates (a tiny book with
+    one large charge-off, a data anomaly) can otherwise dominate a
+    model fit that a rate-clipped view wouldn't be as sensitive to. This
+    does NOT modify `panel` -- the raw, unclipped annualized_nco_rate
+    column stays as-is; assign this Series to a NEW column (e.g.
+    `panel["annualized_nco_rate_winsorized"] = winsorize_nco_rates(panel)`)
+    if you want both side by side. `min_balance` (optional): rows with
+    average_balance below this are excluded from BOTH the percentile
+    calculation and the returned values (NaN there instead) -- matches
+    `build_industry_nco_rate_report`'s own min_balance filter, so the
+    same near-zero-balance outliers don't distort either the industry
+    rate or the winsorization bounds."""
+    rates = panel["annualized_nco_rate"].copy()
+    if min_balance is not None:
+        rates = rates.where(panel["average_balance"] >= min_balance)
+
+    def _clip_group(s: pd.Series) -> pd.Series:
+        valid = s.dropna()
+        if valid.empty:
+            return s
+        lo, hi = valid.quantile([lower_quantile, upper_quantile])
+        return s.clip(lo, hi)
+
+    return rates.groupby(panel["category"], observed=True).transform(_clip_group)
 
 
 def flag_chargeoff_gaps(
@@ -565,7 +702,7 @@ def build_allowance_panel(item_frame: pd.DataFrame) -> pd.DataFrame:
     rcon = item_frame[TOTAL_ALLOWANCE_ITEM]
     if TOTAL_ALLOWANCE_RCFD_FALLBACK_ITEM in item_frame.columns:
         rcfd = item_frame[TOTAL_ALLOWANCE_RCFD_FALLBACK_ITEM]
-        allowance_balance = rcon.where(rcon.notna(), rcfd)
+        allowance_balance = apply_rcfd_fallback(rcon, rcfd)
     else:
         allowance_balance = rcon
 
@@ -598,7 +735,13 @@ def build_allowance_panel(item_frame: pd.DataFrame) -> pd.DataFrame:
     pct_change = (result["allowance_balance"] - prior_allowance) / prior_allowance.replace(
         0, np.nan
     )
-    result["allowance_merger_flag"] = (pct_change.abs() > 0.5).fillna(False)
+    pct_change_flag = (pct_change.abs() > 0.5).fillna(False)
+    from_near_zero_flag = (
+        prior_allowance.notna()
+        & (prior_allowance.abs() <= NEAR_ZERO_BALANCE_THRESHOLD)
+        & (result["allowance_balance"].abs() > NEAR_ZERO_BALANCE_THRESHOLD)
+    )
+    result["allowance_merger_flag"] = pct_change_flag | from_near_zero_flag
     return result
 
 
@@ -730,7 +873,10 @@ def split_by_cecl_adoption_flag(rollforward: pd.DataFrame) -> tuple[pd.DataFrame
     return rollforward[~flagged_mask], rollforward[flagged_mask]
 
 
-def summarize_mapped_category_coverage(rollforward: pd.DataFrame) -> pd.DataFrame:
+def summarize_mapped_category_coverage(
+    rollforward: pd.DataFrame,
+    min_quarter: pd.Period | None = TOTAL_CHARGEOFF_SERIES_START,
+) -> pd.DataFrame:
     """rollforward: from `compute_bank_allowance_rollforward`. Returns one
     row per quarter: what share of the bank-level TOTAL net charge-offs
     (total_net_chargeoffs, from RIADC079/RIAD4605) is captured by summing
@@ -738,8 +884,20 @@ def summarize_mapped_category_coverage(rollforward: pd.DataFrame) -> pd.DataFram
     Schedule RI-B has several charge-off items (lease financing, farmland
     loans, loans to foreign governments, and more) that aren't mapped into
     any LoanCategory -- this share is expected to be well under 100%, not
-    a data-quality bug."""
-    grouped = rollforward.groupby("quarter", observed=True)[
+    a data-quality bug.
+
+    `min_quarter` (default TOTAL_CHARGEOFF_SERIES_START, 2001Q2): quarters
+    before this are excluded entirely. RIADC079 (the bank-level total
+    charge-off item) doesn't exist as a COLUMN at all in real 2001Q1 bulk
+    data (confirmed) -- total_net_chargeoffs there is artificially low for
+    a reason unrelated to the mapped categories' own coverage, which
+    otherwise produces a spurious >100% "share" for that one quarter/year
+    (confirmed against a real full build: 2001 alone showed 135.8%). Pass
+    None to disable this filter."""
+    scoped = rollforward
+    if min_quarter is not None:
+        scoped = scoped[scoped["quarter"] >= min_quarter]
+    grouped = scoped.groupby("quarter", observed=True)[
         ["mapped_category_net_chargeoffs", "total_net_chargeoffs"]
     ].sum(min_count=1)
     grouped["mapped_category_share"] = (

@@ -157,6 +157,19 @@ def coverage(
     gap_end: str = typer.Option(
         "2010Q4", "--gap-end", help="Last quarter of the gap-check window."
     ),
+    min_balance: float = typer.Option(
+        1_000.0,
+        "--min-balance",
+        help="Exclude bank-quarters below this average balance (thousands of "
+        "dollars) from industry NCO rates -- a near-zero denominator produces "
+        "an extreme, noise-dominated rate.",
+    ),
+    exclude_merger_flagged: bool = typer.Option(
+        True,
+        "--exclude-merger-flagged/--include-merger-flagged",
+        help="Exclude merger-flagged bank-quarters from industry NCO rates (their "
+        "quarterly flow is contaminated by the acquired bank's prior activity).",
+    ),
     output: Path = typer.Option(
         DEFAULT_COVERAGE_REPORT_PATH, "--output", help="Where to write the coverage report."
     ),
@@ -174,7 +187,9 @@ def coverage(
         aggregate_balance=lambda s: s.sum(skipna=True),
     ).reset_index()
 
-    nco_report = build_industry_nco_rate_report(panel)
+    nco_report = build_industry_nco_rate_report(
+        panel, exclude_merger_flagged=exclude_merger_flagged, min_balance=min_balance
+    )
     nco_window = nco_report[
         (nco_report["quarter"] >= pd.Period(nco_start, freq="Q"))
         & (nco_report["quarter"] <= pd.Period(nco_end, freq="Q"))
