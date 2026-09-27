@@ -326,9 +326,34 @@ def test_flag_chargeoff_gaps_detects_a_missing_quarter_in_the_window():
             "has_chargeoff_data": [True, False, True, True, True, True],
         }
     )
-    gaps = panel.flag_chargeoff_gaps(industry_report, start="2008Q1", end="2008Q3")
+    gaps = panel.flag_chargeoff_gaps(
+        industry_report,
+        start="2008Q1",
+        end="2008Q3",
+        categories=[LoanCategory.CRE_CONSTRUCTION, LoanCategory.CI],
+    )
     assert gaps[LoanCategory.CRE_CONSTRUCTION]
     assert not gaps[LoanCategory.CI]
+
+
+def test_flag_chargeoff_gaps_flags_a_category_with_no_rows_at_all_in_the_window():
+    # AUTO has zero rows in a pre-2011 window -- must be flagged as a gap,
+    # not silently omitted from the result.
+    industry_report = pd.DataFrame(
+        {
+            "category": [LoanCategory.CI] * 3,
+            "quarter": [pd.Period(q, freq="Q") for q in ["2008Q1", "2008Q2", "2008Q3"]],
+            "has_chargeoff_data": [True, True, True],
+        }
+    )
+    gaps = panel.flag_chargeoff_gaps(
+        industry_report,
+        start="2008Q1",
+        end="2008Q3",
+        categories=[LoanCategory.CI, LoanCategory.AUTO],
+    )
+    assert not gaps[LoanCategory.CI]
+    assert gaps[LoanCategory.AUTO]
 
 
 def test_allowance_rollforward_residual_detects_a_broken_identity():

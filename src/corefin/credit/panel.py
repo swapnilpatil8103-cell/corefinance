@@ -346,20 +346,41 @@ def build_industry_nco_rate_report(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def flag_chargeoff_gaps(
-    industry_nco_report: pd.DataFrame, start: str = "2008Q1", end: str = "2010Q4"
+    industry_nco_report: pd.DataFrame,
+    start: str = "2008Q1",
+    end: str = "2010Q4",
+    categories: list[LoanCategory] | None = None,
 ) -> pd.Series:
     """industry_nco_report: as produced by `build_industry_nco_rate_report`.
-    Returns a Series indexed by category: True if ANY quarter in
-    [start, end] (inclusive "YYYYQN" strings) has no charge-off data at
-    all for that category -- a gap in exactly the window a crisis-period
-    backtest needs is a hard blocker, not a cosmetic issue."""
+    Returns a Series indexed by `categories` (default: every LoanCategory):
+    True if ANY quarter in [start, end] (inclusive "YYYYQN" strings) has no
+    charge-off data for that category -- a gap in exactly the window a
+    crisis-period backtest needs is a hard blocker, not a cosmetic issue.
+    A category with NO rows at all in the window (e.g. AUTO before its
+    2011Q1 start) is flagged True too, not silently omitted -- "missing
+    every quarter" is the most extreme case of "has a gap," and dropping
+    it from the output would look like "no gap" to a reader skimming the
+    result."""
+    categories = categories if categories is not None else list(LoanCategory)
     start_q = pd.Period(start, freq="Q")
     end_q = pd.Period(end, freq="Q")
+    expected_quarters = pd.period_range(start_q, end_q, freq="Q")
     window = industry_nco_report[
         (industry_nco_report["quarter"] >= start_q) & (industry_nco_report["quarter"] <= end_q)
     ]
-    by_category = window.groupby("category", observed=True)["has_chargeoff_data"]
-    return by_category.apply(lambda s: not s.all())
+    by_category = {
+        name: group["has_chargeoff_data"]
+        for name, group in window.groupby("category", observed=True)
+    }
+
+    gaps = {}
+    for category in categories:
+        category_data = by_category.get(category)
+        if category_data is None or len(category_data) < len(expected_quarters):
+            gaps[category] = True  # missing quarter(s) entirely -- also a gap
+        else:
+            gaps[category] = not category_data.all()
+    return pd.Series(gaps)
 
 
 def allowance_rollforward_residual(

@@ -55,3 +55,4 @@ select = ["E", "F", "I", "UP", "B", "N"]
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["N802"]
 "src/corefin/cli.py" = ["B008"]  # typer's idiomatic Option()/Argument() defaults
+"src/corefin/credit/cli.py" = ["B008"]  # same

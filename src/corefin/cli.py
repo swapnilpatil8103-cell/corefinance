@@ -56,6 +56,16 @@ from corefin.transaction.sources_uses import compute_sources_and_uses
 
 app = typer.Typer(add_completion=False)
 
+try:
+    from corefin.credit.cli import app as credit_app
+
+    app.add_typer(credit_app, name="credit")
+except ImportError:
+    # corefin[fig] (requests/pyarrow/etc) not installed -- `corefin credit`
+    # simply isn't registered rather than making it a hard dependency of
+    # the core install.
+    pass
+
 
 @app.command()
 def version() -> None:
