@@ -16,6 +16,8 @@ from corefin.credit.schema import (
     CATEGORY_MDRM_CODES,
     PROVISION_EXPENSE_ITEM,
     TOTAL_ALLOWANCE_ITEM,
+    TOTAL_CHARGEOFF_ITEM,
+    TOTAL_RECOVERY_ITEM,
     LoanCategory,
     MdrmCodeSet,
 )
@@ -431,10 +433,16 @@ def build_allowance_panel(item_frame: pd.DataFrame) -> pd.DataFrame:
     `item_frame` needs "bank_id", "quarter" plus TOTAL_ALLOWANCE_ITEM
     (RCON3123), TOTAL_ALLOWANCE_RCFD_FALLBACK_ITEM (RCFD3123, optional --
     used only where RCON3123 is missing) and PROVISION_EXPENSE_ITEM
-    (RIAD4230, year-to-date) columns. Returns bank_id, quarter,
-    allowance_balance, provision_ytd, provision_quarterly (the last via
-    `ytd_to_quarterly`, per bank, vectorized the same way `build_panel`
-    computes chargeoff_quarterly)."""
+    (RIAD4230, year-to-date), TOTAL_CHARGEOFF_ITEM (RIADC079, year-to-date)
+    and TOTAL_RECOVERY_ITEM (RIAD4605, year-to-date) columns. Returns
+    bank_id, quarter, allowance_balance, provision_ytd, provision_quarterly,
+    total_chargeoff_ytd, total_chargeoff_quarterly, total_recovery_ytd,
+    total_recovery_quarterly, and allowance_merger_flag
+    (`flag_merger_discontinuities` on allowance_balance, per bank -- a
+    merger/acquisition adds the acquired bank's allowance as a lump sum
+    that breaks the roll-forward identity by construction; see
+    `compute_bank_allowance_rollforward`, which excludes flagged
+    bank-quarters from its summary statistics)."""
     rcon = item_frame[TOTAL_ALLOWANCE_ITEM]
     if TOTAL_ALLOWANCE_RCFD_FALLBACK_ITEM in item_frame.columns:
         rcfd = item_frame[TOTAL_ALLOWANCE_RCFD_FALLBACK_ITEM]
@@ -448,16 +456,30 @@ def build_allowance_panel(item_frame: pd.DataFrame) -> pd.DataFrame:
             "quarter": item_frame["quarter"],
             "allowance_balance": allowance_balance,
             "provision_ytd": item_frame[PROVISION_EXPENSE_ITEM],
+            "total_chargeoff_ytd": item_frame[TOTAL_CHARGEOFF_ITEM],
+            "total_recovery_ytd": item_frame[TOTAL_RECOVERY_ITEM],
         }
     )
     result = result.sort_values(["bank_id", "quarter"]).reset_index(drop=True)
 
     quarters = pd.PeriodIndex(result["quarter"])
     is_q1 = quarters.quarter == 1
-    prior_provision_ytd = result.groupby("bank_id", sort=False)["provision_ytd"].shift(1)
-    result["provision_quarterly"] = np.where(
-        is_q1, result["provision_ytd"], result["provision_ytd"] - prior_provision_ytd
+    by_bank = result.groupby("bank_id", sort=False)
+    for ytd_col, quarterly_col in (
+        ("provision_ytd", "provision_quarterly"),
+        ("total_chargeoff_ytd", "total_chargeoff_quarterly"),
+        ("total_recovery_ytd", "total_recovery_quarterly"),
+    ):
+        prior_ytd = by_bank[ytd_col].shift(1)
+        result[quarterly_col] = np.where(
+            is_q1, result[ytd_col], result[ytd_col] - prior_ytd
+        )
+
+    prior_allowance = by_bank["allowance_balance"].shift(1)
+    pct_change = (result["allowance_balance"] - prior_allowance) / prior_allowance.replace(
+        0, np.nan
     )
+    result["allowance_merger_flag"] = (pct_change.abs() > 0.5).fillna(False)
     return result
 
 
@@ -466,21 +488,35 @@ def compute_bank_allowance_rollforward(
     category_panel: pd.DataFrame,
     categories: list[LoanCategory] | None = None,
 ) -> pd.DataFrame:
-    """Joins `allowance_panel` (from `build_allowance_panel`) with total
-    net charge-offs aggregated ACROSS categories from `category_panel`
-    (from `build_panel`) to compute the bank-quarter allowance
-    roll-forward residual. `categories` defaults to every LoanCategory
-    EXCEPT AUTO_AND_OTHER_CONSUMER_COMBINED (summing it alongside AUTO/
-    OTHER_CONSUMER would double-count, per schema.py's module docstring) --
-    pass an explicit list to change that.
+    """Joins `allowance_panel` (from `build_allowance_panel`) with
+    `category_panel` (from `build_panel`) to compute the bank-quarter
+    allowance roll-forward residual. The residual uses `allowance_panel`'s
+    own bank-level total_chargeoff_quarterly/total_recovery_quarterly
+    (RIADC079/RIAD4605 -- the actual Schedule RI-B Part II totals, which
+    include several charge-off items, e.g. lease financing and farmland
+    loans, this project doesn't map into any LoanCategory), NOT the sum of
+    this project's mapped categories, which understates the true total by
+    construction. That mapped-category sum is kept as a separate column
+    (`mapped_category_net_chargeoffs`) -- see
+    `summarize_mapped_category_coverage` for how much of the true total it
+    captures, by quarter. `categories` (for the mapped-category sum only)
+    defaults to every LoanCategory EXCEPT AUTO_AND_OTHER_CONSUMER_COMBINED
+    (summing it alongside AUTO/OTHER_CONSUMER would double-count, per
+    schema.py's module docstring) -- pass an explicit list to change that.
 
     Returns bank_id, quarter, allowance_balance, beginning_allowance (the
     prior quarter's allowance_balance, per bank -- NaN for each bank's
-    first quarter), provision_quarterly, total_net_chargeoffs, and
-    residual (`allowance_rollforward_residual`). A nonzero residual is
-    expected against real data (a small "other adjustments" Call Report
-    line isn't modeled here); large residuals point to a mapping or
-    differencing error, not just real-world noise."""
+    first quarter), provision_quarterly, total_net_chargeoffs (bank-level,
+    used in the residual), mapped_category_net_chargeoffs (this project's
+    categories, informational only), allowance_merger_flag, and residual.
+    A nonzero residual is expected against real data (a small "other
+    adjustments" Call Report line isn't modeled here); large residuals for
+    bank-quarters NOT flagged by allowance_merger_flag point to a mapping
+    or differencing error, not just real-world noise -- flagged
+    bank-quarters break the identity for a known, different reason (a
+    merger/acquisition's lump-sum allowance addition) and should be
+    excluded from summary statistics on the residual, not blamed on the
+    mapping."""
     categories = (
         categories
         if categories is not None
@@ -490,18 +526,23 @@ def compute_bank_allowance_rollforward(
     net_chargeoffs = scoped.assign(
         net_chargeoff=scoped["chargeoff_quarterly"] - scoped["recovery_quarterly"]
     )
-    total_net_chargeoffs = (
+    mapped_category_net_chargeoffs = (
         net_chargeoffs.groupby(["bank_id", "quarter"], observed=True)["net_chargeoff"]
         .sum(min_count=1)
         .reset_index()
-        .rename(columns={"net_chargeoff": "total_net_chargeoffs"})
+        .rename(columns={"net_chargeoff": "mapped_category_net_chargeoffs"})
     )
 
-    merged = allowance_panel.merge(total_net_chargeoffs, on=["bank_id", "quarter"], how="left")
+    merged = allowance_panel.merge(
+        mapped_category_net_chargeoffs, on=["bank_id", "quarter"], how="left"
+    )
     merged = merged.sort_values(["bank_id", "quarter"]).reset_index(drop=True)
     prior_allowance = merged.groupby("bank_id", sort=False)["allowance_balance"]
     merged["beginning_allowance"] = prior_allowance.shift(1)
 
+    merged["total_net_chargeoffs"] = (
+        merged["total_chargeoff_quarterly"] - merged["total_recovery_quarterly"]
+    )
     merged["residual"] = allowance_rollforward_residual(
         merged["beginning_allowance"],
         merged["provision_quarterly"],
@@ -516,6 +557,38 @@ def compute_bank_allowance_rollforward(
             "beginning_allowance",
             "provision_quarterly",
             "total_net_chargeoffs",
+            "mapped_category_net_chargeoffs",
+            "allowance_merger_flag",
             "residual",
         ]
     ]
+
+
+def split_by_merger_flag(rollforward: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Returns (clean, flagged) -- `rollforward` (from
+    `compute_bank_allowance_rollforward`) split by allowance_merger_flag.
+    Summary statistics computed on `clean` reflect the roll-forward
+    identity's actual fit; `flagged` rows are excluded from such summaries
+    because a merger/acquisition-driven allowance jump breaks the identity
+    by design (the acquired allowance arrives as a lump sum, not through
+    organic provision/charge-off activity), not because of a mapping bug."""
+    flagged_mask = rollforward["allowance_merger_flag"].fillna(False)
+    return rollforward[~flagged_mask], rollforward[flagged_mask]
+
+
+def summarize_mapped_category_coverage(rollforward: pd.DataFrame) -> pd.DataFrame:
+    """rollforward: from `compute_bank_allowance_rollforward`. Returns one
+    row per quarter: what share of the bank-level TOTAL net charge-offs
+    (total_net_chargeoffs, from RIADC079/RIAD4605) is captured by summing
+    this project's mapped loan categories (mapped_category_net_chargeoffs)?
+    Schedule RI-B has several charge-off items (lease financing, farmland
+    loans, loans to foreign governments, and more) that aren't mapped into
+    any LoanCategory -- this share is expected to be well under 100%, not
+    a data-quality bug."""
+    grouped = rollforward.groupby("quarter", observed=True)[
+        ["mapped_category_net_chargeoffs", "total_net_chargeoffs"]
+    ].sum(min_count=1)
+    grouped["mapped_category_share"] = (
+        grouped["mapped_category_net_chargeoffs"] / grouped["total_net_chargeoffs"]
+    )
+    return grouped.reset_index().sort_values("quarter").reset_index(drop=True)

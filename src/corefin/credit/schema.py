@@ -406,3 +406,30 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
 # real 2006Q4/2008Q4/2021Q4 bulk data.
 TOTAL_ALLOWANCE_ITEM = "RCON3123"
 PROVISION_EXPENSE_ITEM = "RIAD4230"
+
+# Bank-level TOTAL charge-offs/recoveries -- Schedule RI-B Part II (the
+# "Allowance" memo section reported alongside RCON3123/RIAD4230/RIAD4605),
+# NOT the sum of this project's mapped loan categories, which is the right
+# denominator for the allowance roll-forward identity. Schedule RI-B has
+# several charge-off items (lease financing, farmland loans, loans to
+# foreign governments, and more) this project doesn't map into any
+# LoanCategory at all, so the mapped-category sum understates the true
+# total by construction -- see panel.py's
+# `compute_bank_allowance_rollforward`, which keeps both figures.
+#
+# RI-B actually has TWO charge-off total lines, both verified present in
+# real 2006Q4/2021Q4 bulk data: RIAD4635 (Part I, in Schedule RIBI) and
+# RIADC079 (Part II, in Schedule RIBII). They are usually identical but not
+# always -- verified against real 2021Q4 data, they differ for 29 of 4887
+# banks, and RIADC079 is always >= RIAD4635 where they differ. This matches
+# MDRM's own COMPARABILITY note for RIAD4635/C079: beginning 2001Q2, "the
+# item number was changed to C079 from 4635; the definition was changed to
+# include write-down[s] arising from transfers of loans to a held-for-sale
+# account" -- i.e. C079 is a superset covering banks with held-for-sale
+# transfers that quarter. RIADC079 (Part II) is used here since it is the
+# figure reported alongside the allowance roll-forward itself, in the same
+# schedule as RCON3123/RIAD4230. RIAD4605 (recoveries) has no equivalent
+# ambiguity -- verified byte-for-byte identical whether read from Schedule
+# RIBI or RIBII, across all 4887 banks in the 2021Q4 file.
+TOTAL_CHARGEOFF_ITEM = "RIADC079"
+TOTAL_RECOVERY_ITEM = "RIAD4605"

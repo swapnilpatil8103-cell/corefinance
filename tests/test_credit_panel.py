@@ -366,15 +366,28 @@ def test_allowance_rollforward_residual_detects_a_broken_identity():
 # ------------------------------------------------ allowance/provision -----
 
 
+def _allowance_item_frame(**overrides) -> pd.DataFrame:
+    base = {
+        "bank_id": ["A", "A"],
+        "quarter": _quarters(["2015Q1", "2015Q2"]),
+        "RCON3123": [100.0, 108.0],
+        "RIAD4230": [5.0, 25.0],  # provision, YTD
+        "RIADC079": [10.0, 25.0],  # total chargeoff, YTD
+        "RIAD4605": [2.0, 5.0],  # total recovery, YTD
+    }
+    base.update(overrides)
+    return pd.DataFrame(base)
+
+
 def test_build_allowance_panel_uses_rcfd_fallback_only_where_rcon_is_missing():
-    item_frame = pd.DataFrame(
-        {
-            "bank_id": ["A", "A", "B"],
-            "quarter": _quarters(["2015Q1", "2015Q2", "2015Q1"]),
-            "RCON3123": [100.0, 110.0, np.nan],  # bank B missing RCON entirely
-            "RCFD3123": [np.nan, np.nan, 250.0],  # only bank B has an RCFD figure
-            "RIAD4230": [5.0, 25.0, 12.0],  # provision, YTD
-        }
+    item_frame = _allowance_item_frame(
+        bank_id=["A", "A", "B"],
+        quarter=_quarters(["2015Q1", "2015Q2", "2015Q1"]),
+        RCON3123=[100.0, 110.0, np.nan],  # bank B missing RCON entirely
+        RCFD3123=[np.nan, np.nan, 250.0],  # only bank B has an RCFD figure
+        RIAD4230=[5.0, 25.0, 12.0],
+        RIADC079=[10.0, 25.0, 6.0],
+        RIAD4605=[2.0, 5.0, 1.0],
     )
     result = panel.build_allowance_panel(item_frame)
     bank_a = result[result["bank_id"] == "A"].sort_values("quarter")
@@ -384,75 +397,114 @@ def test_build_allowance_panel_uses_rcfd_fallback_only_where_rcon_is_missing():
     assert bank_b["allowance_balance"].iloc[0] == pytest.approx(250.0)  # fell back to RCFD3123
     # Q1 provision_quarterly == its own YTD value; Q2 is YTD-differenced
     assert bank_a["provision_quarterly"].tolist() == pytest.approx([5.0, 20.0])
+    assert bank_a["total_chargeoff_quarterly"].tolist() == pytest.approx([10.0, 15.0])
+    assert bank_a["total_recovery_quarterly"].tolist() == pytest.approx([2.0, 3.0])
 
 
 def test_build_allowance_panel_without_rcfd_column_uses_rcon_only():
-    item_frame = pd.DataFrame(
-        {
-            "bank_id": ["A"],
-            "quarter": _quarters(["2015Q1"]),
-            "RCON3123": [100.0],
-            "RIAD4230": [5.0],
-        }
+    item_frame = _allowance_item_frame(
+        bank_id=["A"],
+        quarter=_quarters(["2015Q1"]),
+        RCON3123=[100.0],
+        RIAD4230=[5.0],
+        RIADC079=[10.0],
+        RIAD4605=[2.0],
     )
     result = panel.build_allowance_panel(item_frame)
     assert result["allowance_balance"].iloc[0] == pytest.approx(100.0)
 
 
-def test_compute_bank_allowance_rollforward_matches_a_consistent_synthetic_series():
-    allowance_panel = pd.DataFrame(
-        {
-            "bank_id": ["A", "A"],
-            "quarter": _quarters(["2015Q1", "2015Q2"]),
-            "allowance_balance": [100.0, 108.0],
-            "provision_ytd": [5.0, 25.0],
-            "provision_quarterly": [5.0, 20.0],
-        }
+def test_build_allowance_panel_flags_a_merger_sized_balance_jump():
+    item_frame = _allowance_item_frame(
+        RCON3123=[100.0, 400.0],  # 4x jump -- a merger, not organic growth
     )
+    result = panel.build_allowance_panel(item_frame)
+    result = result.sort_values("quarter")
+    assert result["allowance_merger_flag"].tolist() == [False, True]
+
+
+def test_compute_bank_allowance_rollforward_uses_bank_level_totals_not_mapped_categories():
+    # Bank-level total NCO (RIADC079 - RIAD4605) differs from the mapped
+    # category sum -- the residual must use the bank-level total.
+    allowance_panel = panel.build_allowance_panel(
+        _allowance_item_frame(RIADC079=[10.0, 30.0], RIAD4605=[2.0, 6.0])
+    )
+    # bank-level: Q1 chargeoff=10, recovery=2 -> net=8; Q2 chargeoff=20, recovery=4 -> net=16
+    # ending = beginning(100) + provision(20) - net(16) = 104
+    q2_mask = allowance_panel["quarter"] == pd.Period("2015Q2", freq="Q")
+    allowance_panel.loc[q2_mask, "allowance_balance"] = 104.0
+
     category_panel = pd.DataFrame(
         {
             "bank_id": ["A", "A"],
             "quarter": _quarters(["2015Q1", "2015Q2"]),
             "category": [LoanCategory.CI, LoanCategory.CI],
-            "chargeoff_quarterly": [10.0, 15.0],
-            "recovery_quarterly": [2.0, 3.0],
+            # deliberately different from the bank-level total, to prove
+            # the residual doesn't use this sum
+            "chargeoff_quarterly": [1.0, 1.0],
+            "recovery_quarterly": [0.0, 0.0],
         }
     )
     result = panel.compute_bank_allowance_rollforward(
         allowance_panel, category_panel, categories=[LoanCategory.CI]
     )
-    q1 = result[result["quarter"] == pd.Period("2015Q1", freq="Q")].iloc[0]
     q2 = result[result["quarter"] == pd.Period("2015Q2", freq="Q")].iloc[0]
-
-    assert q1["beginning_allowance"] != q1["beginning_allowance"]  # NaN: no prior quarter
-    assert q2["beginning_allowance"] == pytest.approx(100.0)
-    assert q2["total_net_chargeoffs"] == pytest.approx(12.0)  # 15 - 3
+    assert q2["total_net_chargeoffs"] == pytest.approx(16.0)  # bank-level, not mapped
+    assert q2["mapped_category_net_chargeoffs"] == pytest.approx(1.0)  # kept, unused in residual
     assert q2["residual"] == pytest.approx(0.0, abs=1e-9)
 
 
-def test_compute_bank_allowance_rollforward_excludes_combined_consumer_by_default():
-    allowance_panel = pd.DataFrame(
-        {
-            "bank_id": ["A"],
-            "quarter": _quarters(["2015Q1"]),
-            "allowance_balance": [100.0],
-            "provision_ytd": [5.0],
-            "provision_quarterly": [5.0],
-        }
+def test_compute_bank_allowance_rollforward_excludes_combined_consumer_from_mapped_sum_by_default():
+    item_frame = _allowance_item_frame(
+        bank_id=["A"],
+        quarter=_quarters(["2015Q1"]),
+        RCON3123=[100.0],
+        RIAD4230=[5.0],
+        RIADC079=[10.0],
+        RIAD4605=[2.0],
     )
+    allowance_panel = panel.build_allowance_panel(item_frame)
     category_panel = pd.DataFrame(
         {
             "bank_id": ["A", "A"],
             "quarter": _quarters(["2015Q1", "2015Q1"]),
             "category": [LoanCategory.CI, LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED],
-            "chargeoff_quarterly": [10.0, 999.0],
-            "recovery_quarterly": [2.0, 0.0],
+            "chargeoff_quarterly": [3.0, 999.0],
+            "recovery_quarterly": [1.0, 0.0],
         }
     )
     result = panel.compute_bank_allowance_rollforward(allowance_panel, category_panel)
-    # must only reflect CI's net chargeoff (8.0), not the combined-consumer
-    # row (which would double-count with AUTO/OTHER_CONSUMER in real usage)
-    assert result["total_net_chargeoffs"].iloc[0] == pytest.approx(8.0)
+    # mapped_category_net_chargeoffs must only reflect CI (3-1=2), not the
+    # combined-consumer row (which would double-count with AUTO/OTHER_CONSUMER)
+    assert result["mapped_category_net_chargeoffs"].iloc[0] == pytest.approx(2.0)
+
+
+def test_split_by_merger_flag_separates_flagged_rows():
+    rollforward = pd.DataFrame(
+        {
+            "bank_id": ["A", "B"],
+            "residual": [5.0, 999.0],
+            "allowance_merger_flag": [False, True],
+        }
+    )
+    clean, flagged = panel.split_by_merger_flag(rollforward)
+    assert clean["bank_id"].tolist() == ["A"]
+    assert flagged["bank_id"].tolist() == ["B"]
+
+
+def test_summarize_mapped_category_coverage_computes_share_by_quarter():
+    rollforward = pd.DataFrame(
+        {
+            "quarter": _quarters(["2015Q1", "2015Q1"]),
+            "mapped_category_net_chargeoffs": [8.0, 2.0],
+            "total_net_chargeoffs": [10.0, 5.0],
+        }
+    )
+    result = panel.summarize_mapped_category_coverage(rollforward)
+    row = result.iloc[0]
+    assert row["mapped_category_net_chargeoffs"] == pytest.approx(10.0)
+    assert row["total_net_chargeoffs"] == pytest.approx(15.0)
+    assert row["mapped_category_share"] == pytest.approx(10.0 / 15.0)
 
 
 # --------------------------------------------------------- coverage report -
