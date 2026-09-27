@@ -63,6 +63,7 @@ def parse_bulk_zip(zip_bytes: bytes, quarter: pd.Period) -> pd.DataFrame:
     zf = zipfile.ZipFile(BytesIO(zip_bytes))
 
     schedules = [
+        _read_schedule(zf, "Schedule RC "),  # trailing space -- excludes RCCI/RCCII/RCN/RCA/etc
         _read_schedule(zf, "Schedule RCCI "),
         _read_schedule(zf, "Schedule RCCII "),
         _read_schedule(zf, "Schedule RCN "),
@@ -72,7 +73,8 @@ def parse_bulk_zip(zip_bytes: bytes, quarter: pd.Period) -> pd.DataFrame:
     present = [s for s in schedules if s is not None]
     if not present:
         raise ValueError(
-            "none of the expected schedule files (RCCI/RCCII/RCN/RIBI/RIBII) were found in the ZIP"
+            "none of the expected schedule files (RC/RCCI/RCCII/RCN/RIBI/RIBII) "
+            "were found in the ZIP"
         )
 
     id_col = next(c for c in present[0].columns if "IDRSSD" in c.upper())

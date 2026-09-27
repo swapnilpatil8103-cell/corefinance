@@ -68,6 +68,23 @@ def test_parse_bulk_zip_merges_across_schedules_on_bank_id():
     assert result["quarter"].iloc[0] == pd.Period("2021Q4", freq="Q")
 
 
+def test_parse_bulk_zip_reads_the_plain_rc_schedule_for_allowance_items():
+    # "Schedule RC " (with the trailing space) must match only the plain
+    # RC schedule, not RCCI/RCCII/RCA/RCR/etc -- confirmed against a real
+    # bulk ZIP, RCON3123/RCFD3123 (allowance) live only in this schedule.
+    rc = '"IDRSSD"\tRCON3123\tRCFD3123\n\tdesc\tdesc\n37\t100\t\n'
+    rca = '"IDRSSD"\tRCONXXXX\n\tdesc\n37\t999\n'  # decoy -- must not be picked up as "RC"
+    zip_bytes = _make_zip(
+        {
+            "FFIEC CDR Call Schedule RC 12312021.txt": rc,
+            "FFIEC CDR Call Schedule RCA 12312021.txt": rca,
+        }
+    )
+    result = ffiec_parse.parse_bulk_zip(zip_bytes, pd.Period("2021Q4", freq="Q"))
+    assert result["RCON3123"].iloc[0] == pytest.approx(100.0)
+    assert "RCONXXXX" not in result.columns
+
+
 def test_parse_bulk_zip_raises_when_no_expected_schedule_is_present():
     rca = '"IDRSSD"\tRCON1\n\tdesc\n37\t1\n'
     zip_bytes = _make_zip({"FFIEC CDR Call Schedule RCA 12312021.txt": rca})

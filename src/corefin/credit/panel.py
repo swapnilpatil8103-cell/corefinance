@@ -12,7 +12,22 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from corefin.credit.schema import CATEGORY_MDRM_CODES, LoanCategory, MdrmCodeSet
+from corefin.credit.schema import (
+    CATEGORY_MDRM_CODES,
+    PROVISION_EXPENSE_ITEM,
+    TOTAL_ALLOWANCE_ITEM,
+    LoanCategory,
+    MdrmCodeSet,
+)
+
+# RCFD3123 (consolidated) fallback for TOTAL_ALLOWANCE_ITEM (RCON3123,
+# domestic-only) -- confirmed a REAL, actually-used fallback against a real
+# 2021Q4 bulk file: 84 of 4887 banks had RCON3123 missing, and every one of
+# those 84 had RCFD3123 populated instead (likely FFIEC 031 filers whose
+# allowance is reported only on a consolidated basis) -- unlike every
+# per-category balance item in schema.py, where the RCFD fallback is purely
+# defensive and never triggered in practice.
+TOTAL_ALLOWANCE_RCFD_FALLBACK_ITEM = "RCFD3123"
 
 # CECL is mandatory for large SEC filers starting 2020Q1, phased in for
 # smaller/non-SEC filers through 2023. This default is only a fallback for
@@ -409,3 +424,98 @@ def allowance_rollforward_residual(
     against synthetic fixtures built to satisfy the identity exactly, the
     residual should be ~0 (see checks.framework.check_close_to_zero)."""
     return ending_allowance - (beginning_allowance + provision - net_chargeoffs)
+
+
+def build_allowance_panel(item_frame: pd.DataFrame) -> pd.DataFrame:
+    """Bank-quarter (not per-category) allowance and provision figures.
+    `item_frame` needs "bank_id", "quarter" plus TOTAL_ALLOWANCE_ITEM
+    (RCON3123), TOTAL_ALLOWANCE_RCFD_FALLBACK_ITEM (RCFD3123, optional --
+    used only where RCON3123 is missing) and PROVISION_EXPENSE_ITEM
+    (RIAD4230, year-to-date) columns. Returns bank_id, quarter,
+    allowance_balance, provision_ytd, provision_quarterly (the last via
+    `ytd_to_quarterly`, per bank, vectorized the same way `build_panel`
+    computes chargeoff_quarterly)."""
+    rcon = item_frame[TOTAL_ALLOWANCE_ITEM]
+    if TOTAL_ALLOWANCE_RCFD_FALLBACK_ITEM in item_frame.columns:
+        rcfd = item_frame[TOTAL_ALLOWANCE_RCFD_FALLBACK_ITEM]
+        allowance_balance = rcon.where(rcon.notna(), rcfd)
+    else:
+        allowance_balance = rcon
+
+    result = pd.DataFrame(
+        {
+            "bank_id": item_frame["bank_id"],
+            "quarter": item_frame["quarter"],
+            "allowance_balance": allowance_balance,
+            "provision_ytd": item_frame[PROVISION_EXPENSE_ITEM],
+        }
+    )
+    result = result.sort_values(["bank_id", "quarter"]).reset_index(drop=True)
+
+    quarters = pd.PeriodIndex(result["quarter"])
+    is_q1 = quarters.quarter == 1
+    prior_provision_ytd = result.groupby("bank_id", sort=False)["provision_ytd"].shift(1)
+    result["provision_quarterly"] = np.where(
+        is_q1, result["provision_ytd"], result["provision_ytd"] - prior_provision_ytd
+    )
+    return result
+
+
+def compute_bank_allowance_rollforward(
+    allowance_panel: pd.DataFrame,
+    category_panel: pd.DataFrame,
+    categories: list[LoanCategory] | None = None,
+) -> pd.DataFrame:
+    """Joins `allowance_panel` (from `build_allowance_panel`) with total
+    net charge-offs aggregated ACROSS categories from `category_panel`
+    (from `build_panel`) to compute the bank-quarter allowance
+    roll-forward residual. `categories` defaults to every LoanCategory
+    EXCEPT AUTO_AND_OTHER_CONSUMER_COMBINED (summing it alongside AUTO/
+    OTHER_CONSUMER would double-count, per schema.py's module docstring) --
+    pass an explicit list to change that.
+
+    Returns bank_id, quarter, allowance_balance, beginning_allowance (the
+    prior quarter's allowance_balance, per bank -- NaN for each bank's
+    first quarter), provision_quarterly, total_net_chargeoffs, and
+    residual (`allowance_rollforward_residual`). A nonzero residual is
+    expected against real data (a small "other adjustments" Call Report
+    line isn't modeled here); large residuals point to a mapping or
+    differencing error, not just real-world noise."""
+    categories = (
+        categories
+        if categories is not None
+        else [c for c in LoanCategory if c != LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED]
+    )
+    scoped = category_panel[category_panel["category"].isin(categories)]
+    net_chargeoffs = scoped.assign(
+        net_chargeoff=scoped["chargeoff_quarterly"] - scoped["recovery_quarterly"]
+    )
+    total_net_chargeoffs = (
+        net_chargeoffs.groupby(["bank_id", "quarter"], observed=True)["net_chargeoff"]
+        .sum(min_count=1)
+        .reset_index()
+        .rename(columns={"net_chargeoff": "total_net_chargeoffs"})
+    )
+
+    merged = allowance_panel.merge(total_net_chargeoffs, on=["bank_id", "quarter"], how="left")
+    merged = merged.sort_values(["bank_id", "quarter"]).reset_index(drop=True)
+    prior_allowance = merged.groupby("bank_id", sort=False)["allowance_balance"]
+    merged["beginning_allowance"] = prior_allowance.shift(1)
+
+    merged["residual"] = allowance_rollforward_residual(
+        merged["beginning_allowance"],
+        merged["provision_quarterly"],
+        merged["total_net_chargeoffs"],
+        merged["allowance_balance"],
+    )
+    return merged[
+        [
+            "bank_id",
+            "quarter",
+            "allowance_balance",
+            "beginning_allowance",
+            "provision_quarterly",
+            "total_net_chargeoffs",
+            "residual",
+        ]
+    ]

@@ -363,6 +363,98 @@ def test_allowance_rollforward_residual_detects_a_broken_identity():
     assert residual.iloc[0] == pytest.approx(999.0 - 110.0)
 
 
+# ------------------------------------------------ allowance/provision -----
+
+
+def test_build_allowance_panel_uses_rcfd_fallback_only_where_rcon_is_missing():
+    item_frame = pd.DataFrame(
+        {
+            "bank_id": ["A", "A", "B"],
+            "quarter": _quarters(["2015Q1", "2015Q2", "2015Q1"]),
+            "RCON3123": [100.0, 110.0, np.nan],  # bank B missing RCON entirely
+            "RCFD3123": [np.nan, np.nan, 250.0],  # only bank B has an RCFD figure
+            "RIAD4230": [5.0, 25.0, 12.0],  # provision, YTD
+        }
+    )
+    result = panel.build_allowance_panel(item_frame)
+    bank_a = result[result["bank_id"] == "A"].sort_values("quarter")
+    bank_b = result[result["bank_id"] == "B"]
+
+    assert bank_a["allowance_balance"].tolist() == pytest.approx([100.0, 110.0])
+    assert bank_b["allowance_balance"].iloc[0] == pytest.approx(250.0)  # fell back to RCFD3123
+    # Q1 provision_quarterly == its own YTD value; Q2 is YTD-differenced
+    assert bank_a["provision_quarterly"].tolist() == pytest.approx([5.0, 20.0])
+
+
+def test_build_allowance_panel_without_rcfd_column_uses_rcon_only():
+    item_frame = pd.DataFrame(
+        {
+            "bank_id": ["A"],
+            "quarter": _quarters(["2015Q1"]),
+            "RCON3123": [100.0],
+            "RIAD4230": [5.0],
+        }
+    )
+    result = panel.build_allowance_panel(item_frame)
+    assert result["allowance_balance"].iloc[0] == pytest.approx(100.0)
+
+
+def test_compute_bank_allowance_rollforward_matches_a_consistent_synthetic_series():
+    allowance_panel = pd.DataFrame(
+        {
+            "bank_id": ["A", "A"],
+            "quarter": _quarters(["2015Q1", "2015Q2"]),
+            "allowance_balance": [100.0, 108.0],
+            "provision_ytd": [5.0, 25.0],
+            "provision_quarterly": [5.0, 20.0],
+        }
+    )
+    category_panel = pd.DataFrame(
+        {
+            "bank_id": ["A", "A"],
+            "quarter": _quarters(["2015Q1", "2015Q2"]),
+            "category": [LoanCategory.CI, LoanCategory.CI],
+            "chargeoff_quarterly": [10.0, 15.0],
+            "recovery_quarterly": [2.0, 3.0],
+        }
+    )
+    result = panel.compute_bank_allowance_rollforward(
+        allowance_panel, category_panel, categories=[LoanCategory.CI]
+    )
+    q1 = result[result["quarter"] == pd.Period("2015Q1", freq="Q")].iloc[0]
+    q2 = result[result["quarter"] == pd.Period("2015Q2", freq="Q")].iloc[0]
+
+    assert q1["beginning_allowance"] != q1["beginning_allowance"]  # NaN: no prior quarter
+    assert q2["beginning_allowance"] == pytest.approx(100.0)
+    assert q2["total_net_chargeoffs"] == pytest.approx(12.0)  # 15 - 3
+    assert q2["residual"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_compute_bank_allowance_rollforward_excludes_combined_consumer_by_default():
+    allowance_panel = pd.DataFrame(
+        {
+            "bank_id": ["A"],
+            "quarter": _quarters(["2015Q1"]),
+            "allowance_balance": [100.0],
+            "provision_ytd": [5.0],
+            "provision_quarterly": [5.0],
+        }
+    )
+    category_panel = pd.DataFrame(
+        {
+            "bank_id": ["A", "A"],
+            "quarter": _quarters(["2015Q1", "2015Q1"]),
+            "category": [LoanCategory.CI, LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED],
+            "chargeoff_quarterly": [10.0, 999.0],
+            "recovery_quarterly": [2.0, 0.0],
+        }
+    )
+    result = panel.compute_bank_allowance_rollforward(allowance_panel, category_panel)
+    # must only reflect CI's net chargeoff (8.0), not the combined-consumer
+    # row (which would double-count with AUTO/OTHER_CONSUMER in real usage)
+    assert result["total_net_chargeoffs"].iloc[0] == pytest.approx(8.0)
+
+
 # --------------------------------------------------------- coverage report -
 
 
