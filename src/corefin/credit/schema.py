@@ -6,64 +6,90 @@ Every MDRM code below was looked up against the Federal Reserve's own
 published MDRM Data Dictionary (a free, no-account-required 7.6MB zip at
 https://www.federalreserve.gov/apps/mdrm/download_mdrm.htm -- distinct
 from FFIEC's account-gated PWS), filtered to the three Call Report forms
-(FFIEC 031/041/051), not recalled from memory. Call Report item codes are
-NOT stable over the panel's full history -- some categories were
-restructured mid-series, so each category maps to an ordered tuple of
-`MdrmCodeSet`s, each valid for a contiguous span of calendar quarters
-(`code_sets_for(category)` / `code_set_for_quarter` in panel.py pick the
-right one per bank-quarter row). Two confirmed, real restructurings drove
-this:
+(FFIEC 031/041/051), not recalled from memory, AND cross-checked against
+real bulk Call Report downloads (via sources/ffiec.py) for 2006Q4, 2008Q4,
+2021Q4 and 2026Q2 -- MDRM's "active" flag on an item code does not
+guarantee that code is actually a populated column in the distributed
+bulk data (several codes below are MDRM-active but empirically absent;
+see the per-category notes). Call Report item codes are NOT stable over
+the panel's full history -- some categories were restructured mid-series,
+so each category maps to an ordered tuple of `MdrmCodeSet`s, each valid
+for a contiguous span of calendar quarters (`code_set_for_quarter` in
+panel.py picks the right one per bank-quarter row). Three confirmed, real
+restructurings drove this:
 
 - CRE construction and CRE nonfarm-nonresidential both split at 2007Q1,
-  confirmed not just against MDRM but against a REAL downloaded bulk Call
-  Report file (2021Q4, via the bulk-download client in sources/ffiec.py):
+  confirmed against real 2006Q4 (pre-split codes present) and 2008Q4/
+  2021Q4 (post-split codes present, pre-split codes absent) bulk files:
   the pre-2007 combined items (RCON1415 construction balance; RCON1480
   nonfarm-nonresidential balance; RCON2759/2769/3492 and RCON3502/3503/
   3504 past-due/nonaccrual; RIAD3582/3583 and RIAD3590/3591 charge-off/
-  recovery) are simply ABSENT as columns from the real 2021Q4 bulk
-  extract, despite MDRM listing several of them as still "active" through
-  12/31/9999 -- MDRM's activity flag does not mean a column is actually
-  populated in the distributed bulk data. The replacements, confirmed
-  present in that same file: balance splits into owner-occupied/other
-  (RCONF160/RCONF161 for nonfarm-nonresidential) or 1-4-family/other
-  (RCONF158/RCONF159 for construction); past-due and nonaccrual split the
-  same way (RCONF172-177 for construction, RCONF178-183 for nonfarm-
-  nonresidential). Charge-offs/recoveries, however, have NO real
-  replacement at this granularity: the real bulk file's RI-B schedule
-  breaks out multifamily charge-offs (RIAD3588/3589) but not construction
-  or nonfarm-nonresidential specifically -- the nearest related item
-  (RIAD5409/5410) is a memo of CRE/construction-*purpose* charge-offs
-  carved out of the C&I lines, not a breakout of RC-C's real-estate-
-  secured loan categories, and does not match this project's taxonomy.
-  Both categories' 2007Q1-onward code sets therefore leave
-  chargeoff_items/recovery_items empty rather than pointing at codes that
-  don't actually appear in the data -- a real, confirmed reporting gap,
-  not an oversight. The pre-2007 code sets' charge-off/recovery items are
-  not independently verified against an actual pre-2007 bulk file (only
-  their MDRM-documented validity range) since the bulk-download client
-  hasn't been run that far back yet.
-- Consumer loans: automobile loans were not broken out as their own
-  Call Report line until 2011Q1 (RCONK137 balance; RCONK213/K214/K215
-  past-due/nonaccrual; RIADK129/K133 charge-off/recovery -- all verified,
-  all starting 2011Q1 on FFIEC 031/041, 2017Q1 on FFIEC 051). Before that,
-  auto loans were bundled into a single "loans to individuals" total
-  (RIAD4639, still active but a coarser aggregate than this project's
-  category taxonomy needs) with no verified per-category breakout in the
-  MDRM dictionary -- LoanCategory.AUTO is therefore only populated from
-  2011Q1 onward; there is no confirmed pre-2011 balance/charge-off/
-  recovery mapping for it, which the panel builder must treat as a real
-  missing-data period, not silently backfill.
-  The "other consumer" balance is NOT the old RCON2011 ("OTHER LOANS")
-  item this project originally (incorrectly) used -- RCON2011 is Schedule
-  RC-C Part I item 9's non-consumer "other loans" catch-all, a different
-  line entirely. The charge-off/recovery pairing (RIADK205/K206, "CHARGE-
-  OFFS/RECOVERIES ALL OTHER (INCLUDES SINGLE PAYMENT, INSTALLMENT, ALL
-  STUDENT LOANS, AND REVOLVING CREDIT PLANS OTHER THAN CREDIT CARDS)")
-  covers TWO separate RC-C Part I balance lines -- "other revolving credit
-  plans" (RCONB539) and "other consumer loans" (RCONK207) -- so
-  OTHER_CONSUMER's balance sums both; using RCONK207 alone would
-  understate the NCO-rate denominator relative to what the charge-off
-  item actually covers.
+  recovery) are absent from bulk data from 2007Q1 onward despite MDRM
+  listing several of them as still "active" through 12/31/9999. The
+  replacements, confirmed present in 2008Q4/2021Q4/2026Q2: balance splits
+  into owner-occupied/other (RCONF160/RCONF161 for nonfarm-nonresidential)
+  or 1-4-family/other (RCONF158/RCONF159 for construction); past-due and
+  nonaccrual split the same way (RCONF172-177 for construction, RCONF178-
+  183 for nonfarm-nonresidential); charge-offs/recoveries ALSO split the
+  same way and are confirmed present (RCONF158/F159's charge-off/recovery
+  counterparts RIADC891-894 for construction, RIADC895-898 for
+  nonfarm-nonresidential) -- an earlier version of this module wrongly
+  concluded no charge-off/recovery breakout existed at this granularity;
+  it does, just under a different (C8xx) item-code range than the
+  balance/past-due F-series.
+- Automobile loans were not broken out as their own Call Report line
+  until 2011Q1 (RCONK137 balance; RCONK213/K214/K215 past-due/nonaccrual;
+  RIADK129/K133 charge-off/recovery -- confirmed present in 2021Q4/2026Q2
+  bulk data). Before that, auto loans were bundled with "other consumer"
+  loans into a single combined line (see next point) -- LoanCategory.AUTO
+  is therefore only populated from 2011Q1 onward.
+- "Other consumer" (RC-C Part I, loans to individuals excluding credit
+  cards and secured real estate): before 2011Q1, auto + other-than-credit-
+  card consumer loans were ONE combined item, RCON2011 ("OTHER LOANS").
+  MDRM's Description field (not just its Item Name, which is misleadingly
+  generic) confirms this explicitly: "Includes all other loans to
+  individuals for household, family, and other personal expenditures...
+  1) purchases of private passenger automobiles... 3) educational
+  expenses, including student loans..." and its own COMPARABILITY note
+  states "RCON2011 derived beginning 3/31/2011. SUM(RCONK137, RCONK207)"
+  -- i.e. FFIEC's own dictionary defines RCON2011, from 2011Q1 onward, AS
+  the sum of auto (K137) + other-consumer (K207). An earlier version of
+  this module wrongly read RCON2011's generic Item Name ("OTHER LOANS")
+  as Schedule RC-C's unrelated non-consumer catch-all and left it out
+  entirely -- that was a real error, corrected here. Because RCON2011
+  spans BOTH auto and "other consumer" (RCONB539 other-revolving-credit +
+  RCONK207 single-payment/installment/student), it is kept as a THIRD,
+  DERIVED category (AUTO_AND_OTHER_CONSUMER_COMBINED) rather than folded
+  into either LoanCategory.AUTO or LoanCategory.OTHER_CONSUMER -- both of
+  those stay 2011Q1-onward only and continue to represent their own
+  narrower slice. AUTO_AND_OTHER_CONSUMER_COMBINED runs continuously from
+  2001Q1 (confirmed present in 2006Q4/2008Q4 real data: RCON2011 balance,
+  RCONB578/B579/B580 past-due/nonaccrual, RIADB516/B517 charge-off/
+  recovery) through the 2011Q1 switch (to RCONK137+RCONK207 balance,
+  RCONK213+RCONK216 / RCONK214+RCONK217 / RCONK215+RCONK218 past-due/
+  nonaccrual, RIADK129+RIADK205 / RIADK133+RIADK206 charge-off/recovery,
+  per RCON2011's own MDRM COMPARABILITY note: "derived beginning 3/31/2011:
+  SUM(RCONK137, RCONK207)") to today -- built specifically so a 2008-2010
+  backtest has ONE continuous consumer series to work with. It OVERLAPS
+  with (but is NOT identical to) AUTO + OTHER_CONSUMER from 2011Q1 onward:
+  it is exactly AUTO's balance + RCONK207 (i.e. OTHER_CONSUMER's balance
+  MINUS RCONB539, "other revolving credit plans"), because RCON2011's
+  official derivation formula excludes RCONB539 entirely -- RCONB539 has
+  been its own standalone RC-C line since 2001Q1 and was never part of
+  "OTHER LOANS." Never sum this category alongside AUTO and/or
+  OTHER_CONSUMER when totaling "all loan categories"; use it on its own
+  for a continuous consumer series, or use AUTO/OTHER_CONSUMER separately
+  for 2011Q1-onward granularity (which additionally captures RCONB539).
+  OTHER_CONSUMER's own balance is RCONB539 (other revolving credit plans)
+  + RCONK207 (other consumer loans) from 2011Q1 -- matching the exact
+  scope of its RIADK205/K206 charge-off/recovery pairing -- and now also
+  has past-due/nonaccrual (RCONK216/K217/K218, confirmed present in
+  2021Q4/2026Q2 data), filling a gap an earlier version of this module
+  left empty because the search that produced it didn't find these codes.
+  Those past-due/nonaccrual codes cover only RCONK207's portion, though --
+  MDRM has no dedicated RC-N past-due/nonaccrual item for RCONB539 at all
+  (confirmed) -- so OTHER_CONSUMER's past-due/nonaccrual figures are
+  partial relative to its own balance denominator; see its code set's note.
 
 RCON-prefixed items are domestic-office-only figures, the right scope for
 this panel (RCFD "consolidated" figures also include foreign offices).
@@ -99,6 +125,10 @@ class LoanCategory(StrEnum):
     CREDIT_CARD = "credit_card"
     AUTO = "auto"
     OTHER_CONSUMER = "other_consumer"
+    # Derived, overlapping series -- see module docstring. Not part of the
+    # 8-category balance-sheet taxonomy; exists only for pre-2011Q1
+    # backtest continuity. Never sum alongside AUTO/OTHER_CONSUMER.
+    AUTO_AND_OTHER_CONSUMER_COMBINED = "auto_and_other_consumer_combined"
 
 
 @dataclass(frozen=True)
@@ -148,6 +178,7 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
             chargeoff_items=("RIAD4638",),
             recovery_items=("RIAD4608",),
             rcfd_items=("RCFD1766",),
+            note="Verified present in real 2006Q4/2008Q4/2021Q4 bulk data.",
         ),
     ),
     LoanCategory.CRE_CONSTRUCTION: (
@@ -160,10 +191,8 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
             nonaccrual_items=("RCON3492",),
             chargeoff_items=("RIAD3582",),
             recovery_items=("RIAD3583",),
-            confidence="needs_confirmation",
-            note="Not independently verified against a real pre-2007 bulk file "
-            "(only against MDRM's documented validity range) -- see the module "
-            "docstring's construction/nonfarm-nonresidential note.",
+            note="Verified present in real 2006Q4 bulk data (every item in this "
+            "code set).",
         ),
         MdrmCodeSet(
             valid_from="2007Q1",
@@ -172,14 +201,15 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
             past_due_30_89_items=("RCONF172", "RCONF173"),
             past_due_90_items=("RCONF174", "RCONF175"),
             nonaccrual_items=("RCONF176", "RCONF177"),
-            note="Verified against a real downloaded 2021Q4 bulk file: RCON1415 "
-            "(combined) and RIAD3582/3583 (charge-off/recovery) are absent from the "
-            "actual data from this point on, despite MDRM listing them as "
-            "'active' -- replaced for balance/past-due/nonaccrual by the 1-4-family "
-            "(RCONF158/F172/F174/F176) / other (RCONF159/F173/F175/F177) split. No "
-            "charge-off/recovery replacement at this granularity exists in the real "
-            "data -- see the module docstring; chargeoff_items/recovery_items are "
-            "deliberately left empty rather than pointed at absent columns.",
+            chargeoff_items=("RIADC891", "RIADC893"),
+            recovery_items=("RIADC892", "RIADC894"),
+            note="Verified present in real 2008Q4/2021Q4 bulk data (every item in "
+            "this code set, including the charge-off/recovery split RIADC891-894, "
+            "found in Schedule RIBI). RCON1415/RIAD3582/RIAD3583 (pre-2007 combined "
+            "items) are confirmed ABSENT from bulk data from this point on despite "
+            "MDRM listing them 'active' -- replaced by the 1-4-family "
+            "(RCONF158/F172/F174/F176/RIADC891/C892) / other "
+            "(RCONF159/F173/F175/F177/RIADC893/C894) split.",
         ),
     ),
     LoanCategory.CRE_MULTIFAMILY: (
@@ -193,6 +223,7 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
             chargeoff_items=("RIAD3588",),
             recovery_items=("RIAD3589",),
             rcfd_items=("RCFD1460",),
+            note="Verified present in real 2006Q4/2008Q4/2021Q4 bulk data.",
         ),
     ),
     LoanCategory.CRE_NONFARM_NONRESIDENTIAL: (
@@ -205,10 +236,8 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
             nonaccrual_items=("RCON3504",),
             chargeoff_items=("RIAD3590",),
             recovery_items=("RIAD3591",),
-            confidence="needs_confirmation",
-            note="Not independently verified against a real pre-2007 bulk file "
-            "(only against MDRM's documented validity range) -- see the module "
-            "docstring's construction/nonfarm-nonresidential note.",
+            note="Verified present in real 2006Q4 bulk data (every item in this "
+            "code set).",
         ),
         MdrmCodeSet(
             valid_from="2007Q1",
@@ -217,15 +246,15 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
             past_due_30_89_items=("RCONF178", "RCONF179"),
             past_due_90_items=("RCONF180", "RCONF181"),
             nonaccrual_items=("RCONF182", "RCONF183"),
-            note="Verified against a real downloaded 2021Q4 bulk file: RCON1480 "
-            "(combined balance), RCON3502/3503/3504 (combined past-due/nonaccrual) "
-            "and RIAD3590/3591 (charge-off/recovery) are all absent from the actual "
-            "data from this point on, despite MDRM listing them as 'active' -- "
-            "replaced for balance/past-due/nonaccrual by the owner-occupied "
-            "(RCONF160/F178/F180/F182) / other (RCONF161/F179/F181/F183) split. No "
-            "charge-off/recovery replacement at this granularity exists in the real "
-            "data -- see the module docstring; chargeoff_items/recovery_items are "
-            "deliberately left empty rather than pointed at absent columns.",
+            chargeoff_items=("RIADC895", "RIADC897"),
+            recovery_items=("RIADC896", "RIADC898"),
+            note="Verified present in real 2008Q4/2021Q4 bulk data (every item in "
+            "this code set, including the charge-off/recovery split RIADC895-898, "
+            "found in Schedule RIBI). RCON1480/RCON3502-3504/RIAD3590/RIAD3591 "
+            "(pre-2007 combined items) are confirmed ABSENT from bulk data from "
+            "this point on despite MDRM listing them 'active' -- replaced by the "
+            "owner-occupied (RCONF160/F178/F180/F182/RIADC895/C896) / other "
+            "(RCONF161/F179/F181/F183/RIADC897/C898) split.",
         ),
     ),
     LoanCategory.RESIDENTIAL_MORTGAGE: (
@@ -239,9 +268,11 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
             chargeoff_items=("RIADC234", "RIADC235"),
             recovery_items=("RIADC217", "RIADC218"),
             rcfd_items=("RCFD5367", "RCFD5368"),
-            note="Nonaccrual codes (RCONC229 first lien, RCONC230 junior lien) "
-            "confirmed active since 2002Q1 -- balance/past-due/charge-off/recovery "
-            "codes predate that (1991Q1); nonaccrual for 1991Q1-2001Q4 is not "
+            note="Verified present in real 2006Q4/2008Q4/2021Q4 bulk data (every "
+            "item in this code set, including nonaccrual). Nonaccrual codes "
+            "(RCONC229 first lien, RCONC230 junior lien) are MDRM-documented active "
+            "since 2002Q1 only -- balance/past-due/charge-off/recovery codes "
+            "predate that (1991Q1); nonaccrual for 1991Q1-2001Q4 is not "
             "independently verified and should be treated as unavailable rather "
             "than backfilled.",
         ),
@@ -257,11 +288,11 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
             chargeoff_items=("RIAD5411",),
             recovery_items=("RIAD5412",),
             rcfd_items=("RCFD1797",),
-            confidence="needs_confirmation",
-            note="RCON5398/5399/5400's assignment to 30-89/90+/nonaccrual is inferred "
-            "from sequential numbering matching every other category's pattern (the "
-            "MDRM item names were truncated mid-word in the search) -- confirm "
-            "before a real fetch.",
+            note="RCON5398/5399/5400's assignment to 30-89/90+/nonaccrual confirmed "
+            "via their full (untruncated) MDRM item names ('...PAST DUE 30 THROUGH "
+            "89 DAYS AND STILL ACCRUING' / '...PAST DUE 90 DAYS OR MORE...' / "
+            "'...NONACCRUAL' respectively) and verified present in real 2006Q4/"
+            "2008Q4/2021Q4 bulk data.",
         ),
     ),
     LoanCategory.CREDIT_CARD: (
@@ -275,6 +306,7 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
             chargeoff_items=("RIADB514",),
             recovery_items=("RIADB515",),
             rcfd_items=("RCFDB538",),
+            note="Verified present in real 2006Q4/2008Q4/2021Q4 bulk data.",
         ),
     ),
     LoanCategory.AUTO: (
@@ -288,11 +320,11 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
             chargeoff_items=("RIADK129",),
             recovery_items=("RIADK133",),
             rcfd_items=("RCFDK137",),
-            note="Automobile loans were not a separate Call Report line before "
-            "2011Q1 (bundled into the pre-2011 consumer-loan totals with no "
-            "verified per-category breakout) -- there is deliberately no code set "
-            "covering quarters before 2011Q1; those bank-quarters are real missing "
-            "data for this category, not an oversight.",
+            note="Verified present in real 2021Q4/2026Q2 bulk data. Automobile "
+            "loans were not a separate Call Report line before 2011Q1 (bundled "
+            "into RCON2011 -- see LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED for "
+            "a continuous pre/post-2011 series) -- there is deliberately no code "
+            "set here covering quarters before 2011Q1.",
         ),
     ),
     LoanCategory.OTHER_CONSUMER: (
@@ -300,20 +332,68 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
             valid_from="2011Q1",
             valid_to=None,
             balance_items=("RCONB539", "RCONK207"),
+            past_due_30_89_items=("RCONK216",),
+            past_due_90_items=("RCONK217",),
+            nonaccrual_items=("RCONK218",),
             chargeoff_items=("RIADK205",),
             recovery_items=("RIADK206",),
-            note="Balance = RCONB539 (other revolving credit plans) + RCONK207 "
-            "(other consumer loans, i.e. single payment/installment/student loans) "
-            "-- this matches the exact scope described by the RIADK205/K206 "
-            "charge-off/recovery item names ('...REVOLVING CREDIT PLANS OTHER THAN "
-            "CREDIT CARDS'); RCONK207 alone would understate the NCO-rate "
-            "denominator. No RC-N past-due/nonaccrual breakout at this granularity "
-            "was found in the MDRM dictionary (only loan-modification memo items, "
-            "which are not the same thing) -- left empty rather than guessed. "
-            "Before 2011Q1, auto loans were bundled into this same combined "
-            "consumer bucket with no verified breakout -- see LoanCategory.AUTO's "
-            "note; there is no code set here for pre-2011Q1 either, for the same "
-            "reason.",
+            note="Verified present in real 2021Q4/2026Q2 bulk data (every item in "
+            "this code set, including the RCONK216/K217/K218 past-due/nonaccrual "
+            "codes an earlier version of this module failed to find). Balance = "
+            "RCONB539 (other revolving credit plans) + RCONK207 (other consumer "
+            "loans, i.e. single payment/installment/student loans) -- matches the "
+            "exact scope described by the RIADK205/K206 charge-off/recovery item "
+            "names ('...REVOLVING CREDIT PLANS OTHER THAN CREDIT CARDS'); RCONK207 "
+            "alone would understate the NCO-rate denominator. CAVEAT: "
+            "past_due_30_89/90/nonaccrual (RCONK216/K217/K218) cover ONLY RCONK207's "
+            "portion -- MDRM has no dedicated RC-N past-due/nonaccrual item for "
+            "RCONB539 (confirmed: no such item exists), so the past-due/nonaccrual "
+            "figures here are partial relative to the balance denominator, not a "
+            "like-for-like NPL ratio numerator. Before 2011Q1, auto + other consumer "
+            "were one combined line (RCON2011, which itself excludes RCONB539 -- "
+            "see LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED's note) -- there is "
+            "deliberately no code set here covering quarters before 2011Q1.",
+        ),
+    ),
+    LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED: (
+        MdrmCodeSet(
+            valid_from="2001Q1",
+            valid_to="2010Q4",
+            balance_items=("RCON2011",),
+            past_due_30_89_items=("RCONB578",),
+            past_due_90_items=("RCONB579",),
+            nonaccrual_items=("RCONB580",),
+            chargeoff_items=("RIADB516",),
+            recovery_items=("RIADB517",),
+            note="Verified present in real 2006Q4/2008Q4 bulk data (every item in "
+            "this code set). RCON2011's own MDRM Description confirms it covers "
+            "'all other loans to individuals for household, family, and other "
+            "personal expenditures' including automobiles and student loans -- an "
+            "earlier version of this module misread its generic Item Name ('OTHER "
+            "LOANS') as an unrelated non-consumer catch-all; that was a real error.",
+        ),
+        MdrmCodeSet(
+            valid_from="2011Q1",
+            valid_to=None,
+            balance_items=("RCONK137", "RCONK207"),
+            past_due_30_89_items=("RCONK213", "RCONK216"),
+            past_due_90_items=("RCONK214", "RCONK217"),
+            nonaccrual_items=("RCONK215", "RCONK218"),
+            chargeoff_items=("RIADK129", "RIADK205"),
+            recovery_items=("RIADK133", "RIADK206"),
+            note="Balance = RCONK137 + RCONK207 exactly, per MDRM's own "
+            "COMPARABILITY note for RCON2011: 'derived beginning 3/31/2011: "
+            "SUM(RCONK137, RCONK207)' -- confirming this is the true continuation "
+            "of the pre-2011 combined series, not a coincidental reconstruction. "
+            "NOTE this does NOT equal LoanCategory.AUTO + LoanCategory.OTHER_CONSUMER "
+            "summed: OTHER_CONSUMER's own balance also includes RCONB539 (other "
+            "revolving credit plans, needed there to match its RIADK205/K206 "
+            "charge-off scope), which RCON2011's official derivation formula "
+            "excludes. This code set's past-due/nonaccrual (K213+K216/K214+K217/"
+            "K215+K218) and charge-off/recovery (K129+K205/K133+K206) mirror that "
+            "same K137+K207-only scope, consistent with the balance. Overlaps (but "
+            "is not identical to) AUTO + OTHER_CONSUMER from this quarter onward -- "
+            "see module docstring.",
         ),
     ),
 }
@@ -322,6 +402,7 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
 # both item codes were carried through the 2020 CECL transition unchanged for
 # adopting institutions (methodology shifts from incurred-loss ALLL to
 # current-expected-credit-loss ACL under the same code); see panel.py's
-# CECL-transition handling, not a code-mapping issue.
+# CECL-transition handling, not a code-mapping issue. Both verified present in
+# real 2006Q4/2008Q4/2021Q4 bulk data.
 TOTAL_ALLOWANCE_ITEM = "RCON3123"
 PROVISION_EXPENSE_ITEM = "RIAD4230"

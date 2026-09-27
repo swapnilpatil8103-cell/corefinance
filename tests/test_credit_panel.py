@@ -7,7 +7,7 @@ import pytest
 
 from corefin.checks.framework import check_close_to_zero
 from corefin.credit import panel
-from corefin.credit.schema import CATEGORY_MDRM_CODES, LoanCategory
+from corefin.credit.schema import CATEGORY_MDRM_CODES, LoanCategory, MdrmCodeSet
 
 
 def _quarters(labels: list[str]) -> pd.Series:
@@ -81,16 +81,26 @@ def test_category_mapping_sums_multi_item_categories_within_tolerance():
     assert mapped["balance"].iloc[0] == pytest.approx(expected_total, rel=1e-9)
 
 
-def test_category_mapping_missing_component_is_nan_not_zero():
-    (code_set,) = CATEGORY_MDRM_CODES[LoanCategory.OTHER_CONSUMER]
-    item_frame = pd.DataFrame({col: [500.0] for col in code_set.balance_items})
-    for col in (*code_set.chargeoff_items, *code_set.recovery_items):
-        item_frame[col] = 1.0
+def test_category_mapping_missing_component_is_nan_not_zero(monkeypatch):
+    # A synthetic category whose code set deliberately has no past-due/
+    # nonaccrual items -- this must produce NaN columns, not zeros.
+    synthetic_category = LoanCategory.CI
+    synthetic_code_set = MdrmCodeSet(
+        valid_from="2015Q1",
+        valid_to=None,
+        balance_items=("RCONSYN1",),
+        chargeoff_items=("RIADSYN1",),
+        recovery_items=("RIADSYN2",),
+    )
+    monkeypatch.setitem(CATEGORY_MDRM_CODES, synthetic_category, (synthetic_code_set,))
+
+    item_frame = pd.DataFrame({"RCONSYN1": [500.0], "RIADSYN1": [1.0], "RIADSYN2": [1.0]})
     quarters = _quarters(["2015Q1"])
-    mapped = panel.apply_category_mapping(item_frame, LoanCategory.OTHER_CONSUMER, quarters)
-    # other_consumer has no past-due/nonaccrual item codes in schema.py -- must be NaN
+    mapped = panel.apply_category_mapping(item_frame, synthetic_category, quarters)
     assert mapped["past_due_30_89"].isna().all()
+    assert mapped["past_due_90"].isna().all()
     assert mapped["nonaccrual"].isna().all()
+    assert mapped["balance"].iloc[0] == pytest.approx(500.0)
 
 
 def test_category_mapping_raises_on_missing_required_column():
@@ -136,6 +146,10 @@ def test_category_mapping_picks_the_right_code_set_on_each_side_of_a_switch_date
             "RCONF181": [np.nan, 0.0],
             "RCONF182": [np.nan, 0.0],
             "RCONF183": [np.nan, 0.0],
+            "RIADC895": [np.nan, 0.0],
+            "RIADC896": [np.nan, 0.0],
+            "RIADC897": [np.nan, 0.0],
+            "RIADC898": [np.nan, 0.0],
         }
     )
     quarters = _quarters(["2006Q4", "2007Q1"])
@@ -165,6 +179,10 @@ def test_aggregate_balance_is_continuous_across_a_synthetic_code_switch():
             "RCONF181": [np.nan, np.nan, 0.0, 0.0],
             "RCONF182": [np.nan, np.nan, 0.0, 0.0],
             "RCONF183": [np.nan, np.nan, 0.0, 0.0],
+            "RIADC895": [np.nan, np.nan, 0.0, 0.0],
+            "RIADC896": [np.nan, np.nan, 0.0, 0.0],
+            "RIADC897": [np.nan, np.nan, 0.0, 0.0],
+            "RIADC898": [np.nan, np.nan, 0.0, 0.0],
         }
     )
     quarters = _quarters(["2006Q4", "2006Q4", "2007Q1", "2007Q1"])
@@ -232,6 +250,85 @@ def test_allowance_rollforward_residual_is_zero_for_a_consistent_synthetic_serie
         "allowance_rollforward", residual.to_numpy().reshape(1, -1), tolerance=1e-9
     )
     assert result.passed
+
+
+# ------------------------------------------------------ build_panel -------
+
+
+def _ci_item_frame() -> pd.DataFrame:
+    quarters = _quarters(["2019Q1", "2019Q2", "2019Q3"] * 2)
+    return pd.DataFrame(
+        {
+            "bank_id": ["A", "A", "A", "B", "B", "B"],
+            "quarter": quarters,
+            "RCON1766": [1000.0, 1100.0, 1200.0, 2000.0, 2100.0, 2200.0],
+            "RCON1606": [0.0] * 6,
+            "RCON1607": [0.0] * 6,
+            "RCON1608": [0.0] * 6,
+            "RIAD4638": [10.0, 25.0, 40.0, 20.0, 50.0, 80.0],  # YTD
+            "RIAD4608": [2.0, 5.0, 8.0, 4.0, 10.0, 16.0],  # YTD
+        }
+    )
+
+
+def test_build_panel_computes_per_bank_quarterly_flows_and_nco_rate():
+    result = panel.build_panel(_ci_item_frame(), categories=[LoanCategory.CI], min_balance=500.0)
+    assert len(result) == 6
+
+    bank_a = result[result["bank_id"] == "A"].sort_values("quarter").reset_index(drop=True)
+    assert bank_a["chargeoff_quarterly"].tolist() == pytest.approx([10.0, 15.0, 15.0])
+    assert bank_a["recovery_quarterly"].tolist() == pytest.approx([2.0, 3.0, 3.0])
+    assert bank_a["average_balance"].iloc[0] != bank_a["average_balance"].iloc[0]  # NaN
+    assert bank_a["average_balance"].iloc[1] == pytest.approx(1050.0)
+    expected_nco_q2 = (15.0 - 3.0) / 1050.0 * 4.0
+    assert bank_a["annualized_nco_rate"].iloc[1] == pytest.approx(expected_nco_q2)
+    assert bank_a["cecl_regime"].tolist() == [0, 0, 0]
+    assert bank_a["keep"].tolist() == [True, True, True]
+    assert not bank_a["merger_flag"].any()
+
+
+def test_build_panel_excludes_categories_with_no_covering_code_set():
+    # AUTO has no code set before 2011Q1 -- pre-2011 rows must simply be
+    # absent for that category, not raise or zero-fill (unlike passing a
+    # quarter AUTO DOES cover but omitting its required columns, which is
+    # a real caller error and still raises -- see
+    # test_category_mapping_raises_on_missing_required_column).
+    pre_2011_frame = pd.DataFrame(
+        {
+            "bank_id": ["A", "A"],
+            "quarter": _quarters(["2005Q1", "2005Q2"]),
+            "RCON1766": [1000.0, 1100.0],
+        }
+    )
+    result = panel.build_panel(pre_2011_frame, categories=[LoanCategory.AUTO])
+    assert result.empty
+
+
+# ------------------------------------------------- industry NCO rate ------
+
+
+def test_build_industry_nco_rate_report_aggregates_across_banks():
+    panel_frame = panel.build_panel(_ci_item_frame(), categories=[LoanCategory.CI])
+    report = panel.build_industry_nco_rate_report(panel_frame)
+    q2 = report[report["quarter"] == pd.Period("2019Q2", freq="Q")].iloc[0]
+    # aggregate chargeoff = 15+30=45, recovery=3+6=9
+    # avg balance: bank A (1000+1100)/2=1050, bank B (2000+2100)/2=2050 -> 3100
+    expected_rate = (45.0 - 9.0) / 3100.0 * 4.0
+    assert q2["industry_nco_rate"] == pytest.approx(expected_rate)
+    assert bool(q2["has_chargeoff_data"])
+
+
+def test_flag_chargeoff_gaps_detects_a_missing_quarter_in_the_window():
+    industry_report = pd.DataFrame(
+        {
+            "category": [LoanCategory.CRE_CONSTRUCTION] * 3 + [LoanCategory.CI] * 3,
+            "quarter": [pd.Period(q, freq="Q") for q in ["2008Q1", "2008Q2", "2008Q3"]] * 2,
+            "has_chargeoff_data": [True, False, True, True, True, True],
+        }
+    )
+    gaps = panel.flag_chargeoff_gaps(industry_report, start="2008Q1", end="2008Q3")
+    assert gaps[LoanCategory.CRE_CONSTRUCTION]
+    assert not gaps[LoanCategory.CI]
 
 
 def test_allowance_rollforward_residual_detects_a_broken_identity():

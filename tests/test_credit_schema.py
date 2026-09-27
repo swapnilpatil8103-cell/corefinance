@@ -75,3 +75,41 @@ def test_auto_category_has_no_code_set_before_2011():
     auto_code_sets = CATEGORY_MDRM_CODES[LoanCategory.AUTO]
     assert all(cs.valid_from == "2011Q1" for cs in auto_code_sets)
     assert not any(cs.covers(pd.Period("2010Q4", freq="Q")) for cs in auto_code_sets)
+
+
+def test_other_consumer_category_has_no_code_set_before_2011():
+    other_consumer_code_sets = CATEGORY_MDRM_CODES[LoanCategory.OTHER_CONSUMER]
+    assert all(cs.valid_from == "2011Q1" for cs in other_consumer_code_sets)
+    assert not any(cs.covers(pd.Period("2010Q4", freq="Q")) for cs in other_consumer_code_sets)
+
+
+def test_combined_consumer_series_covers_2001_through_present_continuously():
+    combined = LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED
+    code_sets = CATEGORY_MDRM_CODES[combined]
+    assert code_sets[0].valid_from == "2001Q1"
+    assert code_sets[-1].valid_to is None
+    # every quarter from 2001Q1 through a recent quarter must be covered by
+    # exactly one code set (no gap for this category, unlike AUTO/OTHER_CONSUMER)
+    quarters = pd.period_range("2001Q1", "2026Q2", freq="Q")
+    for quarter in quarters:
+        matches = [cs for cs in code_sets if cs.covers(quarter)]
+        assert len(matches) == 1, f"{combined} at {quarter}: {len(matches)} code sets match"
+
+
+def test_combined_consumer_series_post_2011_excludes_other_revolving_credit():
+    # RCON2011's own MDRM COMPARABILITY note defines it as
+    # SUM(RCONK137, RCONK207) exactly -- it does NOT include RCONB539
+    # ("other revolving credit plans"), even though OTHER_CONSUMER's own
+    # balance does (to match its RIADK205/K206 charge-off scope). The
+    # combined series must match RCON2011's real definition, not a naive
+    # "AUTO + OTHER_CONSUMER" union.
+    (auto_code_set,) = CATEGORY_MDRM_CODES[LoanCategory.AUTO]
+    (other_consumer_code_set,) = CATEGORY_MDRM_CODES[LoanCategory.OTHER_CONSUMER]
+    combined_code_sets = CATEGORY_MDRM_CODES[LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED]
+    post_2011 = next(cs for cs in combined_code_sets if cs.valid_from == "2011Q1")
+
+    assert set(post_2011.balance_items) == {"RCONK137", "RCONK207"}
+    assert "RCONB539" not in post_2011.balance_items
+    assert set(post_2011.balance_items) == set(auto_code_set.balance_items) | (
+        set(other_consumer_code_set.balance_items) - {"RCONB539"}
+    )

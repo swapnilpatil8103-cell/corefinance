@@ -225,6 +225,143 @@ def apply_min_balance_filter(balance: pd.Series, minimum: float) -> pd.Series:
     return balance.notna() & (balance >= minimum)
 
 
+def build_panel(
+    item_frame: pd.DataFrame,
+    categories: list[LoanCategory] | None = None,
+    min_balance: float = 1_000.0,
+    cecl_adoption_quarter: pd.Period = DEFAULT_CECL_TRANSITION_QUARTER,
+    merger_jump_threshold: float = 0.5,
+) -> pd.DataFrame:
+    """Orchestrates the whole per-category panel build. `item_frame` needs
+    "bank_id" and "quarter" (pandas Period, freq="Q") columns plus every
+    raw MDRM item column any of `categories`' code sets reference across
+    the quarters present (one row per bank-quarter). `categories` defaults
+    to every LoanCategory (including AUTO_AND_OTHER_CONSUMER_COMBINED --
+    pass an explicit list to exclude it, e.g. when totaling "all loan
+    categories" and its intentional overlap with AUTO/OTHER_CONSUMER would
+    double-count).
+
+    A category/quarter with no covering MdrmCodeSet (e.g. AUTO before
+    2011Q1) is simply excluded from that category's rows, not zero-filled.
+
+    Returns one row per (bank_id, category, quarter) with balance,
+    past_due_30_89, past_due_90, nonaccrual, chargeoff_ytd, recovery_ytd
+    (straight from `apply_category_mapping`), plus chargeoff_quarterly/
+    recovery_quarterly (`ytd_to_quarterly`, per bank), average_balance
+    (`average_balance`, per bank), annualized_nco_rate
+    (`annualized_nco_rate`), merger_flag (`flag_merger_discontinuities`,
+    per bank), cecl_regime (`apply_cecl_regime_dummy`) and keep (the
+    min-balance mask from `apply_min_balance_filter` -- filtering on it is
+    the caller's choice, not applied here)."""
+    categories = categories if categories is not None else list(LoanCategory)
+    category_frames = []
+
+    for category in categories:
+        quarter_frames = []
+        for quarter, group in item_frame.groupby("quarter", sort=True):
+            try:
+                code_set_for_quarter(category, quarter)
+            except ValueError:
+                continue
+            mapped = apply_category_mapping(group, category, group["quarter"])
+            mapped["bank_id"] = group["bank_id"].to_numpy()
+            mapped["quarter"] = quarter
+            quarter_frames.append(mapped)
+        if not quarter_frames:
+            continue
+
+        cat_panel = pd.concat(quarter_frames, ignore_index=True)
+        cat_panel = cat_panel.sort_values(["bank_id", "quarter"]).reset_index(drop=True)
+
+        grouped = cat_panel.groupby("bank_id", group_keys=False, sort=False)
+        cat_panel["chargeoff_quarterly"] = grouped.apply(
+            lambda g: ytd_to_quarterly(g["chargeoff_ytd"], g["quarter"])
+        )
+        cat_panel["recovery_quarterly"] = grouped.apply(
+            lambda g: ytd_to_quarterly(g["recovery_ytd"], g["quarter"])
+        )
+        cat_panel["average_balance"] = grouped["balance"].apply(average_balance)
+        cat_panel["annualized_nco_rate"] = annualized_nco_rate(
+            cat_panel["chargeoff_quarterly"],
+            cat_panel["recovery_quarterly"],
+            cat_panel["average_balance"],
+        )
+        cat_panel["merger_flag"] = grouped["balance"].apply(
+            lambda s: flag_merger_discontinuities(s, jump_threshold=merger_jump_threshold)
+        )
+        cat_panel["cecl_regime"] = apply_cecl_regime_dummy(
+            cat_panel["quarter"], cecl_adoption_quarter
+        )
+        cat_panel["keep"] = apply_min_balance_filter(cat_panel["balance"], min_balance)
+        cat_panel["category"] = category
+        category_frames.append(cat_panel)
+
+    if not category_frames:
+        return pd.DataFrame(
+            columns=[
+                "bank_id",
+                "category",
+                "quarter",
+                "balance",
+                "past_due_30_89",
+                "past_due_90",
+                "nonaccrual",
+                "chargeoff_ytd",
+                "recovery_ytd",
+                "chargeoff_quarterly",
+                "recovery_quarterly",
+                "average_balance",
+                "annualized_nco_rate",
+                "merger_flag",
+                "cecl_regime",
+                "keep",
+            ]
+        )
+    return pd.concat(category_frames, ignore_index=True)
+
+
+def build_industry_nco_rate_report(panel: pd.DataFrame) -> pd.DataFrame:
+    """panel: long-format frame (as produced by `build_panel`) with
+    columns "category", "quarter", "chargeoff_quarterly",
+    "recovery_quarterly", "average_balance". Returns one row per
+    (category, quarter) with the aggregate industry annualized NCO rate --
+    sum(chargeoff_quarterly) - sum(recovery_quarterly), divided by
+    sum(average_balance), annualized by x4 -- and `has_chargeoff_data`
+    (True if at least one bank has a non-missing chargeoff_quarterly that
+    quarter; see `flag_chargeoff_gaps`)."""
+    grouped = panel.groupby(["category", "quarter"], observed=True)
+    agg = grouped.agg(
+        aggregate_chargeoff=("chargeoff_quarterly", lambda s: s.sum(skipna=True)),
+        aggregate_recovery=("recovery_quarterly", lambda s: s.sum(skipna=True)),
+        aggregate_average_balance=("average_balance", lambda s: s.sum(skipna=True)),
+        has_chargeoff_data=("chargeoff_quarterly", lambda s: bool(s.notna().any())),
+    ).reset_index()
+
+    nco = agg["aggregate_chargeoff"] - agg["aggregate_recovery"]
+    avg = agg["aggregate_average_balance"].to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rate = np.where(avg > 0, (nco.to_numpy() / avg) * 4.0, np.nan)
+    agg["industry_nco_rate"] = rate
+    return agg.sort_values(["category", "quarter"]).reset_index(drop=True)
+
+
+def flag_chargeoff_gaps(
+    industry_nco_report: pd.DataFrame, start: str = "2008Q1", end: str = "2010Q4"
+) -> pd.Series:
+    """industry_nco_report: as produced by `build_industry_nco_rate_report`.
+    Returns a Series indexed by category: True if ANY quarter in
+    [start, end] (inclusive "YYYYQN" strings) has no charge-off data at
+    all for that category -- a gap in exactly the window a crisis-period
+    backtest needs is a hard blocker, not a cosmetic issue."""
+    start_q = pd.Period(start, freq="Q")
+    end_q = pd.Period(end, freq="Q")
+    window = industry_nco_report[
+        (industry_nco_report["quarter"] >= start_q) & (industry_nco_report["quarter"] <= end_q)
+    ]
+    by_category = window.groupby("category", observed=True)["has_chargeoff_data"]
+    return by_category.apply(lambda s: not s.all())
+
+
 def allowance_rollforward_residual(
     beginning_allowance: pd.Series,
     provision: pd.Series,
