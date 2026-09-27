@@ -33,10 +33,35 @@ from corefin.credit.schema import (
 TOTAL_ALLOWANCE_RCFD_FALLBACK_ITEM = "RCFD3123"
 
 # CECL is mandatory for large SEC filers starting 2020Q1, phased in for
-# smaller/non-SEC filers through 2023. This default is only a fallback for
-# quick synthetic-data smoke tests -- real panel-building must pass each
-# bank's own adoption quarter to `apply_cecl_regime_dummy`, not rely on it.
-DEFAULT_CECL_TRANSITION_QUARTER = pd.Period("2020Q1", freq="Q")
+# smaller/non-SEC filers through 2023Q1. This is the fallback used for
+# banks `derive_cecl_adoption_quarters` never detects a signal for --
+# real panel-building should always try that first (see `build_panel`),
+# using this default only for banks the signal doesn't cover.
+#
+# 2023Q1, not 2020Q1, on purpose: verified against real data (a full
+# 2001Q1-2026Q2 build), only 2,503 of the ~4,700-8,000 banks per quarter
+# ever show a detectable RIADJJ26/JJ28 signal at all, split into two
+# waves matching ASU 2016-13's known rollout (222 banks in 2020Q1, the
+# large-SEC-filer mandatory date; 1,981 in 2023Q1, the final mandatory
+# date for smaller/private companies -- see
+# `summarize_cecl_adoption_counts`). The large majority of ALL banks
+# (undetected ones included) are small/private institutions with no SEC
+# filing obligation, so 2023Q1 is the correct default for them -- their
+# adoption typically had little or no day-one allowance change to
+# register as a nonzero RIADJJ26/JJ28 value, which is presumably why they
+# go undetected in the first place, not because they adopted early.
+#
+# A total-assets-based rule to identify "large SEC filer -> use 2020Q1
+# instead" was tried and rejected: the 222 CONFIRMED 2020Q1 adopters span
+# total assets from $293 million to $93 billion (median ~$7.0 billion),
+# with no threshold that meaningfully separates them from the broader
+# population (42% of ALL banks in 2020Q1 already exceed the confirmed
+# adopters' minimum asset size). Call Report data has no direct SEC-filer
+# or public-company-status item at all (searched MDRM; none exists), and
+# asset size alone is evidently too weak a proxy for actual SEC-filer
+# status to justify a differentiated default -- so a single default
+# (2023Q1) is used uniformly for every undetected bank instead.
+DEFAULT_CECL_TRANSITION_QUARTER = pd.Period("2023Q1", freq="Q")
 
 
 def ytd_to_quarterly(ytd: pd.Series, quarter_period: pd.Series) -> pd.Series:
@@ -249,6 +274,48 @@ def summarize_cecl_adoption_counts(adoption_quarters: pd.Series) -> pd.Series:
     2020Q1 (large SEC filers' mandatory date) and a larger one around
     2023Q1 (the final mandatory date for smaller/private companies)."""
     return adoption_quarters.value_counts().sort_index()
+
+
+def resolve_cecl_adoption_quarters(
+    bank_ids: pd.Series,
+    detected_adoption_quarters: pd.Series,
+    default_adoption_quarter: pd.Period = DEFAULT_CECL_TRANSITION_QUARTER,
+) -> pd.DataFrame:
+    """bank_ids: every bank_id `apply_cecl_regime_dummy` will be asked
+    about (e.g. item_frame["bank_id"] or category_panel["bank_id"]).
+    detected_adoption_quarters: from `derive_cecl_adoption_quarters`.
+    Returns one row per unique bank_id in `bank_ids`, with columns
+    "adoption_quarter" (the detected quarter, or `default_adoption_quarter`
+    if undetected) and "detected" (True if it came from a real RIADJJ26/
+    JJ28 signal, False if defaulted). This is a reporting utility -- it
+    doesn't change `apply_cecl_regime_dummy`'s own behavior (which already
+    applies the same fallback internally), it just makes the detected-vs-
+    defaulted split visible; see `summarize_cecl_adoption_detected_vs_defaulted`."""
+    unique_banks = pd.Index(bank_ids.unique(), name="bank_id")
+    detected = detected_adoption_quarters.reindex(unique_banks)
+    resolved = detected.where(detected.notna(), default_adoption_quarter)
+    return pd.DataFrame(
+        {
+            "bank_id": unique_banks,
+            "adoption_quarter": resolved.to_numpy(),
+            "detected": detected.notna().to_numpy(),
+        }
+    )
+
+
+def summarize_cecl_adoption_detected_vs_defaulted(resolved: pd.DataFrame) -> pd.DataFrame:
+    """resolved: from `resolve_cecl_adoption_quarters`. Returns one row per
+    adoption_quarter with n_detected (banks whose adoption quarter came
+    from a real RIADJJ26/JJ28 signal) and n_defaulted (banks that never
+    showed the signal and fell back to `default_adoption_quarter`),
+    sorted chronologically."""
+    counts = resolved.groupby(["adoption_quarter", "detected"]).size().unstack("detected")
+    counts = counts.rename(columns={True: "n_detected", False: "n_defaulted"})
+    for col in ("n_detected", "n_defaulted"):
+        if col not in counts.columns:
+            counts[col] = 0
+    counts = counts[["n_detected", "n_defaulted"]].fillna(0).astype(int)
+    return counts.sort_index()
 
 
 def apply_cecl_regime_dummy(

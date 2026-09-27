@@ -91,13 +91,17 @@ def build(
 ) -> None:
     """Parse cached bulk ZIPs (run `fetch` first) for every quarter in
     [start, end] and build the bank-category-quarter panel, written as
-    parquet. Missing quarters are skipped with a warning, not fatal."""
+    parquet. Missing quarters are skipped with a warning, not fatal.
+    Prints a summary of skipped malformed rows per (schedule, quarter) at
+    the end, and warns if any single one loses more than
+    ffiec_parse.BAD_ROW_WARNING_THRESHOLD rows."""
     quarters = _quarter_range(start, end)
     categories = list(LoanCategory) if include_combined_consumer else [
         c for c in LoanCategory if c != LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED
     ]
 
     item_frames = []
+    bad_row_counts: dict[tuple[pd.Period, str], int] = {}
     for quarter in quarters:
         path = _cached_zip_path(raw_dir, quarter)
         if not path.exists():
@@ -106,8 +110,11 @@ def build(
             )
             continue
         typer.echo(f"{quarter}: parsing...")
-        item_frame = ffiec_parse.parse_bulk_zip(path.read_bytes(), quarter)
+        item_frame, schedule_bad_rows = ffiec_parse.parse_bulk_zip(path.read_bytes(), quarter)
         item_frames.append(item_frame)
+        for schedule, count in schedule_bad_rows.items():
+            if count > 0:
+                bad_row_counts[(quarter, schedule)] = count
 
     if not item_frames:
         typer.echo("no quarters parsed -- nothing to build", err=True)
@@ -120,6 +127,19 @@ def build(
     output.parent.mkdir(parents=True, exist_ok=True)
     result.to_parquet(output, index=False)
     typer.echo(f"wrote {len(result):,} rows to {output}")
+
+    typer.echo("\nMalformed rows skipped during parsing (schedule, quarter -> row count):")
+    if not bad_row_counts:
+        typer.echo("  none")
+    for (quarter, schedule), count in sorted(bad_row_counts.items(), key=lambda kv: kv[0]):
+        typer.echo(f"  {schedule} {quarter}: {count}")
+        if count > ffiec_parse.BAD_ROW_WARNING_THRESHOLD:
+            typer.echo(
+                f"  WARNING: {schedule} {quarter} lost {count} rows (> "
+                f"{ffiec_parse.BAD_ROW_WARNING_THRESHOLD}) -- investigate before trusting this "
+                "quarter's data for that schedule",
+                err=True,
+            )
 
 
 @app.command()

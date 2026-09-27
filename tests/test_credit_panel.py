@@ -301,6 +301,45 @@ def test_summarize_cecl_adoption_counts_reports_bank_count_per_quarter():
     assert counts.index.tolist() == sorted(counts.index.tolist())
 
 
+def test_resolve_cecl_adoption_quarters_marks_detected_vs_defaulted():
+    bank_ids = pd.Series(["A", "B", "C"])
+    detected = pd.Series({"A": pd.Period("2020Q1", freq="Q")})  # B, C undetected
+    default_quarter = pd.Period("2023Q1", freq="Q")
+    resolved = panel.resolve_cecl_adoption_quarters(bank_ids, detected, default_quarter)
+    resolved = resolved.set_index("bank_id")
+
+    assert resolved.loc["A", "adoption_quarter"] == pd.Period("2020Q1", freq="Q")
+    assert resolved.loc["A", "detected"]
+    assert resolved.loc["B", "adoption_quarter"] == default_quarter
+    assert not resolved.loc["B", "detected"]
+    assert resolved.loc["C", "adoption_quarter"] == default_quarter
+    assert not resolved.loc["C", "detected"]
+
+
+def test_summarize_cecl_adoption_detected_vs_defaulted_splits_counts_by_quarter():
+    resolved = pd.DataFrame(
+        {
+            "bank_id": ["A", "B", "C", "D"],
+            "adoption_quarter": [
+                pd.Period("2020Q1", freq="Q"),
+                pd.Period("2020Q1", freq="Q"),
+                pd.Period("2023Q1", freq="Q"),
+                pd.Period("2023Q1", freq="Q"),
+            ],
+            "detected": [True, False, True, True],
+        }
+    )
+    result = panel.summarize_cecl_adoption_detected_vs_defaulted(resolved)
+    q1_2020 = result.loc[pd.Period("2020Q1", freq="Q")]
+    q1_2023 = result.loc[pd.Period("2023Q1", freq="Q")]
+
+    assert q1_2020["n_detected"] == 1
+    assert q1_2020["n_defaulted"] == 1
+    assert q1_2023["n_detected"] == 2
+    assert q1_2023["n_defaulted"] == 0
+    assert result.index.tolist() == sorted(result.index.tolist())
+
+
 # --------------------------------------------------------- min balance -----
 
 
