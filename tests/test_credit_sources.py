@@ -128,7 +128,9 @@ def test_fed_scenario_rejects_unknown_scenario_name():
         fed_scenarios.fetch_scenario("bogus")
 
 
-def test_fed_scenario_builds_the_correct_url_and_parses_csv():
+def test_fed_scenario_builds_the_correct_url_and_parses_csv_pre_2026_vintage():
+    # 2025 and earlier vintages use the old "<vintage>-Table_2A_..." naming
+    # -- confirmed still correct for that vintage (only 2026+ changed).
     csv_text = "Scenario Name,Date,Unemployment rate\nSupervisory Baseline,2025 Q1,4.3\n"
     with mock.patch.object(
         fed_scenarios.requests, "get", return_value=_fake_response(text=csv_text)
@@ -141,13 +143,49 @@ def test_fed_scenario_builds_the_correct_url_and_parses_csv():
     assert df["Unemployment rate"].iloc[0] == 4.3
 
 
-def test_fed_scenario_severely_adverse_uses_table_3a():
+def test_fed_scenario_severely_adverse_uses_table_3a_pre_2026_vintage():
     csv_text = "Scenario Name,Date\nSupervisory Severely Adverse,2025 Q1\n"
     with mock.patch.object(
         fed_scenarios.requests, "get", return_value=_fake_response(text=csv_text)
     ) as get:
         fed_scenarios.fetch_scenario("severely_adverse", vintage=2025)
     assert "3A_Supervisory_Severely_Adverse_Domestic" in get.call_args.args[0]
+
+
+def test_fed_scenario_builds_the_correct_url_for_the_2026_vintage_naming_change():
+    # The 2026 cycle dropped the table-number segment entirely -- confirmed
+    # live: the old-style URL 404s for 2026, this new one is a real 200.
+    csv_text = "Scenario Name,Date,Unemployment rate\nSupervisory Baseline,2026 Q1,4.6\n"
+    with mock.patch.object(
+        fed_scenarios.requests, "get", return_value=_fake_response(text=csv_text)
+    ) as get:
+        df = fed_scenarios.fetch_scenario("baseline", vintage=2026)
+    assert get.call_args.args[0] == (
+        "https://www.federalreserve.gov/supervisionreg/files/"
+        "2026_Final_Supervisory_Baseline_Domestic.csv"
+    )
+    assert df["Unemployment rate"].iloc[0] == 4.6
+
+
+def test_fed_scenario_severely_adverse_uses_new_naming_for_2026_vintage():
+    csv_text = "Scenario Name,Date\nSupervisory Severely Adverse,2026 Q1\n"
+    with mock.patch.object(
+        fed_scenarios.requests, "get", return_value=_fake_response(text=csv_text)
+    ) as get:
+        fed_scenarios.fetch_scenario("severely_adverse", vintage=2026)
+    assert get.call_args.args[0] == (
+        "https://www.federalreserve.gov/supervisionreg/files/"
+        "2026_Final_Supervisory_Severely_Adverse_Domestic.csv"
+    )
+
+
+def test_fed_scenario_default_vintage_is_the_2026_final():
+    csv_text = "Scenario Name,Date\nSupervisory Baseline,2026 Q1\n"
+    with mock.patch.object(
+        fed_scenarios.requests, "get", return_value=_fake_response(text=csv_text)
+    ) as get:
+        fed_scenarios.fetch_scenario("baseline")
+    assert "2026_Final_Supervisory_Baseline_Domestic.csv" in get.call_args.args[0]
 
 
 # --------------------------------------------------------------- FFIEC ----

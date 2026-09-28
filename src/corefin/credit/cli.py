@@ -9,15 +9,22 @@ from pathlib import Path
 import pandas as pd
 import typer
 
+from corefin.credit import charts, macro
 from corefin.credit.panel import build_industry_nco_rate_report, build_panel, flag_chargeoff_gaps
 from corefin.credit.schema import LoanCategory
-from corefin.credit.sources import ffiec, ffiec_parse
+from corefin.credit.sources import fed_scenarios as fed_scenarios_source
+from corefin.credit.sources import ffiec, ffiec_parse, fred
 
 app = typer.Typer(add_completion=False, help="Credit-Loss Forecasting Engine data pipeline.")
 
 DEFAULT_RAW_DIR = Path("data/raw/ffiec")
 DEFAULT_PANEL_PATH = Path("data/processed/credit_panel.parquet")
 DEFAULT_COVERAGE_REPORT_PATH = Path("data/processed/coverage_report.csv")
+DEFAULT_MACRO_RAW_DIR = Path("data/raw/fred")
+DEFAULT_MACRO_HISTORY_PATH = Path("data/processed/macro_history.parquet")
+DEFAULT_SCENARIO_DIR = Path("data/processed/scenarios")
+DEFAULT_MODELING_DATASET_PATH = Path("data/processed/modeling_dataset.parquet")
+DEFAULT_CHARTS_DIR = Path("data/processed/charts")
 
 
 def _quarter_range(start: str, end: str) -> list[pd.Period]:
@@ -208,3 +215,160 @@ def coverage(
     output.parent.mkdir(parents=True, exist_ok=True)
     merged.to_csv(output, index=False)
     typer.echo(f"wrote coverage+NCO report to {output}")
+
+
+@app.command("fetch-macro")
+def fetch_macro(
+    start: str = typer.Option(
+        "2001-01-01", "--start", help="First date to pull FRED history from."
+    ),
+    end: str | None = typer.Option(
+        None, "--end", help="Last date to pull FRED history through (defaults to latest available)."
+    ),
+    raw_dir: Path = typer.Option(
+        DEFAULT_MACRO_RAW_DIR,
+        "--raw-dir",
+        help="Gitignored directory to cache each series' raw FRED pull in.",
+    ),
+    output: Path = typer.Option(
+        DEFAULT_MACRO_HISTORY_PATH,
+        "--output",
+        help="Where to write the quarterly macro history (wide, one column per variable).",
+    ),
+) -> None:
+    """Fetch every FRED series in fred.FED_SCENARIO_VARIABLE_TO_FRED (or
+    reuse a cached raw pull), aggregate to quarterly and apply each
+    variable's own transform (see credit/macro.py's module docstring for
+    the verified aggregation/transform rules), and write the resulting
+    wide history to `output`. Requires FRED_API_KEY."""
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_by_variable: dict[str, pd.DataFrame] = {}
+    for variable, mapping in fred.FED_SCENARIO_VARIABLE_TO_FRED.items():
+        cache_path = raw_dir / f"{mapping.fred_series_id}.csv"
+        if cache_path.exists():
+            typer.echo(f"{variable} ({mapping.fred_series_id}): cached")
+            observations = pd.read_csv(cache_path, parse_dates=["date"])
+        else:
+            typer.echo(f"{variable} ({mapping.fred_series_id}): fetching...")
+            observations = fred.fetch_series(mapping.fred_series_id, start_date=start, end_date=end)
+            observations.to_csv(cache_path, index=False)
+        raw_by_variable[variable] = observations
+
+    history = macro.build_fred_history_from_raw(raw_by_variable)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    history.reset_index().assign(quarter=lambda d: d["quarter"].astype(str)).to_parquet(
+        output, index=False
+    )
+    typer.echo(f"wrote {len(history):,} quarters x {len(history.columns)} variables to {output}")
+
+
+@app.command("fetch-scenarios")
+def fetch_scenarios(
+    vintage: int = typer.Option(
+        fed_scenarios_source.CURRENT_SCENARIO_VINTAGE,
+        "--vintage",
+        help="Fed scenario vintage year.",
+    ),
+    macro_history_path: Path = typer.Option(
+        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-macro`."
+    ),
+    output_dir: Path = typer.Option(
+        DEFAULT_SCENARIO_DIR, "--output-dir", help="Where to write each normalized scenario."
+    ),
+) -> None:
+    """Fetch the Fed's baseline and severely-adverse scenarios for
+    `vintage`, normalize them to the same quarter-indexed/variable-name
+    shape `fetch-macro` produces, verify each starts exactly one quarter
+    after the macro history's last actual quarter (no gap, no overlap --
+    raises if not), and write both to `output_dir`. No key needed."""
+    history = pd.read_parquet(macro_history_path)
+    history["quarter"] = pd.PeriodIndex(history["quarter"].astype(str), freq="Q")
+    history = history.set_index("quarter")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for scenario_name in ("baseline", "severely_adverse"):
+        typer.echo(f"{scenario_name}: fetching...")
+        raw = fed_scenarios_source.fetch_scenario(scenario_name, vintage=vintage)
+        normalized = macro.normalize_scenario(raw)
+        macro.assert_scenario_continues_from_history(history, normalized)
+        path = output_dir / f"{scenario_name}.parquet"
+        normalized.reset_index().assign(quarter=lambda d: d["quarter"].astype(str)).to_parquet(
+            path, index=False
+        )
+        typer.echo(f"{scenario_name}: continuity OK, wrote {len(normalized)} quarters to {path}")
+
+
+@app.command("build-modeling-dataset")
+def build_modeling_dataset_cmd(
+    panel_path: Path = typer.Option(
+        DEFAULT_PANEL_PATH, "--panel", help="Parquet panel from `build`."
+    ),
+    macro_history_path: Path = typer.Option(
+        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-macro`."
+    ),
+    output: Path = typer.Option(
+        DEFAULT_MODELING_DATASET_PATH, "--output", help="Where to write the modeling dataset."
+    ),
+    min_balance: float = typer.Option(
+        1_000.0, "--min-balance", help="Exclude bank-quarters below this average balance."
+    ),
+    lags: str = typer.Option(
+        "0,1,2,4", "--lags", help="Comma-separated quarter lags of each macro driver to include."
+    ),
+) -> None:
+    """Joins the panel with macro drivers and their lags (no look-ahead),
+    using winsorized NCO rates, excluding merger-flagged and
+    below-min-balance bank-quarters -- see credit/macro.py's
+    build_modeling_dataset for the exact rules."""
+    panel = pd.read_parquet(panel_path)
+    panel["quarter"] = pd.PeriodIndex(panel["quarter"].astype(str), freq="Q")
+
+    history = pd.read_parquet(macro_history_path)
+    history["quarter"] = pd.PeriodIndex(history["quarter"].astype(str), freq="Q")
+    history = history.set_index("quarter")
+
+    lag_values = tuple(int(x) for x in lags.split(","))
+    dataset = macro.build_modeling_dataset(panel, history, lags=lag_values, min_balance=min_balance)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    dataset.assign(quarter=lambda d: d["quarter"].astype(str)).to_parquet(output, index=False)
+    typer.echo(f"wrote {len(dataset):,} rows to {output}")
+
+
+@app.command("chart-macro")
+def chart_macro(
+    macro_history_path: Path = typer.Option(
+        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-macro`."
+    ),
+    scenario_dir: Path = typer.Option(
+        DEFAULT_SCENARIO_DIR, "--scenario-dir", help="Output directory of `fetch-scenarios`."
+    ),
+    output_dir: Path = typer.Option(
+        DEFAULT_CHARTS_DIR, "--output-dir", help="Where to write each variable's chart PNG."
+    ),
+) -> None:
+    """One PNG per macro variable: its full FRED history, with the Fed's
+    baseline and severely-adverse scenario paths appended, continuing
+    from the last actual quarter."""
+    history = pd.read_parquet(macro_history_path)
+    history["quarter"] = pd.PeriodIndex(history["quarter"].astype(str), freq="Q")
+    history = history.set_index("quarter")
+
+    scenarios = {}
+    for scenario_name in ("baseline", "severely_adverse"):
+        path = scenario_dir / f"{scenario_name}.parquet"
+        if not path.exists():
+            typer.echo(
+                f"{scenario_name}: no cached scenario at {path} -- run fetch-scenarios first",
+                err=True,
+            )
+            continue
+        scenario = pd.read_parquet(path)
+        scenario["quarter"] = pd.PeriodIndex(scenario["quarter"].astype(str), freq="Q")
+        scenarios[scenario_name] = scenario.set_index("quarter")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for variable in history.columns:
+        safe_name = variable.replace(" ", "_").replace("/", "_")
+        chart_path = output_dir / f"{safe_name}.png"
+        charts.render_macro_variable_chart(history, scenarios, variable, str(chart_path))
+        typer.echo(f"wrote {chart_path}")

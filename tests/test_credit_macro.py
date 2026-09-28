@@ -1,0 +1,335 @@
+"""Offline tests for the macro/scenario transformation layer -- no network,
+no FRED_API_KEY needed. The transform-methodology tests use real,
+hand-verified FRED values (CPIAUCSL, DSPI, UNRATE) cross-checked against
+the Fed's own published "Historic Domestic" actuals as regression fixtures
+(the numbers are hardcoded here, not re-fetched -- see macro.py's module
+docstring for how they were obtained and verified)."""
+
+from __future__ import annotations
+
+import pandas as pd
+import pytest
+
+from corefin.credit import macro
+from corefin.credit.sources.fred import FredSeriesMapping
+
+
+def _observations(dates: list[str], values: list[float]) -> pd.DataFrame:
+    return pd.DataFrame({"date": pd.to_datetime(dates), "value": values})
+
+
+# ------------------------------------------------------- aggregation ---
+
+
+def test_aggregate_fred_series_to_quarterly_averages_monthly_observations():
+    observations = _observations(
+        ["2025-07-01", "2025-08-01", "2025-09-01"], [322.169, 323.291, 324.245]
+    )
+    quarterly = macro.aggregate_fred_series_to_quarterly(observations)
+    assert quarterly.index[0] == pd.Period("2025Q3", freq="Q")
+    assert quarterly.iloc[0] == pytest.approx((322.169 + 323.291 + 324.245) / 3)
+
+
+def test_aggregate_fred_series_to_quarterly_passes_through_already_quarterly_data():
+    observations = _observations(["2025-01-01", "2025-04-01"], [100.0, 105.0])
+    quarterly = macro.aggregate_fred_series_to_quarterly(observations)
+    assert quarterly.tolist() == [100.0, 105.0]
+
+
+def test_aggregate_fred_series_to_quarterly_real_unemployment_matches_fed_actual():
+    # Real UNRATE for Jul/Aug/Sep 2025: 4.3, 4.3, 4.4 -- the Fed's own
+    # published "Unemployment rate" actual for 2025Q3 is 4.3.
+    observations = _observations(
+        ["2025-07-01", "2025-08-01", "2025-09-01"], [4.3, 4.3, 4.4]
+    )
+    quarterly = macro.aggregate_fred_series_to_quarterly(observations)
+    assert round(quarterly.iloc[0], 1) == 4.3
+
+
+# ------------------------------------------------------------ transform ---
+
+
+def test_apply_fred_transform_level_passes_through():
+    quarterly = pd.Series([4.0, 4.5], index=pd.PeriodIndex(["2025Q1", "2025Q2"], freq="Q"))
+    result = macro.apply_fred_transform(quarterly, "level")
+    assert result.tolist() == [4.0, 4.5]
+
+
+def test_apply_fred_transform_growth_first_observation_is_nan():
+    quarterly = pd.Series([100.0, 101.0], index=pd.PeriodIndex(["2025Q1", "2025Q2"], freq="Q"))
+    result = macro.apply_fred_transform(quarterly, "qoq_annualized_pct_change")
+    assert pd.isna(result.iloc[0])
+
+
+def test_apply_fred_transform_growth_uses_compounding_not_simple_x4():
+    # A 1% quarterly increase compounds to (1.01**4 - 1) * 100 = 4.06%,
+    # not the 4.00% a simple x4 would give -- this is the distinguishing
+    # synthetic case for the two formulas.
+    quarterly = pd.Series([100.0, 101.0], index=pd.PeriodIndex(["2025Q1", "2025Q2"], freq="Q"))
+    result = macro.apply_fred_transform(quarterly, "qoq_annualized_pct_change")
+    assert result.iloc[1] == pytest.approx(4.0604, abs=1e-3)
+
+
+def test_apply_fred_transform_rejects_unknown_transform():
+    quarterly = pd.Series([1.0], index=pd.PeriodIndex(["2025Q1"], freq="Q"))
+    with pytest.raises(ValueError, match="unknown transform"):
+        macro.apply_fred_transform(quarterly, "bogus")
+
+
+def test_apply_fred_transform_growth_matches_real_nominal_disposable_income_2023q1():
+    # Real DSPI: Oct/Nov/Dec 2022 = 19428.1/19509.7/19625.4 (Q4 2022 avg);
+    # Jan/Feb/Mar 2023 = 20121.6/20289.8/20438.8 (Q1 2023 avg). The Fed's
+    # own published "Nominal disposable income growth" actual for 2023Q1
+    # is 16.6 -- the compounded formula gives 16.56 (matches to within
+    # 0.05 points); a simple x4 formula would give 15.56 (a full point
+    # off), which is why compounding is this project's verified choice.
+    observations = _observations(
+        [
+            "2022-10-01",
+            "2022-11-01",
+            "2022-12-01",
+            "2023-01-01",
+            "2023-02-01",
+            "2023-03-01",
+        ],
+        [19428.1, 19509.7, 19625.4, 20121.6, 20289.8, 20438.8],
+    )
+    quarterly = macro.aggregate_fred_series_to_quarterly(observations)
+    growth = macro.apply_fred_transform(quarterly, "qoq_annualized_pct_change")
+    assert growth.loc[pd.Period("2023Q1", freq="Q")] == pytest.approx(16.6, abs=0.1)
+
+
+def test_apply_fred_transform_growth_matches_real_cpi_inflation_2024q1():
+    # Real CPIAUCSL: Oct/Nov/Dec 2023 = 307.696/308.148/308.741 (Q4 2023
+    # avg); Jan/Feb/Mar 2024 = 309.698/310.967/312.345 (Q1 2024 avg). The
+    # Fed's own published "CPI inflation rate" actual for 2024Q1 is 3.7 --
+    # the compounded formula gives 3.70 (matches almost exactly); a simple
+    # x4 formula would give 3.65, further off.
+    observations = _observations(
+        [
+            "2023-10-01",
+            "2023-11-01",
+            "2023-12-01",
+            "2024-01-01",
+            "2024-02-01",
+            "2024-03-01",
+        ],
+        [307.696, 308.148, 308.741, 309.698, 310.967, 312.345],
+    )
+    quarterly = macro.aggregate_fred_series_to_quarterly(observations)
+    growth = macro.apply_fred_transform(quarterly, "qoq_annualized_pct_change")
+    assert growth.loc[pd.Period("2024Q1", freq="Q")] == pytest.approx(3.7, abs=0.1)
+
+
+# ---------------------------------------------------- build_fred_history ---
+
+
+def test_build_fred_history_from_raw_applies_each_variables_own_transform():
+    raw = {
+        "Unemployment rate": _observations(
+            ["2025-01-01", "2025-02-01", "2025-03-01"], [4.0, 4.0, 4.0]
+        ),
+        "CPI inflation rate": _observations(
+            ["2024-10-01", "2024-11-01", "2024-12-01", "2025-01-01", "2025-02-01", "2025-03-01"],
+            [100.0, 100.0, 100.0, 101.0, 101.0, 101.0],
+        ),
+    }
+    mappings = {
+        "Unemployment rate": FredSeriesMapping("UNRATE", "M", "1948-01-01", "level", True),
+        "CPI inflation rate": FredSeriesMapping(
+            "CPIAUCSL", "M", "1947-01-01", "qoq_annualized_pct_change", True
+        ),
+    }
+    history = macro.build_fred_history_from_raw(raw, mappings)
+    assert history.loc[pd.Period("2025Q1", freq="Q"), "Unemployment rate"] == pytest.approx(4.0)
+    assert history.loc[pd.Period("2025Q1", freq="Q"), "CPI inflation rate"] == pytest.approx(
+        4.0604, abs=1e-3
+    )
+    assert pd.isna(history.loc[pd.Period("2024Q4", freq="Q"), "CPI inflation rate"])
+
+
+# -------------------------------------------------------- scenario ingest ---
+
+
+def test_normalize_scenario_parses_fed_date_format_and_drops_label_columns():
+    raw = pd.DataFrame(
+        {
+            "Scenario Name": ["Supervisory Baseline", "Supervisory Baseline"],
+            "Date": ["2026 Q1", "2026 Q2"],
+            "Unemployment rate": [4.6, 4.6],
+        }
+    )
+    normalized = macro.normalize_scenario(raw)
+    assert list(normalized.index) == [pd.Period("2026Q1", freq="Q"), pd.Period("2026Q2", freq="Q")]
+    assert "Scenario Name" not in normalized.columns
+    assert "Date" not in normalized.columns
+    assert normalized["Unemployment rate"].tolist() == [4.6, 4.6]
+
+
+def test_assert_scenario_continues_from_history_passes_with_no_gap():
+    history = pd.DataFrame(
+        {"Unemployment rate": [4.5, 4.5]},
+        index=pd.PeriodIndex(["2025Q3", "2025Q4"], freq="Q"),
+    )
+    scenario = pd.DataFrame(
+        {"Unemployment rate": [4.6]}, index=pd.PeriodIndex(["2026Q1"], freq="Q")
+    )
+    macro.assert_scenario_continues_from_history(history, scenario)  # must not raise
+
+
+def test_assert_scenario_continues_from_history_raises_on_a_gap():
+    history = pd.DataFrame(
+        {"Unemployment rate": [4.5]}, index=pd.PeriodIndex(["2025Q3"], freq="Q")
+    )
+    scenario = pd.DataFrame(
+        {"Unemployment rate": [4.6]}, index=pd.PeriodIndex(["2026Q1"], freq="Q")
+    )
+    with pytest.raises(ValueError, match="expected"):
+        macro.assert_scenario_continues_from_history(history, scenario)
+
+
+def test_assert_scenario_continues_from_history_raises_on_overlap():
+    history = pd.DataFrame(
+        {"Unemployment rate": [4.5]}, index=pd.PeriodIndex(["2026Q1"], freq="Q")
+    )
+    scenario = pd.DataFrame(
+        {"Unemployment rate": [4.6]}, index=pd.PeriodIndex(["2026Q1"], freq="Q")
+    )
+    with pytest.raises(ValueError, match="expected"):
+        macro.assert_scenario_continues_from_history(history, scenario)
+
+
+def test_build_macro_chart_series_labels_actual_and_each_scenario():
+    history = pd.DataFrame(
+        {"Unemployment rate": [4.5]}, index=pd.PeriodIndex(["2025Q4"], freq="Q")
+    )
+    baseline = pd.DataFrame(
+        {"Unemployment rate": [4.6]}, index=pd.PeriodIndex(["2026Q1"], freq="Q")
+    )
+    severely_adverse = pd.DataFrame(
+        {"Unemployment rate": [5.9]}, index=pd.PeriodIndex(["2026Q1"], freq="Q")
+    )
+    chart_series = macro.build_macro_chart_series(
+        history, {"baseline": baseline, "severely_adverse": severely_adverse}, "Unemployment rate"
+    )
+    assert set(chart_series["series"]) == {"actual", "baseline", "severely_adverse"}
+    assert len(chart_series) == 3
+
+
+# ---------------------------------------------------- modeling dataset ---
+
+
+def _synthetic_panel() -> pd.DataFrame:
+    quarters = pd.PeriodIndex(["2020Q1", "2020Q2", "2020Q3"], freq="Q")
+    return pd.DataFrame(
+        {
+            "bank_id": [1, 1, 1],
+            "quarter": quarters,
+            "category": ["auto", "auto", "auto"],
+            "average_balance": [10_000.0, 10_000.0, 10_000.0],
+            "chargeoff_quarterly": [10.0, 12.0, 14.0],
+            "recovery_quarterly": [1.0, 1.0, 1.0],
+            "annualized_nco_rate": [0.0036, 0.0044, 0.0052],
+            "merger_flag": [False, False, False],
+        }
+    )
+
+
+def _synthetic_macro_history() -> pd.DataFrame:
+    quarters = pd.PeriodIndex(["2019Q3", "2019Q4", "2020Q1", "2020Q2", "2020Q3"], freq="Q")
+    return pd.DataFrame({"Unemployment rate": [3.5, 3.6, 4.4, 13.0, 8.4]}, index=quarters)
+
+
+def test_build_modeling_dataset_lag_columns_never_look_ahead():
+    panel = _synthetic_panel()
+    macro_history = _synthetic_macro_history()
+    dataset = macro.build_modeling_dataset(panel, macro_history, lags=(0, 1, 2))
+
+    for _, row in dataset.iterrows():
+        for lag in (0, 1, 2):
+            col = f"Unemployment rate_lag{lag}"
+            source_quarter = row["quarter"] - lag
+            if source_quarter in macro_history.index:
+                expected = macro_history.loc[source_quarter, "Unemployment rate"]
+                assert row[col] == pytest.approx(expected)
+                assert source_quarter <= row["quarter"]
+            else:
+                assert pd.isna(row[col])
+
+
+def test_build_modeling_dataset_lag0_is_contemporaneous_not_future():
+    panel = _synthetic_panel()
+    macro_history = _synthetic_macro_history()
+    dataset = macro.build_modeling_dataset(panel, macro_history, lags=(0,))
+    row_2020q2 = dataset[dataset["quarter"] == pd.Period("2020Q2", freq="Q")].iloc[0]
+    assert row_2020q2["Unemployment rate_lag0"] == pytest.approx(13.0)
+
+
+def test_build_modeling_dataset_excludes_merger_flagged_rows():
+    panel = _synthetic_panel()
+    panel.loc[1, "merger_flag"] = True
+    macro_history = _synthetic_macro_history()
+    dataset = macro.build_modeling_dataset(panel, macro_history, lags=(0,))
+    assert len(dataset) == 2
+    assert pd.Period("2020Q2", freq="Q") not in dataset["quarter"].values
+
+
+def test_build_modeling_dataset_excludes_below_min_balance_rows():
+    panel = _synthetic_panel()
+    panel.loc[2, "average_balance"] = 500.0
+    macro_history = _synthetic_macro_history()
+    dataset = macro.build_modeling_dataset(panel, macro_history, lags=(0,), min_balance=1_000.0)
+    assert len(dataset) == 2
+    assert pd.Period("2020Q3", freq="Q") not in dataset["quarter"].values
+
+
+def test_build_modeling_dataset_adds_winsorized_nco_rate_column():
+    panel = _synthetic_panel()
+    macro_history = _synthetic_macro_history()
+    dataset = macro.build_modeling_dataset(panel, macro_history, lags=(0,))
+    assert "winsorized_nco_rate" in dataset.columns
+    assert dataset["winsorized_nco_rate"].notna().all()
+
+
+# ------------------------------------------------ units consistency ---
+
+
+def test_fred_history_and_scenario_share_the_same_units_for_every_variable():
+    # Both a FRED-history frame and a normalized scenario frame must use
+    # the SAME column names / units for every shared variable -- this is
+    # what makes assert_scenario_continues_from_history and the chart
+    # function meaningful (comparing like with like, not e.g. a level
+    # against a growth rate for the same nominal column name).
+    raw_scenario = pd.DataFrame(
+        {
+            "Scenario Name": ["Supervisory Baseline"],
+            "Date": ["2026 Q1"],
+            "Unemployment rate": [4.6],
+            "CPI inflation rate": [3.0],
+        }
+    )
+    scenario = macro.normalize_scenario(raw_scenario)
+    # Synthetic illustrative values (this test checks column/unit
+    # consistency, not a real-data numeric match -- see the
+    # growth-transform tests above for those).
+    raw = {
+        "Unemployment rate": _observations(
+            ["2025-10-01", "2025-11-01", "2025-12-01"], [4.4, 4.5, 4.4]
+        ),
+        "CPI inflation rate": _observations(
+            ["2025-07-01", "2025-08-01", "2025-09-01", "2025-10-01", "2025-11-01", "2025-12-01"],
+            [322.0, 323.0, 324.0, 324.5, 325.0, 326.0],
+        ),
+    }
+    mappings = {
+        "Unemployment rate": FredSeriesMapping("UNRATE", "M", "1948-01-01", "level", True),
+        "CPI inflation rate": FredSeriesMapping(
+            "CPIAUCSL", "M", "1947-01-01", "qoq_annualized_pct_change", True
+        ),
+    }
+    history = macro.build_fred_history_from_raw(raw, mappings)
+    assert set(scenario.columns) <= set(history.columns)
+    # both express "Unemployment rate" as a level in percentage points
+    # (not e.g. history in decimal fraction and scenario in percent)
+    assert 0 < history["Unemployment rate"].iloc[-1] < 20
+    assert 0 < scenario["Unemployment rate"].iloc[0] < 20
