@@ -1,11 +1,50 @@
-"""Pure transformations for macro/scenario data: FRED history aggregation
-to quarterly, Fed scenario alignment with that history, and the joined
-credit-panel + macro-driver modeling dataset with lagged macro drivers.
-No function here touches the network -- fetching is sources/fred.py and
-sources/fed_scenarios.py's job, orchestration is the CLI's.
+"""Pure transformations for macro/scenario data: the Fed's own historic
+domestic actuals as the PRIMARY macro history, Fed scenario ingestion,
+QoQ/YoY change features for the non-stationary level variables, and the
+joined credit-panel + macro-driver modeling dataset with lagged macro
+drivers. No function here touches the network -- fetching is
+sources/fred.py and sources/fed_scenarios.py's job, orchestration is the
+CLI's.
 
-Quarter-averaging and transform rules (both verified against real data,
-not assumed -- see the empirical checks below):
+PRIMARY SOURCE, and why: this project first built macro history from FRED
+proxy series (aggregated to quarterly, transformed -- see
+`aggregate_fred_series_to_quarterly`/`apply_fred_transform`/
+`build_fred_history_from_raw` below, still here and still tested). That
+approach hit a real, verified problem on the full real build: FOUR of the
+16 Fed scenario variables have NO exact FRED equivalent and are on a
+DIFFERENT NUMERIC SCALE from the Fed's own scenario values --
+House Price Index (FRED's FHFA-based proxy ~720 vs the Fed's own ~273),
+the Dow Jones Total Stock Market Index (NASDAQ proxy ~26,100 vs the Fed's
+own ~67,500), Commercial Real Estate Price Index (FRED's COMREPUSQ159N is
+literally a year-over-year PERCENT CHANGE, not a level, confirmed via
+FRED's own series metadata -- units "% Chg. from Yr. Ago"), and BBB
+corporate yield (Moody's Baa, ~1 point above the Fed's own BBB
+methodology). Mixing FRED-derived history with Fed-published scenario
+paths for these four therefore produces a visible, wrong discontinuity at
+the history/scenario boundary.
+
+The fix: use the Fed's OWN historic domestic actuals table
+(sources.fed_scenarios.fetch_historic_domestic -- "Table 1A" pre-2026,
+"<vintage>_Final_Historic_Domestic.csv" from 2026 on) as the PRIMARY
+macro history for ALL 16 variables (`normalize_fed_historic`, which is
+`normalize_scenario` under a clearer name for this use -- same CSV shape,
+"Scenario Name" is "Actual" throughout). This is, by construction, in the
+Fed's own definitions and units for every variable, so it lines up
+exactly with the Fed's own scenario paths with no scale mismatch --
+confirmed live: the 2026 vintage's historic table ends at 2025Q4 and its
+scenario tables start at 2026Q1, adjoining with no gap or overlap.
+FRED remains available (`build_fred_history_from_raw` and friends) ONLY
+as an optional, secondary cross-reference for variables whose FRED series
+matches the Fed's own definition exactly (fred.FED_SCENARIO_VARIABLE_TO_
+FRED's `is_exact_match=True` entries -- unemployment, GDP/income growth,
+CPI inflation, the three Treasury rates, mortgage rate, prime rate, VIX);
+it is NOT used to build the primary macro_history.parquet the modeling
+pipeline consumes.
+
+Quarter-averaging and transform rules for the (now secondary) FRED path
+are still verified against real data, not assumed -- see the empirical
+checks below; this documents that verification, not current default
+behavior:
 
 - Every sub-quarterly (D/W/M) FRED series is aggregated to quarterly via
   the plain MEAN of its observations within each calendar quarter. An
@@ -42,6 +81,16 @@ not assumed -- see the empirical checks below):
   match years later isn't expected regardless of formula; the CPI checks,
   which barely revise, are the more reliable signal and point the same
   way GDP does, just more cleanly.)
+
+NON-STATIONARY LEVEL VARIABLES: `LEVEL_VARIABLES_FOR_CHANGE_FEATURES`
+below names the 4 variables that are raw index/price LEVELS, not rates or
+growth rates -- House Price Index, Commercial Real Estate Price Index,
+the Dow Jones Total Stock Market Index proxy, and Market Volatility
+Index. These stay in the modeling dataset as levels (useful as-is for
+some purposes) but are non-stationary and should not be fed directly into
+a regression expecting stationary inputs -- `add_pct_change_features`
+adds QoQ and YoY percent-change columns for each, which ARE reasonably
+stationary, alongside (not replacing) the raw level columns.
 """
 
 from __future__ import annotations
@@ -49,6 +98,16 @@ from __future__ import annotations
 import pandas as pd
 
 from corefin.credit.sources.fred import FED_SCENARIO_VARIABLE_TO_FRED, FredSeriesMapping
+
+# The 4 Fed scenario variables that are raw index/price LEVELS (not a
+# rate or an already-a-growth-rate variable) -- non-stationary, and the
+# ones `add_pct_change_features` computes QoQ/YoY change columns for.
+LEVEL_VARIABLES_FOR_CHANGE_FEATURES = (
+    "Dow Jones Total Stock Market Index",
+    "House Price Index",
+    "Commercial Real Estate Price Index",
+    "Market Volatility Index",
+)
 
 
 def aggregate_fred_series_to_quarterly(observations: pd.DataFrame) -> pd.Series:
@@ -111,10 +170,13 @@ def normalize_scenario(raw_scenario: pd.DataFrame) -> pd.DataFrame:
     the real 2026 vintage CSV: "Dow Jones Total Stock Market Index
     (Level)", "House Price Index (Level)", "Commercial Real Estate Price
     Index (Level)", "Market Volatility Index (Level)". Stripped here so
-    scenario columns line up 1:1 with `build_fred_history_from_raw`'s
-    columns (both functions must agree on variable names for
-    `assert_scenario_continues_from_history` / charts to compare the
-    right series)."""
+    columns line up 1:1 across history and scenario frames (both must
+    agree on variable names for `assert_scenario_continues_from_history` /
+    `build_full_macro_path` / charts to compare the right series). This
+    function is shape-agnostic about "Scenario Name"'s actual value, so
+    `normalize_fed_historic` below reuses it for the historic actuals
+    table too (where that column is "Actual" throughout, not a scenario
+    name)."""
     quarters = pd.PeriodIndex(
         raw_scenario["Date"].str.replace(" ", "", regex=False), freq="Q"
     )
@@ -126,12 +188,27 @@ def normalize_scenario(raw_scenario: pd.DataFrame) -> pd.DataFrame:
     return normalized.sort_index()
 
 
+def normalize_fed_historic(raw_historic: pd.DataFrame) -> pd.DataFrame:
+    """raw_historic: fed_scenarios.fetch_historic_domestic(...) output --
+    the SAME CSV shape as a scenario ("Scenario Name" == "Actual"
+    throughout, same "Date"/variable columns), so this is
+    `normalize_scenario` under a name that matches how this project
+    actually uses it: the PRIMARY macro history source (see this module's
+    docstring), not a hypothetical projection. Returns a wide DataFrame
+    indexed by quarter (PeriodIndex, freq="Q"), in the Fed's own
+    definitions and units for every one of the 16 variables."""
+    return normalize_scenario(raw_historic)
+
+
 def assert_scenario_continues_from_history(history: pd.DataFrame, scenario: pd.DataFrame) -> None:
     """Raises ValueError unless `scenario`'s first quarter is exactly one
     quarter after `history`'s last quarter -- i.e. the scenario picks up
     immediately where the actual data ends, with no gap and no overlap.
     Both must be non-empty, quarter-indexed frames (as returned by
-    `build_fred_history_from_raw` / `normalize_scenario`)."""
+    `normalize_fed_historic` / `normalize_scenario` -- with the Fed's own
+    historic table as the history source, this holds by construction:
+    confirmed live, the 2026 vintage's historic table ends at 2025Q4 and
+    its scenario tables start at 2026Q1)."""
     if history.empty or scenario.empty:
         raise ValueError("both history and scenario must be non-empty to check continuity")
     last_actual = history.index.max()
@@ -144,48 +221,58 @@ def assert_scenario_continues_from_history(history: pd.DataFrame, scenario: pd.D
         )
 
 
-def latest_complete_quarter(history: pd.DataFrame, as_of: pd.Timestamp | None = None) -> pd.Period:
-    """The latest quarter in `history.index` that has fully ELAPSED as of
-    `as_of` (defaults to now) -- i.e. `as_of` is on or after that
-    quarter's end date. This is deliberately calendar-based, not a
-    data-completeness check on observation counts: a real gap this
-    project hit is that FRED can return a full-looking data point for a
-    STILL-IN-PROGRESS quarter (e.g. only July/August of a September-ending
-    quarter, silently averaged by `aggregate_fred_series_to_quarterly` as
-    if that were the whole quarter) while a genuinely elapsed, complete
-    quarter can ALSO be missing one series' observation for an unrelated
-    reason (verified: FRED's real UNRATE has no 2025-10-01 observation at
-    all -- a real reporting gap, not an in-progress quarter -- so an
-    observation-count threshold would have wrongly flagged an actual,
-    complete quarter as incomplete). Only the calendar tells the two
-    cases apart."""
-    as_of = as_of if as_of is not None else pd.Timestamp.now()
-    elapsed = history.index[history.index.map(lambda q: q.end_time) <= as_of]
-    if len(elapsed) == 0:
-        raise ValueError("no quarter in history has fully elapsed as of `as_of`")
-    return elapsed.max()
+def build_full_macro_path(history: pd.DataFrame, scenario: pd.DataFrame) -> pd.DataFrame:
+    """Concatenates `history` (through the jump-off quarter) with
+    `scenario` (from the quarter immediately after) into one
+    chronologically continuous, quarter-indexed frame. Raises via
+    `assert_scenario_continues_from_history` if they don't adjoin. This is
+    the correct input for `add_pct_change_features` when computing a
+    scenario quarter's QoQ/YoY change: the scenario's own first few
+    quarters need real prior levels from `history` to compute a
+    meaningful change (e.g. the scenario's first quarter's YoY change
+    needs a quarter from a year before the jump-off, which only exists in
+    `history`), not just the scenario's own rows in isolation."""
+    assert_scenario_continues_from_history(history, scenario)
+    return pd.concat([history, scenario]).sort_index()
 
 
-def align_scenario_to_history(
-    history: pd.DataFrame, scenario: pd.DataFrame, as_of: pd.Timestamp | None = None
+def add_pct_change_features(
+    levels: pd.DataFrame, variables: tuple[str, ...] = LEVEL_VARIABLES_FOR_CHANGE_FEATURES
+) -> pd.DataFrame:
+    """levels: a quarter-indexed frame (history, scenario, or the two
+    concatenated via `build_full_macro_path`) containing at least
+    `variables`' level columns, SORTED ascending with no missing quarters
+    in between (a scenario alone does satisfy this on its own for QoQ/YoY
+    computed purely within it, but its first 1-4 rows will be NaN unless
+    called on the `build_full_macro_path` result instead, which carries
+    real prior levels across the history/scenario boundary).
+
+    Returns a COPY of `levels` with two new columns per variable:
+    f"{variable} QoQ % change" = (level[t] / level[t-1] - 1) * 100, and
+    f"{variable} YoY % change" = (level[t] / level[t-4] - 1) * 100 --
+    plain (non-annualized) percent changes, the natural convention for an
+    index/price level rather than a rate. Silently skips any variable not
+    present in `levels.columns` (callers may pass a subset)."""
+    result = levels.copy()
+    for variable in variables:
+        if variable not in levels.columns:
+            continue
+        level = levels[variable]
+        result[f"{variable} QoQ % change"] = (level / level.shift(1) - 1.0) * 100.0
+        result[f"{variable} YoY % change"] = (level / level.shift(4) - 1.0) * 100.0
+    return result
+
+
+def split_dataset_by_quarter(
+    dataset: pd.DataFrame, cutoff: pd.Period, quarter_column: str = "quarter"
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Returns (truncated_history, truncated_scenario): `history` cut to
-    quarters through the latest fully-elapsed actual quarter (see
-    `latest_complete_quarter`), and `scenario` cut to quarters strictly
-    after it. The Fed fixes a scenario's starting point at publication
-    time; by the time this pipeline runs, real actuals may already exist
-    for quarters the scenario also covers (or `history` may include a
-    still-in-progress trailing quarter the scenario doesn't need to
-    account for) -- either way, actual data takes priority, and the
-    scenario is truncated to only the quarters actuals don't yet cover.
-    Raises (via `assert_scenario_continues_from_history`) if what remains
-    still has a gap -- i.e. the scenario doesn't reach far enough forward
-    to pick up immediately after the last complete actual quarter."""
-    cutoff = latest_complete_quarter(history, as_of)
-    truncated_history = history.loc[history.index <= cutoff]
-    truncated_scenario = scenario.loc[scenario.index > cutoff]
-    assert_scenario_continues_from_history(truncated_history, truncated_scenario)
-    return truncated_history, truncated_scenario
+    """Returns (train, holdout): `dataset` split on `quarter_column` into
+    rows at or before `cutoff` (train) and strictly after it (holdout).
+    Used to hold out the panel's most recent quarters (beyond the Fed's
+    own historic table's last actual jump-off quarter) as a small
+    out-of-sample check, rather than training on them."""
+    is_train = dataset[quarter_column] <= cutoff
+    return dataset[is_train], dataset[~is_train]
 
 
 def build_macro_chart_series(

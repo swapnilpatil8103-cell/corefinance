@@ -31,10 +31,12 @@ CURRENT_SCENARIO_VINTAGE = 2026
 _NEW_NAMING_FIRST_VINTAGE = 2026
 
 _SCENARIO_NAMES = {
+    "historic": "Historic_Domestic",
     "baseline": "Supervisory_Baseline_Domestic",
     "severely_adverse": "Supervisory_Severely_Adverse_Domestic",
 }
 _SCENARIO_TABLE_NUMBERS = {  # only used for vintages before _NEW_NAMING_FIRST_VINTAGE
+    "historic": "1A",
     "baseline": "2A",
     "severely_adverse": "3A",
 }
@@ -51,10 +53,12 @@ def _scenario_url(scenario: str, vintage: int) -> str:
 
 
 def fetch_scenario(scenario: str, vintage: int = CURRENT_SCENARIO_VINTAGE) -> pd.DataFrame:
-    """scenario: "baseline" or "severely_adverse". Returns a DataFrame with
-    columns ["Scenario Name", "Date", <domestic variable columns...>] --
-    one row per quarter, matching the Fed's own published CSV exactly
-    (column names are the Fed's, not renamed here, so the mapping in
+    """scenario: "baseline" or "severely_adverse" (or "historic" -- see
+    `fetch_historic_domestic`, a thin wrapper around this same lookup for
+    readability at call sites). Returns a DataFrame with columns
+    ["Scenario Name", "Date", <domestic variable columns...>] -- one row
+    per quarter, matching the Fed's own published CSV exactly (column
+    names are the Fed's, not renamed here, so the mapping in
     fred.FED_SCENARIO_VARIABLE_TO_FRED lines up by name). "Date" is the
     Fed's own "YYYY QN" string format (e.g. "2026 Q1"), not yet parsed to
     a pandas Period -- see macro.normalize_scenario for that."""
@@ -62,3 +66,16 @@ def fetch_scenario(scenario: str, vintage: int = CURRENT_SCENARIO_VINTAGE) -> pd
     response = requests.get(url, timeout=30)
     response.raise_for_status()
     return pd.read_csv(StringIO(response.text))
+
+
+def fetch_historic_domestic(vintage: int = CURRENT_SCENARIO_VINTAGE) -> pd.DataFrame:
+    """The Fed's own historic domestic actuals table ("Table 1A" pre-2026,
+    "<vintage>_Final_Historic_Domestic.csv" from 2026 on) -- real, already-
+    realized values (Scenario Name == "Actual") for every domestic
+    variable, in the Fed's own definitions and units, back to 1976Q1
+    (confirmed live: the 2026 vintage's file has 200 quarterly rows,
+    1976Q1 through 2025Q4). This is this project's PRIMARY macro history
+    source (see macro.py's module docstring for why) -- FRED is used only
+    as an optional, secondary cross-reference for variables whose
+    definitions match exactly."""
+    return fetch_scenario("historic", vintage=vintage)

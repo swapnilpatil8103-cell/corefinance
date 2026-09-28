@@ -20,11 +20,15 @@ app = typer.Typer(add_completion=False, help="Credit-Loss Forecasting Engine dat
 DEFAULT_RAW_DIR = Path("data/raw/ffiec")
 DEFAULT_PANEL_PATH = Path("data/processed/credit_panel.parquet")
 DEFAULT_COVERAGE_REPORT_PATH = Path("data/processed/coverage_report.csv")
+DEFAULT_FED_RAW_DIR = Path("data/raw/fed_scenarios")
 DEFAULT_MACRO_RAW_DIR = Path("data/raw/fred")
 DEFAULT_MACRO_HISTORY_PATH = Path("data/processed/macro_history.parquet")
+DEFAULT_MACRO_HISTORY_FRED_PATH = Path("data/processed/macro_history_fred_extension.parquet")
 DEFAULT_SCENARIO_DIR = Path("data/processed/scenarios")
 DEFAULT_MODELING_DATASET_PATH = Path("data/processed/modeling_dataset.parquet")
+DEFAULT_MODELING_DATASET_HOLDOUT_PATH = Path("data/processed/modeling_dataset_holdout.parquet")
 DEFAULT_CHARTS_DIR = Path("data/processed/charts")
+DEFAULT_TRAINING_JUMP_OFF_QUARTER = "2025Q4"
 
 
 def _quarter_range(start: str, end: str) -> list[pd.Period]:
@@ -217,8 +221,50 @@ def coverage(
     typer.echo(f"wrote coverage+NCO report to {output}")
 
 
-@app.command("fetch-macro")
-def fetch_macro(
+@app.command("fetch-fed-history")
+def fetch_fed_history(
+    vintage: int = typer.Option(
+        fed_scenarios_source.CURRENT_SCENARIO_VINTAGE,
+        "--vintage",
+        help="Fed scenario vintage year.",
+    ),
+    raw_dir: Path = typer.Option(
+        DEFAULT_FED_RAW_DIR, "--raw-dir", help="Gitignored directory to cache the raw pull in."
+    ),
+    output: Path = typer.Option(
+        DEFAULT_MACRO_HISTORY_PATH,
+        "--output",
+        help="Where to write the quarterly macro history (wide, one column per variable).",
+    ),
+) -> None:
+    """PRIMARY macro history source (see credit/macro.py's module
+    docstring for why): fetches the Fed's own historic domestic actuals
+    table for `vintage` (or reuses a cached raw pull), in the Fed's own
+    definitions and units for all 16 variables, adds QoQ/YoY percent-
+    change columns for the non-stationary level variables (see
+    macro.LEVEL_VARIABLES_FOR_CHANGE_FEATURES), and writes the result to
+    `output`. No key needed."""
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = raw_dir / f"{vintage}_Final_Historic_Domestic.csv"
+    if cache_path.exists():
+        typer.echo(f"historic domestic ({vintage}): cached")
+        raw = pd.read_csv(cache_path)
+    else:
+        typer.echo(f"historic domestic ({vintage}): fetching...")
+        raw = fed_scenarios_source.fetch_historic_domestic(vintage=vintage)
+        raw.to_csv(cache_path, index=False)
+
+    history = macro.normalize_fed_historic(raw)
+    history = macro.add_pct_change_features(history)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    history.reset_index().assign(quarter=lambda d: d["quarter"].astype(str)).to_parquet(
+        output, index=False
+    )
+    typer.echo(f"wrote {len(history):,} quarters x {len(history.columns)} columns to {output}")
+
+
+@app.command("fetch-macro-fred")
+def fetch_macro_fred(
     start: str = typer.Option(
         "2001-01-01", "--start", help="First date to pull FRED history from."
     ),
@@ -231,16 +277,24 @@ def fetch_macro(
         help="Gitignored directory to cache each series' raw FRED pull in.",
     ),
     output: Path = typer.Option(
-        DEFAULT_MACRO_HISTORY_PATH,
+        DEFAULT_MACRO_HISTORY_FRED_PATH,
         "--output",
-        help="Where to write the quarterly macro history (wide, one column per variable).",
+        help="Where to write the quarterly FRED-derived history.",
     ),
 ) -> None:
-    """Fetch every FRED series in fred.FED_SCENARIO_VARIABLE_TO_FRED (or
+    """OPTIONAL, secondary cross-reference only -- NOT used by
+    `build-modeling-dataset`/`chart-macro` by default (see
+    `fetch-fed-history`, the primary source, and credit/macro.py's module
+    docstring for why: 4 of the 16 FRED proxies are on a different scale
+    from the Fed's own definitions). Useful for sanity-checking the
+    definition-exact variables (unemployment, GDP/income growth, CPI
+    inflation, Treasury rates, mortgage/prime rate, VIX -- see
+    fred.FED_SCENARIO_VARIABLE_TO_FRED's `is_exact_match` flags) against
+    an independent source, or for extending beyond the Fed's own cached
+    vintage before a newer one is published. Fetch every FRED series (or
     reuse a cached raw pull), aggregate to quarterly and apply each
-    variable's own transform (see credit/macro.py's module docstring for
-    the verified aggregation/transform rules), and write the resulting
-    wide history to `output`. Requires FRED_API_KEY."""
+    variable's own transform, and write the resulting wide history to
+    `output`. Requires FRED_API_KEY."""
     raw_dir.mkdir(parents=True, exist_ok=True)
     raw_by_variable: dict[str, pd.DataFrame] = {}
     for variable, mapping in fred.FED_SCENARIO_VARIABLE_TO_FRED.items():
@@ -269,41 +323,58 @@ def fetch_scenarios(
         "--vintage",
         help="Fed scenario vintage year.",
     ),
+    raw_dir: Path = typer.Option(
+        DEFAULT_FED_RAW_DIR, "--raw-dir", help="Gitignored directory to cache each raw pull in."
+    ),
     macro_history_path: Path = typer.Option(
-        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-macro`."
+        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-fed-history`."
     ),
     output_dir: Path = typer.Option(
         DEFAULT_SCENARIO_DIR, "--output-dir", help="Where to write each normalized scenario."
     ),
 ) -> None:
     """Fetch the Fed's baseline and severely-adverse scenarios for
-    `vintage`, normalize them to the same quarter-indexed/variable-name
-    shape `fetch-macro` produces, and align each to the macro history:
-    truncated to start immediately after the latest FULLY ELAPSED actual
-    quarter (see macro.align_scenario_to_history -- a scenario is fixed
-    at publication time, so by the time this runs, real actuals may
-    already cover some of the scenario's own quarters; those actuals take
-    priority and the overlapping scenario quarters are dropped). Raises
-    if what remains still has a gap. Writes both to `output_dir`. No key
-    needed."""
+    `vintage` (or reuse a cached raw pull), normalize them to the same
+    quarter-indexed/variable-name shape `fetch-fed-history` produces, and
+    verify each starts exactly one quarter after the macro history's last
+    actual quarter -- the Fed's convention: history through the jump-off
+    quarter, then every scenario quarter from the next one on, with no
+    truncation (this holds by construction now that both come from the
+    same Fed file family; raises if it somehow doesn't). Adds QoQ/YoY
+    percent-change columns for the non-stationary level variables,
+    computed against the REAL levels leading into the jump-off quarter
+    (via macro.build_full_macro_path), not the scenario's own 13 rows in
+    isolation. Writes both to `output_dir`."""
     history = pd.read_parquet(macro_history_path)
     history["quarter"] = pd.PeriodIndex(history["quarter"].astype(str), freq="Q")
     history = history.set_index("quarter")
+    # levels only (drop this run's own QoQ/YoY columns) so build_full_macro_path's
+    # continuity check compares the same 16 raw variables the scenario has.
+    history_levels = history[[c for c in history.columns if "% change" not in c]]
 
+    raw_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     for scenario_name in ("baseline", "severely_adverse"):
-        typer.echo(f"{scenario_name}: fetching...")
-        raw = fed_scenarios_source.fetch_scenario(scenario_name, vintage=vintage)
+        cache_path = raw_dir / f"{vintage}_Final_{scenario_name}.csv"
+        if cache_path.exists():
+            typer.echo(f"{scenario_name} ({vintage}): cached")
+            raw = pd.read_csv(cache_path)
+        else:
+            typer.echo(f"{scenario_name} ({vintage}): fetching...")
+            raw = fed_scenarios_source.fetch_scenario(scenario_name, vintage=vintage)
+            raw.to_csv(cache_path, index=False)
+
         normalized = macro.normalize_scenario(raw)
-        _, aligned = macro.align_scenario_to_history(history, normalized)
+        full_path = macro.build_full_macro_path(history_levels, normalized)
+        full_path_with_changes = macro.add_pct_change_features(full_path)
+        scenario_with_changes = full_path_with_changes.loc[normalized.index]
+
         path = output_dir / f"{scenario_name}.parquet"
-        aligned.reset_index().assign(quarter=lambda d: d["quarter"].astype(str)).to_parquet(
-            path, index=False
-        )
-        dropped = len(normalized) - len(aligned)
+        scenario_with_changes.reset_index().assign(
+            quarter=lambda d: d["quarter"].astype(str)
+        ).to_parquet(path, index=False)
         typer.echo(
-            f"{scenario_name}: continuity OK ({dropped} already-actual scenario quarter(s) "
-            f"dropped), wrote {len(aligned)} quarters to {path}"
+            f"{scenario_name}: continuity OK, wrote {len(scenario_with_changes)} quarters to {path}"
         )
 
 
@@ -313,10 +384,23 @@ def build_modeling_dataset_cmd(
         DEFAULT_PANEL_PATH, "--panel", help="Parquet panel from `build`."
     ),
     macro_history_path: Path = typer.Option(
-        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-macro`."
+        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-fed-history`."
     ),
     output: Path = typer.Option(
-        DEFAULT_MODELING_DATASET_PATH, "--output", help="Where to write the modeling dataset."
+        DEFAULT_MODELING_DATASET_PATH,
+        "--output",
+        help="Where to write the TRAINING modeling dataset.",
+    ),
+    holdout_output: Path = typer.Option(
+        DEFAULT_MODELING_DATASET_HOLDOUT_PATH,
+        "--holdout-output",
+        help="Where to write the held-out (post-jump-off) modeling dataset.",
+    ),
+    max_training_quarter: str = typer.Option(
+        DEFAULT_TRAINING_JUMP_OFF_QUARTER,
+        "--max-training-quarter",
+        help="Last quarter included in training; later panel quarters are held out as an "
+        "out-of-sample check, not trained on.",
     ),
     min_balance: float = typer.Option(
         1_000.0, "--min-balance", help="Exclude bank-quarters below this average balance."
@@ -328,7 +412,13 @@ def build_modeling_dataset_cmd(
     """Joins the panel with macro drivers and their lags (no look-ahead),
     using winsorized NCO rates, excluding merger-flagged and
     below-min-balance bank-quarters -- see credit/macro.py's
-    build_modeling_dataset for the exact rules."""
+    build_modeling_dataset for the exact rules. Panel quarters after
+    `max_training_quarter` (the Fed historic table's own jump-off
+    quarter, 2025Q4 by default) are written separately to `holdout_output`
+    rather than included in `output` -- the Fed's own macro history has no
+    actuals past that quarter anyway, so any bank-quarter lag beyond it
+    would otherwise silently pull in NaN or (once scenario paths are used
+    for projection) a hypothetical value instead of a real one."""
     panel = pd.read_parquet(panel_path)
     panel["quarter"] = pd.PeriodIndex(panel["quarter"].astype(str), freq="Q")
 
@@ -338,15 +428,24 @@ def build_modeling_dataset_cmd(
 
     lag_values = tuple(int(x) for x in lags.split(","))
     dataset = macro.build_modeling_dataset(panel, history, lags=lag_values, min_balance=min_balance)
+
+    cutoff = pd.Period(max_training_quarter, freq="Q")
+    train, holdout = macro.split_dataset_by_quarter(dataset, cutoff)
+
     output.parent.mkdir(parents=True, exist_ok=True)
-    dataset.assign(quarter=lambda d: d["quarter"].astype(str)).to_parquet(output, index=False)
-    typer.echo(f"wrote {len(dataset):,} rows to {output}")
+    train.assign(quarter=lambda d: d["quarter"].astype(str)).to_parquet(output, index=False)
+    holdout_output.parent.mkdir(parents=True, exist_ok=True)
+    holdout.assign(quarter=lambda d: d["quarter"].astype(str)).to_parquet(
+        holdout_output, index=False
+    )
+    typer.echo(f"wrote {len(train):,} training rows (<= {cutoff}) to {output}")
+    typer.echo(f"wrote {len(holdout):,} held-out rows (> {cutoff}) to {holdout_output}")
 
 
 @app.command("chart-macro")
 def chart_macro(
     macro_history_path: Path = typer.Option(
-        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-macro`."
+        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-fed-history`."
     ),
     scenario_dir: Path = typer.Option(
         DEFAULT_SCENARIO_DIR, "--scenario-dir", help="Output directory of `fetch-scenarios`."
@@ -355,9 +454,11 @@ def chart_macro(
         DEFAULT_CHARTS_DIR, "--output-dir", help="Where to write each variable's chart PNG."
     ),
 ) -> None:
-    """One PNG per macro variable: its full FRED history, with the Fed's
-    baseline and severely-adverse scenario paths appended, continuing
-    from the last actual quarter."""
+    """One PNG per macro variable (including the QoQ/YoY change columns
+    `fetch-fed-history`/`fetch-scenarios` add): its full history from the
+    Fed's own historic domestic actuals table, with the Fed's baseline and
+    severely-adverse scenario paths appended, continuing from the jump-off
+    quarter."""
     history = pd.read_parquet(macro_history_path)
     history["quarter"] = pd.PeriodIndex(history["quarter"].astype(str), freq="Q")
     history = history.set_index("quarter")
@@ -377,7 +478,7 @@ def chart_macro(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     for variable in history.columns:
-        safe_name = variable.replace(" ", "_").replace("/", "_")
+        safe_name = variable.replace(" ", "_").replace("/", "_").replace("%", "pct")
         chart_path = output_dir / f"{safe_name}.png"
         charts.render_macro_variable_chart(history, scenarios, variable, str(chart_path))
         typer.echo(f"wrote {chart_path}")
