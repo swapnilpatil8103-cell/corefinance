@@ -166,6 +166,31 @@ def test_normalize_scenario_parses_fed_date_format_and_drops_label_columns():
     assert normalized["Unemployment rate"].tolist() == [4.6, 4.6]
 
 
+def test_normalize_scenario_strips_the_fed_level_suffix_to_match_fred_history_names():
+    # Real gap this project hit: the Fed's own 2026 vintage CSV names four
+    # columns with a trailing " (Level)" ("Dow Jones Total Stock Market
+    # Index (Level)", "House Price Index (Level)", "Commercial Real
+    # Estate Price Index (Level)", "Market Volatility Index (Level)")
+    # that fred.FED_SCENARIO_VARIABLE_TO_FRED's keys don't carry --
+    # without stripping it, chart-macro/align_scenario_to_history can't
+    # find the matching FRED-history column at all (a real KeyError this
+    # test guards against).
+    raw = pd.DataFrame(
+        {
+            "Scenario Name": ["Supervisory Baseline"],
+            "Date": ["2026 Q1"],
+            "Dow Jones Total Stock Market Index (Level)": [68298.9],
+            "House Price Index (Level)": [324.7],
+            "Unemployment rate": [4.6],
+        }
+    )
+    normalized = macro.normalize_scenario(raw)
+    assert "Dow Jones Total Stock Market Index" in normalized.columns
+    assert "House Price Index" in normalized.columns
+    assert "Dow Jones Total Stock Market Index (Level)" not in normalized.columns
+    assert "Unemployment rate" in normalized.columns
+
+
 def test_assert_scenario_continues_from_history_passes_with_no_gap():
     history = pd.DataFrame(
         {"Unemployment rate": [4.5, 4.5]},
@@ -186,6 +211,92 @@ def test_assert_scenario_continues_from_history_raises_on_a_gap():
     )
     with pytest.raises(ValueError, match="expected"):
         macro.assert_scenario_continues_from_history(history, scenario)
+
+
+# ------------------------------------------------- scenario alignment ---
+
+
+def test_latest_complete_quarter_ignores_a_still_in_progress_trailing_quarter():
+    # A real gap this project hit: FRED already returns partial data (e.g.
+    # July/August) for a still-in-progress quarter (e.g. one ending in
+    # September), which would otherwise look like "the latest actual."
+    history = pd.DataFrame(
+        {"Unemployment rate": [4.2, 4.1]},
+        index=pd.PeriodIndex(["2026Q2", "2026Q3"], freq="Q"),
+    )
+    # "as_of" = August 15 2026 -- inside 2026Q3, which hasn't elapsed yet.
+    cutoff = macro.latest_complete_quarter(history, as_of=pd.Timestamp("2026-08-15"))
+    assert cutoff == pd.Period("2026Q2", freq="Q")
+
+
+def test_latest_complete_quarter_does_not_require_full_observation_counts():
+    # Real gap this project hit: FRED's real UNRATE has NO 2025-10-01
+    # observation at all (a genuine reporting gap), even though 2025Q4 is
+    # a long-elapsed, otherwise-complete quarter -- an observation-count
+    # threshold would wrongly treat this as "incomplete." Only the
+    # calendar (as_of well after the quarter's end) should decide.
+    history = pd.DataFrame(
+        {"Unemployment rate": [4.5]}, index=pd.PeriodIndex(["2025Q4"], freq="Q")
+    )
+    cutoff = macro.latest_complete_quarter(history, as_of=pd.Timestamp("2026-09-28"))
+    assert cutoff == pd.Period("2025Q4", freq="Q")
+
+
+def test_align_scenario_to_history_drops_scenario_quarters_actuals_now_cover():
+    # History now extends through 2026Q2 (actuals arrived after the
+    # scenario, published assuming actuals only through 2025Q4, was
+    # finalized) -- the scenario's own 2026Q1/2026Q2 rows must be dropped
+    # in favor of the real actuals, leaving only its genuinely-future rows.
+    history = pd.DataFrame(
+        {"Unemployment rate": [4.5, 4.4, 4.3, 4.2]},
+        index=pd.PeriodIndex(["2025Q3", "2025Q4", "2026Q1", "2026Q2"], freq="Q"),
+    )
+    scenario = pd.DataFrame(
+        {"Unemployment rate": [4.6, 4.6, 4.7, 4.7]},
+        index=pd.PeriodIndex(["2026Q1", "2026Q2", "2026Q3", "2026Q4"], freq="Q"),
+    )
+    truncated_history, truncated_scenario = macro.align_scenario_to_history(
+        history, scenario, as_of=pd.Timestamp("2026-09-28")
+    )
+    assert list(truncated_history.index) == [
+        pd.Period("2025Q3", freq="Q"),
+        pd.Period("2025Q4", freq="Q"),
+        pd.Period("2026Q1", freq="Q"),
+        pd.Period("2026Q2", freq="Q"),
+    ]
+    assert list(truncated_scenario.index) == [
+        pd.Period("2026Q3", freq="Q"),
+        pd.Period("2026Q4", freq="Q"),
+    ]
+
+
+def test_align_scenario_to_history_excludes_a_still_in_progress_history_quarter():
+    history = pd.DataFrame(
+        {"Unemployment rate": [4.2, 4.1]},
+        index=pd.PeriodIndex(["2026Q2", "2026Q3"], freq="Q"),
+    )
+    scenario = pd.DataFrame(
+        {"Unemployment rate": [4.5]}, index=pd.PeriodIndex(["2026Q3"], freq="Q")
+    )
+    truncated_history, truncated_scenario = macro.align_scenario_to_history(
+        history, scenario, as_of=pd.Timestamp("2026-08-15")
+    )
+    # 2026Q3 hasn't elapsed as of Aug 15 2026 -- dropped from history, and
+    # the scenario's own 2026Q3 row survives untouched (it's the first
+    # quarter after the real cutoff, 2026Q2).
+    assert list(truncated_history.index) == [pd.Period("2026Q2", freq="Q")]
+    assert list(truncated_scenario.index) == [pd.Period("2026Q3", freq="Q")]
+
+
+def test_align_scenario_to_history_still_raises_on_a_genuine_gap():
+    history = pd.DataFrame(
+        {"Unemployment rate": [4.5]}, index=pd.PeriodIndex(["2025Q3"], freq="Q")
+    )
+    scenario = pd.DataFrame(
+        {"Unemployment rate": [4.6]}, index=pd.PeriodIndex(["2026Q1"], freq="Q")
+    )
+    with pytest.raises(ValueError, match="expected"):
+        macro.align_scenario_to_history(history, scenario, as_of=pd.Timestamp("2026-09-28"))
 
 
 def test_assert_scenario_continues_from_history_raises_on_overlap():
@@ -333,3 +444,50 @@ def test_fred_history_and_scenario_share_the_same_units_for_every_variable():
     # (not e.g. history in decimal fraction and scenario in percent)
     assert 0 < history["Unemployment rate"].iloc[-1] < 20
     assert 0 < scenario["Unemployment rate"].iloc[0] < 20
+
+
+def test_real_fred_history_and_scenario_are_on_the_same_scale_for_exact_match_variables():
+    # Regression guard against a real bug this project hit: the Fed's own
+    # scenario CSV suffixes four column names with " (Level)"
+    # (normalize_scenario strips it), and one FRED series
+    # (COMREPUSQ159N, "Commercial Real Estate Price Index") turned out to
+    # be a year-over-year PERCENT CHANGE, not a level, on a completely
+    # different numeric scale from the Fed's own index (confirmed live
+    # via FRED's series metadata -- see fred.py's note on that mapping).
+    # This test uses the actual cached live pull (data/processed/
+    # macro_history.parquet + .../scenarios/baseline.parquet) to check
+    # every EXACT-MATCH variable's last actual and first scenario value
+    # are within a plausible order of magnitude of each other -- catching
+    # exactly the kind of unit/scale mismatch COMREPUSQ159N had, without
+    # asserting it for known-imperfect variables (is_exact_match=False),
+    # which this project already documents as not being scale-comparable.
+    from pathlib import Path
+
+    from corefin.credit.sources.fred import FED_SCENARIO_VARIABLE_TO_FRED
+
+    history_path = Path("data/processed/macro_history.parquet")
+    scenario_path = Path("data/processed/scenarios/baseline.parquet")
+    if not history_path.exists() or not scenario_path.exists():
+        pytest.skip("real cached macro history/scenario not present locally")
+
+    history = pd.read_parquet(history_path)
+    history["quarter"] = pd.PeriodIndex(history["quarter"].astype(str), freq="Q")
+    history = history.set_index("quarter")
+
+    scenario = pd.read_parquet(scenario_path)
+    scenario["quarter"] = pd.PeriodIndex(scenario["quarter"].astype(str), freq="Q")
+    scenario = scenario.set_index("quarter")
+
+    for variable, mapping in FED_SCENARIO_VARIABLE_TO_FRED.items():
+        if not mapping.is_exact_match:
+            continue
+        last_actual = history[variable].dropna().iloc[-1]
+        first_scenario = scenario[variable].dropna().iloc[0]
+        # same order of magnitude, not an exact match (real economic
+        # values move between the last actual and a projected scenario
+        # start) -- this only needs to catch a gross unit/scale mismatch.
+        ratio = abs(first_scenario) / max(abs(last_actual), 1e-6)
+        assert 0.1 < ratio < 10, (
+            f"{variable}: last actual={last_actual!r}, first scenario={first_scenario!r} "
+            "-- looks like a unit/scale mismatch, not normal quarter-to-quarter movement"
+        )

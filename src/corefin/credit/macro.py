@@ -104,12 +104,23 @@ def normalize_scenario(raw_scenario: pd.DataFrame) -> pd.DataFrame:
     columns exactly as published. Returns a wide DataFrame indexed by
     quarter (PeriodIndex, freq="Q"), variable columns only (Fed's own
     units, unchanged -- these ARE the Fed's units already, no FRED
-    unit conversion needed since the Fed defines these variables itself)."""
+    unit conversion needed since the Fed defines these variables itself).
+
+    Four of the Fed's own column names carry a trailing " (Level)" that
+    fred.FED_SCENARIO_VARIABLE_TO_FRED's keys don't -- confirmed live in
+    the real 2026 vintage CSV: "Dow Jones Total Stock Market Index
+    (Level)", "House Price Index (Level)", "Commercial Real Estate Price
+    Index (Level)", "Market Volatility Index (Level)". Stripped here so
+    scenario columns line up 1:1 with `build_fred_history_from_raw`'s
+    columns (both functions must agree on variable names for
+    `assert_scenario_continues_from_history` / charts to compare the
+    right series)."""
     quarters = pd.PeriodIndex(
         raw_scenario["Date"].str.replace(" ", "", regex=False), freq="Q"
     )
     variable_columns = [c for c in raw_scenario.columns if c not in ("Scenario Name", "Date")]
     normalized = raw_scenario[variable_columns].copy()
+    normalized = normalized.rename(columns=lambda c: c.removesuffix(" (Level)"))
     normalized.index = quarters
     normalized.index.name = "quarter"
     return normalized.sort_index()
@@ -131,6 +142,50 @@ def assert_scenario_continues_from_history(history: pd.DataFrame, scenario: pd.D
             f"scenario starts at {first_scenario}, expected {expected} "
             f"(one quarter after the last actual, {last_actual}) -- gap or overlap"
         )
+
+
+def latest_complete_quarter(history: pd.DataFrame, as_of: pd.Timestamp | None = None) -> pd.Period:
+    """The latest quarter in `history.index` that has fully ELAPSED as of
+    `as_of` (defaults to now) -- i.e. `as_of` is on or after that
+    quarter's end date. This is deliberately calendar-based, not a
+    data-completeness check on observation counts: a real gap this
+    project hit is that FRED can return a full-looking data point for a
+    STILL-IN-PROGRESS quarter (e.g. only July/August of a September-ending
+    quarter, silently averaged by `aggregate_fred_series_to_quarterly` as
+    if that were the whole quarter) while a genuinely elapsed, complete
+    quarter can ALSO be missing one series' observation for an unrelated
+    reason (verified: FRED's real UNRATE has no 2025-10-01 observation at
+    all -- a real reporting gap, not an in-progress quarter -- so an
+    observation-count threshold would have wrongly flagged an actual,
+    complete quarter as incomplete). Only the calendar tells the two
+    cases apart."""
+    as_of = as_of if as_of is not None else pd.Timestamp.now()
+    elapsed = history.index[history.index.map(lambda q: q.end_time) <= as_of]
+    if len(elapsed) == 0:
+        raise ValueError("no quarter in history has fully elapsed as of `as_of`")
+    return elapsed.max()
+
+
+def align_scenario_to_history(
+    history: pd.DataFrame, scenario: pd.DataFrame, as_of: pd.Timestamp | None = None
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Returns (truncated_history, truncated_scenario): `history` cut to
+    quarters through the latest fully-elapsed actual quarter (see
+    `latest_complete_quarter`), and `scenario` cut to quarters strictly
+    after it. The Fed fixes a scenario's starting point at publication
+    time; by the time this pipeline runs, real actuals may already exist
+    for quarters the scenario also covers (or `history` may include a
+    still-in-progress trailing quarter the scenario doesn't need to
+    account for) -- either way, actual data takes priority, and the
+    scenario is truncated to only the quarters actuals don't yet cover.
+    Raises (via `assert_scenario_continues_from_history`) if what remains
+    still has a gap -- i.e. the scenario doesn't reach far enough forward
+    to pick up immediately after the last complete actual quarter."""
+    cutoff = latest_complete_quarter(history, as_of)
+    truncated_history = history.loc[history.index <= cutoff]
+    truncated_scenario = scenario.loc[scenario.index > cutoff]
+    assert_scenario_continues_from_history(truncated_history, truncated_scenario)
+    return truncated_history, truncated_scenario
 
 
 def build_macro_chart_series(

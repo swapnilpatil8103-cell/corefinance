@@ -278,9 +278,14 @@ def fetch_scenarios(
 ) -> None:
     """Fetch the Fed's baseline and severely-adverse scenarios for
     `vintage`, normalize them to the same quarter-indexed/variable-name
-    shape `fetch-macro` produces, verify each starts exactly one quarter
-    after the macro history's last actual quarter (no gap, no overlap --
-    raises if not), and write both to `output_dir`. No key needed."""
+    shape `fetch-macro` produces, and align each to the macro history:
+    truncated to start immediately after the latest FULLY ELAPSED actual
+    quarter (see macro.align_scenario_to_history -- a scenario is fixed
+    at publication time, so by the time this runs, real actuals may
+    already cover some of the scenario's own quarters; those actuals take
+    priority and the overlapping scenario quarters are dropped). Raises
+    if what remains still has a gap. Writes both to `output_dir`. No key
+    needed."""
     history = pd.read_parquet(macro_history_path)
     history["quarter"] = pd.PeriodIndex(history["quarter"].astype(str), freq="Q")
     history = history.set_index("quarter")
@@ -290,12 +295,16 @@ def fetch_scenarios(
         typer.echo(f"{scenario_name}: fetching...")
         raw = fed_scenarios_source.fetch_scenario(scenario_name, vintage=vintage)
         normalized = macro.normalize_scenario(raw)
-        macro.assert_scenario_continues_from_history(history, normalized)
+        _, aligned = macro.align_scenario_to_history(history, normalized)
         path = output_dir / f"{scenario_name}.parquet"
-        normalized.reset_index().assign(quarter=lambda d: d["quarter"].astype(str)).to_parquet(
+        aligned.reset_index().assign(quarter=lambda d: d["quarter"].astype(str)).to_parquet(
             path, index=False
         )
-        typer.echo(f"{scenario_name}: continuity OK, wrote {len(normalized)} quarters to {path}")
+        dropped = len(normalized) - len(aligned)
+        typer.echo(
+            f"{scenario_name}: continuity OK ({dropped} already-actual scenario quarter(s) "
+            f"dropped), wrote {len(aligned)} quarters to {path}"
+        )
 
 
 @app.command("build-modeling-dataset")

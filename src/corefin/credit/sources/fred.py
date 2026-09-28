@@ -172,8 +172,16 @@ FED_SCENARIO_VARIABLE_TO_FRED: dict[str, FredSeriesMapping] = {
         "2005-01-01",
         "level",
         False,
-        "Only starts 2005 -- barely covers the 2007-2010 window with no pre-crisis lead-in; "
-        "may also differ in methodology from the Fed's own CRE index.",
+        "MORE SERIOUS than a methodology difference -- confirmed live via FRED's own series "
+        "metadata: COMREPUSQ159N's units are 'Percent Change from Year Ago' (NSA), NOT a "
+        "level -- real values run roughly -10 to +16, nothing like the Fed's own CRE Price "
+        "Index level (roughly 250-350 in the Fed's own scenario files). transform='level' "
+        "here means 'pass through unchanged,' NOT 'already on the Fed's index scale' -- this "
+        "column is NOT comparable in level terms to the Fed's own CRE index and should not "
+        "be charted/aligned against it as if it were (no freely-published CRE price LEVEL "
+        "series was found on FRED as of this check; only started 2005 either way, barely "
+        "covering the 2007-2010 window with no pre-crisis lead-in, and its own real history "
+        "stops at 2025Q2 with no more recent observations).",
     ),
     "Market Volatility Index": FredSeriesMapping("VIXCLS", "D", "1990-01-02", "level", True),
 }
