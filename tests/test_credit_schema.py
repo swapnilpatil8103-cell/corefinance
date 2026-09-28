@@ -96,20 +96,22 @@ def test_combined_consumer_series_covers_2001_through_present_continuously():
         assert len(matches) == 1, f"{combined} at {quarter}: {len(matches)} code sets match"
 
 
-def test_combined_consumer_series_post_2011_excludes_other_revolving_credit():
-    # RCON2011's own MDRM COMPARABILITY note defines it as
-    # SUM(RCONK137, RCONK207) exactly -- it does NOT include RCONB539
-    # ("other revolving credit plans"), even though OTHER_CONSUMER's own
-    # balance does (to match its RIADK205/K206 charge-off scope). The
-    # combined series must match RCON2011's real definition, not a naive
-    # "AUTO + OTHER_CONSUMER" union.
+def test_combined_consumer_series_post_2011_includes_other_revolving_credit():
+    # RCON2011's own MDRM COMPARABILITY note defines it as SUM(RCONK137,
+    # RCONK207) -- excluding RCONB539 ("other revolving credit plans") --
+    # but RIADK205's own MDRM Description covers RCONB539's scope too, so a
+    # combined balance built from RCON2011's derivation formula alone would
+    # mismatch its own charge-off item's scope (verified: real 2008Q4/2010Q4
+    # data showed zero-balance/nonzero-chargeoff rows this fix eliminates).
+    # The combined series must match the charge-off item's real scope, which
+    # makes it an EXACT union of AUTO + OTHER_CONSUMER, not RCON2011's own
+    # (narrower) derivation formula.
     (auto_code_set,) = CATEGORY_MDRM_CODES[LoanCategory.AUTO]
     (other_consumer_code_set,) = CATEGORY_MDRM_CODES[LoanCategory.OTHER_CONSUMER]
     combined_code_sets = CATEGORY_MDRM_CODES[LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED]
     post_2011 = next(cs for cs in combined_code_sets if cs.valid_from == "2011Q1")
 
-    assert set(post_2011.balance_items) == {"RCONK137", "RCONK207"}
-    assert "RCONB539" not in post_2011.balance_items
-    assert set(post_2011.balance_items) == set(auto_code_set.balance_items) | (
-        set(other_consumer_code_set.balance_items) - {"RCONB539"}
+    assert set(post_2011.balance_items) == {"RCONK137", "RCONK207", "RCONB539"}
+    assert set(post_2011.balance_items) == set(auto_code_set.balance_items) | set(
+        other_consumer_code_set.balance_items
     )

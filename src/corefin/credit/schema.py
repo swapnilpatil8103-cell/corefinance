@@ -439,7 +439,7 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
         MdrmCodeSet(
             valid_from="2001Q1",
             valid_to="2010Q4",
-            balance_items=("RCON2011",),
+            balance_items=("RCON2011", "RCONB539"),
             past_due_30_89_items=("RCONB578",),
             past_due_90_items=("RCONB579",),
             nonaccrual_items=("RCONB580",),
@@ -450,30 +450,47 @@ CATEGORY_MDRM_CODES: dict[LoanCategory, tuple[MdrmCodeSet, ...]] = {
             "'all other loans to individuals for household, family, and other "
             "personal expenditures' including automobiles and student loans -- an "
             "earlier version of this module misread its generic Item Name ('OTHER "
-            "LOANS') as an unrelated non-consumer catch-all; that was a real error.",
+            "LOANS') as an unrelated non-consumer catch-all; that was a real error. "
+            "RCONB539 (other revolving credit plans) was added to balance_items "
+            "after finding a real scope mismatch: RIADB516's own MDRM Description "
+            "states its charge-off scope covers 'all extensions of credit... other "
+            "than credit cards (as defined for Schedule RC-C, part I, items 6.b, "
+            "B539 AND 6.c, 2011)' -- i.e. the charge-off item was ALWAYS defined "
+            "over both balance lines, not RCON2011 alone. Verified against real "
+            "2008Q4 data: 17 bank-quarters showed a zero balance with a nonzero "
+            "RIADB516 charge-off using RCON2011 alone; adding RCONB539 resolved "
+            "all 17. RCONB578/B579/B580 (past-due/nonaccrual) have the identical "
+            "'items 6.b and 6.c' scope per their own MDRM Description, but there is "
+            "no separate RC-N item for RCONB539 to add (confirmed -- same gap as "
+            "OTHER_CONSUMER's own past-due/nonaccrual, which is partial for the "
+            "same reason).",
         ),
         MdrmCodeSet(
             valid_from="2011Q1",
             valid_to=None,
-            balance_items=("RCONK137", "RCONK207"),
+            balance_items=("RCONK137", "RCONK207", "RCONB539"),
             past_due_30_89_items=("RCONK213", "RCONK216"),
             past_due_90_items=("RCONK214", "RCONK217"),
             nonaccrual_items=("RCONK215", "RCONK218"),
             chargeoff_items=("RIADK129", "RIADK205"),
             recovery_items=("RIADK133", "RIADK206"),
-            note="Balance = RCONK137 + RCONK207 exactly, per MDRM's own "
-            "COMPARABILITY note for RCON2011: 'derived beginning 3/31/2011: "
-            "SUM(RCONK137, RCONK207)' -- confirming this is the true continuation "
-            "of the pre-2011 combined series, not a coincidental reconstruction. "
-            "NOTE this does NOT equal LoanCategory.AUTO + LoanCategory.OTHER_CONSUMER "
-            "summed: OTHER_CONSUMER's own balance also includes RCONB539 (other "
-            "revolving credit plans, needed there to match its RIADK205/K206 "
-            "charge-off scope), which RCON2011's official derivation formula "
-            "excludes. This code set's past-due/nonaccrual (K213+K216/K214+K217/"
-            "K215+K218) and charge-off/recovery (K129+K205/K133+K206) mirror that "
-            "same K137+K207-only scope, consistent with the balance. Overlaps (but "
-            "is not identical to) AUTO + OTHER_CONSUMER from this quarter onward -- "
-            "see module docstring.",
+            note="Balance = RCONK137 + RCONK207 + RCONB539 -- RCONB539 added for "
+            "the same reason as the pre-2011 code set above: RIADK205's own MDRM "
+            "Description explicitly covers 'single payment, installment, all "
+            "student loans, AND REVOLVING CREDIT PLANS OTHER THAN CREDIT CARDS' "
+            "(i.e. RCONB539's scope), so a charge-off there with only "
+            "RCONK137+RCONK207 as the denominator would still show a zero-balance "
+            "mismatch for banks whose consumer book is mostly RCONB539. This means "
+            "the balance here is now EXACTLY LoanCategory.AUTO's balance + "
+            "LoanCategory.OTHER_CONSUMER's balance summed (an earlier version of "
+            "this module's note claiming otherwise, based on RCON2011's OWN "
+            "COMPARABILITY note excluding RCONB539, was real but incomplete: "
+            "RCON2011's derivation formula and RIADB516/RIADK205's actual charge-off "
+            "scope disagree with each other in MDRM, and matching the charge-off "
+            "item's scope is what actually matters for a sensible NCO-rate "
+            "denominator). Still overlaps with (now IS equal to, not just "
+            "overlapping) AUTO + OTHER_CONSUMER from 2011Q1 onward -- see module "
+            "docstring; never sum this category alongside them.",
         ),
     ),
 }

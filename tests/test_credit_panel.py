@@ -279,6 +279,121 @@ def test_aggregate_balance_is_continuous_across_a_synthetic_code_switch():
     assert aggregate_after == pytest.approx(3000.0)
 
 
+# ------------------------------------------- combined consumer scope fix ---
+
+
+def test_combined_consumer_balance_includes_rconb539_pre_2011():
+    # RIADB516/B517's own MDRM Description covers both RCON2011 AND RCONB539
+    # ("items 6.b, B539 AND 6.c, 2011") -- the balance denominator must
+    # match that scope, not RCON2011 alone.
+    (code_set,) = [
+        cs
+        for cs in CATEGORY_MDRM_CODES[LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED]
+        if cs.covers(pd.Period("2008Q4", freq="Q"))
+    ]
+    assert set(code_set.balance_items) == {"RCON2011", "RCONB539"}
+    item_frame = pd.DataFrame(
+        {
+            "RCON2011": [800.0],
+            "RCONB539": [200.0],
+            "RCONB578": [0.0],
+            "RCONB579": [0.0],
+            "RCONB580": [0.0],
+            "RIADB516": [50.0],
+            "RIADB517": [10.0],
+        }
+    )
+    quarters = _quarters(["2008Q4"])
+    mapped = panel.apply_category_mapping(
+        item_frame, LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED, quarters
+    )
+    assert mapped["balance"].iloc[0] == pytest.approx(1000.0)
+
+
+def test_combined_consumer_balance_includes_rconb539_post_2011_and_equals_auto_plus_other():
+    (code_set,) = [
+        cs
+        for cs in CATEGORY_MDRM_CODES[LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED]
+        if cs.covers(pd.Period("2012Q4", freq="Q"))
+    ]
+    assert set(code_set.balance_items) == {"RCONK137", "RCONK207", "RCONB539"}
+    item_frame = pd.DataFrame(
+        {
+            "RCONK137": [500.0],
+            "RCONK207": [300.0],
+            "RCONB539": [200.0],
+            "RCONK213": [0.0],
+            "RCONK216": [0.0],
+            "RCONK214": [0.0],
+            "RCONK217": [0.0],
+            "RCONK215": [0.0],
+            "RCONK218": [0.0],
+            "RIADK129": [0.0],
+            "RIADK205": [0.0],
+            "RIADK133": [0.0],
+            "RIADK206": [0.0],
+        }
+    )
+    quarters = _quarters(["2012Q4"])
+    combined = panel.apply_category_mapping(
+        item_frame, LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED, quarters
+    )
+    auto = panel.apply_category_mapping(item_frame, LoanCategory.AUTO, quarters)
+    other_consumer = panel.apply_category_mapping(item_frame, LoanCategory.OTHER_CONSUMER, quarters)
+    assert combined["balance"].iloc[0] == pytest.approx(1000.0)
+    assert combined["balance"].iloc[0] == pytest.approx(
+        auto["balance"].iloc[0] + other_consumer["balance"].iloc[0]
+    )
+
+
+def test_real_2008q4_combined_consumer_has_no_zero_balance_with_material_chargeoff():
+    # Regression guard for the real bug this fix resolves: verified against
+    # real 2008Q4 bulk data that adding RCONB539 eliminates 17 bank-quarters
+    # that showed a zero balance alongside a nonzero RIADB516 charge-off
+    # when only RCON2011 was summed.
+    zip_path = Path("data/raw/ffiec/12-31-2008.zip")
+    if not zip_path.exists():
+        pytest.skip("real 2008Q4 bulk ZIP not cached locally")
+    item_frame, _ = ffiec_parse.parse_bulk_zip(zip_path.read_bytes(), pd.Period("2008Q4", freq="Q"))
+    mapped = panel.apply_category_mapping(
+        item_frame, LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED, item_frame["quarter"]
+    )
+    zero_balance_with_chargeoff = (mapped["balance"] == 0) & (mapped["chargeoff_ytd"] > 0)
+    assert zero_balance_with_chargeoff.sum() == 0
+
+
+def test_real_2010q4_combined_consumer_zero_balance_with_chargeoff_drops_after_fix():
+    # Regression guard: verified against real 2010Q4 bulk data that adding
+    # RCONB539 drops the zero-balance/material-chargeoff count from 22 to 4
+    # (the residual 4 are unrelated data-quality gaps, not this scope bug).
+    zip_path = Path("data/raw/ffiec/12-31-2010.zip")
+    if not zip_path.exists():
+        pytest.skip("real 2010Q4 bulk ZIP not cached locally")
+    item_frame, _ = ffiec_parse.parse_bulk_zip(zip_path.read_bytes(), pd.Period("2010Q4", freq="Q"))
+    mapped = panel.apply_category_mapping(
+        item_frame, LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED, item_frame["quarter"]
+    )
+    zero_balance_with_chargeoff = (mapped["balance"] == 0) & (mapped["chargeoff_ytd"] > 0)
+    assert zero_balance_with_chargeoff.sum() <= 4
+
+
+def test_real_2012q4_combined_consumer_has_no_rcon2011_and_uses_post_2011_code_set():
+    # RCON2011 is fully retired by 2012Q4 (confirmed empirically: it is
+    # either absent or entirely null) -- this quarter must resolve entirely
+    # via the post-2011 RCONK137+RCONK207+RCONB539 code set, with no
+    # meaningful zero-balance/material-chargeoff residue.
+    zip_path = Path("data/raw/ffiec/12-31-2012.zip")
+    if not zip_path.exists():
+        pytest.skip("real 2012Q4 bulk ZIP not cached locally")
+    item_frame, _ = ffiec_parse.parse_bulk_zip(zip_path.read_bytes(), pd.Period("2012Q4", freq="Q"))
+    assert "RCON2011" not in item_frame.columns or item_frame["RCON2011"].notna().sum() == 0
+    mapped = panel.apply_category_mapping(
+        item_frame, LoanCategory.AUTO_AND_OTHER_CONSUMER_COMBINED, item_frame["quarter"]
+    )
+    zero_balance_with_chargeoff = (mapped["balance"] == 0) & (mapped["chargeoff_ytd"] > 0)
+    assert zero_balance_with_chargeoff.sum() <= 6
+
+
 # --------------------------------------------------------- RCFD fallback ---
 
 
