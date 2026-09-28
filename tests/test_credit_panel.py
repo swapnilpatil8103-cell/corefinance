@@ -289,11 +289,21 @@ def test_rcfd_fallback_applies_when_rcon_is_missing_or_zero():
     # row 0: RCON present and nonzero -> keep RCON.
     # row 1: RCON missing -> use RCFD.
     # row 2: RCON exactly zero (the bank 476810 case) -> use RCFD.
-    # row 3: RCON zero AND no RCFD available -> stays missing.
+    # row 3: RCON zero AND no RCFD available -> a GENUINE zero (e.g. a bank
+    #   that just doesn't issue credit cards) -- must stay 0, NOT become
+    #   NaN (a real bug this test now guards against: it cratered
+    #   credit_card's real-data coverage from ~100% to ~18%).
     assert resolved.iloc[0] == pytest.approx(100.0)
     assert resolved.iloc[1] == pytest.approx(999.0)
     assert resolved.iloc[2] == pytest.approx(999.0)
-    assert pd.isna(resolved.iloc[3])
+    assert resolved.iloc[3] == pytest.approx(0.0)
+
+
+def test_rcfd_fallback_missing_rcon_with_no_rcfd_stays_missing():
+    rcon = pd.Series([np.nan])
+    rcfd = pd.Series([np.nan])
+    resolved = panel.apply_rcfd_fallback(rcon, rcfd)
+    assert pd.isna(resolved.iloc[0])
 
 
 def test_category_mapping_applies_rcfd_fallback_for_a_zero_balance(monkeypatch):

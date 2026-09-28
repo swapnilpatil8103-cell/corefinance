@@ -229,11 +229,22 @@ def apply_rcfd_fallback(rcon_balance: pd.Series, rcfd_balance: pd.Series) -> pd.
     quarters (2010Q2-2011Q2) while RCFDB538 (consolidated) shows real,
     substantial values ($35-37B); treating a reported zero as equivalent
     to missing (rather than a genuine zero-balance bank) catches this.
-    No reporting-form check is needed: FFIEC 041/051 filers have no
-    foreign offices, so their RCFD columns are naturally absent/NaN
-    regardless of filer type, making the fallback a no-op for them
-    without needing to know which form they filed."""
-    use_fallback = rcon_balance.isna() | (rcon_balance == 0)
+
+    The fallback only actually fires when `rcfd_balance` itself has a
+    real (non-NaN) value -- otherwise `rcon_balance` is returned as-is,
+    zero included. This matters: a genuine zero (e.g. a small community
+    bank that simply doesn't issue credit cards, the overwhelming
+    majority of banks for that category) must NOT turn into NaN just
+    because there's no RCFD figure to check it against -- that was a
+    real bug caught against real data, which cratered credit_card's
+    reported coverage from ~100% to ~18% before this guard was added.
+    No reporting-form check is needed beyond that: FFIEC 041/051 filers
+    have no foreign offices, so their RCFD columns are naturally absent/
+    NaN regardless of filer type, which this guard already handles
+    correctly (fallback never fires for them) without needing to know
+    which form they filed."""
+    rcon_is_suspect = rcon_balance.isna() | (rcon_balance == 0)
+    use_fallback = rcon_is_suspect & rcfd_balance.notna()
     return rcon_balance.where(~use_fallback, rcfd_balance)
 
 
