@@ -54,6 +54,16 @@ VALIDATION_WINDOWS: tuple[tuple[str, pd.Period, pd.Period, pd.Period], ...] = (
 
 HOLDOUT_TRAIN_END = pd.Period("2025Q4", freq="Q")
 
+# Some categories have a real, documented coverage gap (e.g. AUTO has no
+# code set before 2011Q1 -- see schema.py), so a validation window whose
+# training period predates a category's own start has no data to fit on
+# at all. Skip (not crash) a window when its training slice has fewer
+# than this many quarters of industry-level data -- an AR term alone
+# needs at least 2 just to have one non-NaN lagged observation; this is a
+# generous floor above that, not a tight one, since a handful of
+# quarters would fit but not mean anything.
+MIN_TRAINING_QUARTERS = 8
+
 
 def add_npl_ratio_columns(dataset: pd.DataFrame) -> pd.DataFrame:
     """Adds "npl_ratio" (panel.compute_npl_ratio) and its winsorized
@@ -146,7 +156,12 @@ def run_category_backtests(
     (VALIDATION_WINDOWS) for one category/dependent/covid_spec, using
     ONLY the training dataset (quarter <= 2025Q4) -- the holdout window
     is separate, see `run_holdout_backtest`. Returns {window_label ->
-    `_run_three_families`'s result dict}."""
+    `_run_three_families`'s result dict}, OMITTING any window whose
+    training slice has fewer than MIN_TRAINING_QUARTERS of data or whose
+    test slice is entirely empty -- a real, expected situation for a
+    category with a documented start-date gap (e.g. AUTO has no data
+    before 2011Q1, so the 2006Q4-training/2007-2010 window has nothing to
+    fit or score for it), not an error to raise on."""
     industry_series_full = models.build_industry_series(
         category_bank_dataset, dependent_column
     ).frame
@@ -156,6 +171,8 @@ def run_category_backtests(
         train_bank, test_bank = validation.split_out_of_time(
             category_bank_dataset, train_end, test_start, test_end
         )
+        if len(train_industry) < MIN_TRAINING_QUARTERS or test_bank.empty:
+            continue
         results[label] = _run_three_families(
             industry_series_full,
             train_industry,
@@ -174,16 +191,22 @@ def run_holdout_backtest(
     category_holdout_dataset: pd.DataFrame,
     dependent_column: str,
     covid_spec: str,
-) -> dict:
+) -> dict | None:
     """Fits on the FULL training history (quarter <= HOLDOUT_TRAIN_END,
     2025Q4) and scores against the real, already-known 2026Q1-Q2 holdout
     panel quarters build-modeling-dataset set aside -- this is the ONE
     window where "main" (pandemic dummy) and "robustness" (drop
     2020-2021 from training) genuinely differ, since it's the only
-    training window that spans 2020-2021 at all."""
+    training window that spans 2020-2021 at all. Returns None (same
+    reasoning as `run_category_backtests`) if there isn't enough training
+    or holdout data for this category to fit and score at all."""
+    if category_holdout_dataset.empty:
+        return None
     combined = pd.concat([category_train_dataset, category_holdout_dataset], ignore_index=True)
     industry_series_full = models.build_industry_series(combined, dependent_column).frame
     train_industry = industry_series_full[industry_series_full["quarter"] <= HOLDOUT_TRAIN_END]
+    if len(train_industry) < MIN_TRAINING_QUARTERS:
+        return None
 
     test_start = category_holdout_dataset["quarter"].min()
     test_end = category_holdout_dataset["quarter"].max()

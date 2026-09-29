@@ -623,6 +623,13 @@ def fit_models(
                     holdout_results = backtest.run_holdout_backtest(
                         category_train, category_holdout, dep_column, covid_spec
                     )
+                    if holdout_results is None:
+                        typer.echo(
+                            f"  {dep_label} / {covid_spec}: not enough training data -- "
+                            "skipping 2026 holdout",
+                            err=True,
+                        )
+                        continue
                     for family, result in holdout_results.items():
                         _record_family_result(
                             category,

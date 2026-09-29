@@ -81,6 +81,36 @@ def test_run_category_backtests_covers_both_windows_and_all_three_families():
             assert family_result["metrics"]["n"] > 0
 
 
+def test_run_category_backtests_skips_a_window_with_no_training_data():
+    # Real situation this guards against: AUTO has no data before
+    # 2011Q1 (a documented gap in schema.py), so the 2006Q4-training/
+    # 2007-2010 window has nothing to fit -- it must be OMITTED from the
+    # results, not crash the whole sweep with an empty-design-matrix error.
+    # covers 2015Q1..2022Q4
+    dataset = _synthetic_category_dataset(start="2015Q1", n_quarters=32, n_banks=8)
+    results = backtest.run_category_backtests(dataset, "winsorized_nco_rate", covid_spec="main")
+    assert "2007-2010" not in results
+    assert "2020-2021" in results
+
+
+def test_run_holdout_backtest_returns_none_with_insufficient_training_data():
+    train_dataset = _synthetic_category_dataset(start="2025Q1", n_quarters=4, n_banks=8)
+    holdout_dataset = _synthetic_category_dataset(start="2026Q1", n_quarters=2, n_banks=8, seed=2)
+    result = backtest.run_holdout_backtest(
+        train_dataset, holdout_dataset, "winsorized_nco_rate", covid_spec="main"
+    )
+    assert result is None
+
+
+def test_run_holdout_backtest_returns_none_with_empty_holdout():
+    train_dataset = _synthetic_category_dataset(start="2019Q1", n_quarters=28, n_banks=8)
+    empty_holdout = train_dataset.iloc[0:0]
+    result = backtest.run_holdout_backtest(
+        train_dataset, empty_holdout, "winsorized_nco_rate", covid_spec="main"
+    )
+    assert result is None
+
+
 def test_main_and_robustness_are_identical_for_pre_covid_validation_windows():
     # Documented consequence of the design: neither validation window's
     # TRAINING period reaches 2020-2021, so the robustness treatment
