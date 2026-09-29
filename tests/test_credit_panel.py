@@ -807,6 +807,59 @@ def test_winsorize_nco_rates_excludes_rows_below_min_balance_from_bounds_and_out
     assert winsorized.iloc[:4].max() <= 0.04
 
 
+def test_winsorize_rate_generalizes_to_an_arbitrary_column():
+    panel_frame = pd.DataFrame(
+        {
+            "category": [LoanCategory.CI] * 100,
+            "npl_ratio": [0.01] * 98 + [-5.0, 50.0],  # two extreme outliers
+            "average_balance": [1_000_000.0] * 100,
+        }
+    )
+    winsorized = panel.winsorize_rate(
+        panel_frame, "npl_ratio", lower_quantile=0.01, upper_quantile=0.99
+    )
+    assert winsorized.max() < 50.0
+    assert winsorized.min() > -5.0
+    assert np.allclose(winsorized.iloc[:98].to_numpy(), 0.01)
+
+
+def test_winsorize_nco_rates_matches_winsorize_rate_on_annualized_nco_rate():
+    panel_frame = pd.DataFrame(
+        {
+            "category": [LoanCategory.CI] * 5,
+            "annualized_nco_rate": [0.01, 0.02, 0.03, 0.04, 100.0],
+            "average_balance": [1_000_000.0] * 5,
+        }
+    )
+    via_specific = panel.winsorize_nco_rates(panel_frame)
+    via_generic = panel.winsorize_rate(panel_frame, "annualized_nco_rate")
+    pd.testing.assert_series_equal(via_specific, via_generic)
+
+
+def test_compute_npl_ratio_sums_past_due_90_and_nonaccrual_over_balance():
+    panel_frame = pd.DataFrame(
+        {
+            "balance": [1000.0, 2000.0],
+            "past_due_90": [10.0, 40.0],
+            "nonaccrual": [20.0, 60.0],
+        }
+    )
+    npl = panel.compute_npl_ratio(panel_frame)
+    assert npl.tolist() == pytest.approx([0.03, 0.05])
+
+
+def test_compute_npl_ratio_is_nan_for_zero_or_negative_balance():
+    panel_frame = pd.DataFrame(
+        {
+            "balance": [0.0, -5.0, np.nan],
+            "past_due_90": [1.0, 1.0, 1.0],
+            "nonaccrual": [0.0, 0.0, 0.0],
+        }
+    )
+    npl = panel.compute_npl_ratio(panel_frame)
+    assert npl.isna().all()
+
+
 def test_flag_chargeoff_gaps_detects_a_missing_quarter_in_the_window():
     industry_report = pd.DataFrame(
         {

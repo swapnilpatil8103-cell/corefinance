@@ -605,30 +605,44 @@ def build_industry_nco_rate_report(
     return agg.sort_values(["category", "quarter"]).reset_index(drop=True)
 
 
-def winsorize_nco_rates(
+def compute_npl_ratio(panel: pd.DataFrame) -> pd.Series:
+    """panel: long-format frame with "past_due_90", "nonaccrual", and
+    "balance" columns (as produced by `build_panel`). Returns the
+    non-performing-loan ratio -- (past_due_90 + nonaccrual) / balance --
+    per bank-quarter-category row, a point-in-time stock ratio (unlike
+    annualized_nco_rate, a flow rate, this needs no annualization). NaN
+    where balance is zero, negative, or missing, rather than a spurious
+    +/-inf from dividing by zero."""
+    numerator = panel["past_due_90"] + panel["nonaccrual"]
+    balance = panel["balance"].to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(balance > 0, numerator.to_numpy() / balance, np.nan)
+    return pd.Series(ratio, index=panel.index)
+
+
+def winsorize_rate(
     panel: pd.DataFrame,
+    rate_column: str,
     lower_quantile: float = 0.01,
     upper_quantile: float = 0.99,
     min_balance: float | None = None,
 ) -> pd.Series:
     """panel: long-format frame (as produced by `build_panel`) with
-    columns "category" and "annualized_nco_rate". Returns a new Series,
-    aligned to `panel`'s index, with each category's OWN bank-level
-    annualized_nco_rate values clipped to that category's
-    [lower_quantile, upper_quantile] percentile range (1st/99th by
-    default) -- a handful of extreme bank-quarter rates (a tiny book with
-    one large charge-off, a data anomaly) can otherwise dominate a
-    model fit that a rate-clipped view wouldn't be as sensitive to. This
-    does NOT modify `panel` -- the raw, unclipped annualized_nco_rate
-    column stays as-is; assign this Series to a NEW column (e.g.
-    `panel["annualized_nco_rate_winsorized"] = winsorize_nco_rates(panel)`)
-    if you want both side by side. `min_balance` (optional): rows with
-    average_balance below this are excluded from BOTH the percentile
-    calculation and the returned values (NaN there instead) -- matches
-    `build_industry_nco_rate_report`'s own min_balance filter, so the
-    same near-zero-balance outliers don't distort either the industry
-    rate or the winsorization bounds."""
-    rates = panel["annualized_nco_rate"].copy()
+    columns "category" and `rate_column`. Returns a new Series, aligned to
+    `panel`'s index, with each category's OWN bank-level `rate_column`
+    values clipped to that category's [lower_quantile, upper_quantile]
+    percentile range (1st/99th by default) -- a handful of extreme
+    bank-quarter rates (a tiny book with one large charge-off or
+    delinquency, a data anomaly) can otherwise dominate a model fit that a
+    rate-clipped view wouldn't be as sensitive to. This does NOT modify
+    `panel` -- the raw, unclipped column stays as-is; assign this Series
+    to a NEW column if you want both side by side. `min_balance`
+    (optional): rows with average_balance below this are excluded from
+    BOTH the percentile calculation and the returned values (NaN there
+    instead) -- matches `build_industry_nco_rate_report`'s own
+    min_balance filter, so the same near-zero-balance outliers don't
+    distort either the industry rate or the winsorization bounds."""
+    rates = panel[rate_column].copy()
     if min_balance is not None:
         rates = rates.where(panel["average_balance"] >= min_balance)
 
@@ -640,6 +654,24 @@ def winsorize_nco_rates(
         return s.clip(lo, hi)
 
     return rates.groupby(panel["category"], observed=True).transform(_clip_group)
+
+
+def winsorize_nco_rates(
+    panel: pd.DataFrame,
+    lower_quantile: float = 0.01,
+    upper_quantile: float = 0.99,
+    min_balance: float | None = None,
+) -> pd.Series:
+    """`winsorize_rate` specialized to "annualized_nco_rate" -- see that
+    function for the full docstring; kept as its own name since it's this
+    project's most-used case."""
+    return winsorize_rate(
+        panel,
+        "annualized_nco_rate",
+        lower_quantile=lower_quantile,
+        upper_quantile=upper_quantile,
+        min_balance=min_balance,
+    )
 
 
 def flag_chargeoff_gaps(
