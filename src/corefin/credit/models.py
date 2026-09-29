@@ -232,8 +232,16 @@ def forecast_aggregate_dynamic(
 
 
 def _add_bank_characteristics(bank_dataset: pd.DataFrame) -> pd.DataFrame:
+    """Adds "log_balance" (the one bank characteristic) and "pandemic"
+    (computed here, not required of callers -- `fit_panel_fe_model`/
+    `fit_gbm_model`/their predict counterparts all reference a "pandemic"
+    column via `_macro_feature_columns`, so it must exist on every
+    bank-level frame passed to them; only `build_industry_series` adds it
+    for the industry-level frame itself, which doesn't go through this
+    function)."""
     result = bank_dataset.copy()
     result["log_balance"] = np.log(result["average_balance"].clip(lower=1.0))
+    result["pandemic"] = add_pandemic_indicator(result)
     return result
 
 

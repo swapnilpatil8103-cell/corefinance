@@ -1,0 +1,127 @@
+"""Offline integration tests for the Stage 4 sweep orchestration
+(backtest.py) -- verifies the wiring between models.py/validation.py
+across categories/dependents/COVID specs on synthetic data. The deep
+per-function behavior (no leakage, sign recovery, metric correctness) is
+already covered by test_credit_models.py/test_credit_validation.py; these
+tests check the orchestration layer itself doesn't break, and that the
+documented main-vs-robustness equivalence for pre-COVID windows holds."""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from corefin.credit import backtest, models
+
+
+def _synthetic_category_dataset(start="2001Q1", n_quarters=84, n_banks=8, seed=1) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    quarters = pd.period_range(pd.Period(start, freq="Q"), periods=n_quarters, freq="Q")
+
+    unemployment = 5.0 + np.cumsum(rng.normal(0, 0.2, size=n_quarters))
+    hpi_yoy = 2.0 + np.cumsum(rng.normal(0, 0.3, size=n_quarters))
+    cre_yoy = 2.0 + np.cumsum(rng.normal(0, 0.3, size=n_quarters))
+    stock_yoy = 4.0 + np.cumsum(rng.normal(0, 0.4, size=n_quarters))
+
+    bank_effect = rng.normal(0, 0.004, size=n_banks)
+
+    rows = []
+    for bank_idx in range(n_banks):
+        base_balance = rng.uniform(5_000.0, 50_000.0)
+        for q_idx, quarter in enumerate(quarters):
+            true_nco = max(
+                0.01
+                + 0.0015 * unemployment[q_idx]
+                - 0.001 * hpi_yoy[q_idx]
+                + bank_effect[bank_idx]
+                + rng.normal(0, 0.0004),
+                -0.05,
+            )
+            balance = base_balance * (1.0 + rng.normal(0, 0.02))
+            past_due_90 = max(balance * 0.01 + rng.normal(0, 1.0), 0.0)
+            nonaccrual = max(balance * 0.005 + rng.normal(0, 0.5), 0.0)
+            rows.append(
+                {
+                    "bank_id": bank_idx,
+                    "quarter": quarter,
+                    "category": "commercial_and_industrial",
+                    "average_balance": balance,
+                    "balance": balance,
+                    "past_due_90": past_due_90,
+                    "nonaccrual": nonaccrual,
+                    "winsorized_nco_rate": true_nco,
+                    "merger_flag": False,
+                    models.feature_column("Unemployment rate"): unemployment[q_idx],
+                    models.feature_column("House Price Index YoY % change"): hpi_yoy[q_idx],
+                    models.feature_column(
+                        "Commercial Real Estate Price Index YoY % change"
+                    ): cre_yoy[q_idx],
+                    models.feature_column(
+                        "Dow Jones Total Stock Market Index YoY % change"
+                    ): stock_yoy[q_idx],
+                }
+            )
+    return backtest.add_npl_ratio_columns(pd.DataFrame(rows))
+
+
+def test_add_npl_ratio_columns_adds_both_columns():
+    dataset = _synthetic_category_dataset(n_quarters=4, n_banks=2)
+    assert "npl_ratio" in dataset.columns
+    assert "winsorized_npl_ratio" in dataset.columns
+
+
+def test_run_category_backtests_covers_both_windows_and_all_three_families():
+    dataset = _synthetic_category_dataset(n_quarters=84, n_banks=8)  # 2001Q1..2021Q4
+    results = backtest.run_category_backtests(dataset, "winsorized_nco_rate", covid_spec="main")
+    assert set(results) == {"2007-2010", "2020-2021"}
+    for window_result in results.values():
+        assert set(window_result) == {"aggregate_ar", "panel_fe", "gbm"}
+        for family_result in window_result.values():
+            assert family_result["metrics"]["n"] > 0
+
+
+def test_main_and_robustness_are_identical_for_pre_covid_validation_windows():
+    # Documented consequence of the design: neither validation window's
+    # TRAINING period reaches 2020-2021, so the robustness treatment
+    # (drop 2020-2021 from training) is a no-op for both, and the
+    # pandemic dummy (main) is always 0 in both training samples too --
+    # the two specs must produce numerically identical backtests here.
+    dataset = _synthetic_category_dataset(n_quarters=84, n_banks=8)
+    main_results = backtest.run_category_backtests(
+        dataset, "winsorized_nco_rate", covid_spec="main"
+    )
+    robustness_results = backtest.run_category_backtests(
+        dataset, "winsorized_nco_rate", covid_spec="robustness"
+    )
+    for window_label in main_results:
+        main_metrics = main_results[window_label]["aggregate_ar"]["metrics"]
+        robustness_metrics = robustness_results[window_label]["aggregate_ar"]["metrics"]
+        assert main_metrics["rmse"] == pytest.approx(robustness_metrics["rmse"])
+
+
+def test_run_holdout_backtest_main_and_robustness_can_differ():
+    # The holdout fit's training window (through 2025Q4) DOES span
+    # 2020-2021 -- this is the one place main vs robustness should be
+    # free to disagree (not required to, but the sweep must at least run
+    # both without erroring, and it's a real possibility, not always
+    # forced to coincide the way the two backtest windows are).
+    # covers 2019Q1..2025Q4
+    train_dataset = _synthetic_category_dataset(start="2019Q1", n_quarters=28, n_banks=8)
+    holdout_dataset = _synthetic_category_dataset(start="2026Q1", n_quarters=2, n_banks=8, seed=2)
+    main_result = backtest.run_holdout_backtest(
+        train_dataset, holdout_dataset, "winsorized_nco_rate", covid_spec="main"
+    )
+    robustness_result = backtest.run_holdout_backtest(
+        train_dataset, holdout_dataset, "winsorized_nco_rate", covid_spec="robustness"
+    )
+    assert main_result["aggregate_ar"]["metrics"]["n"] > 0
+    assert robustness_result["aggregate_ar"]["metrics"]["n"] > 0
+    # robustness trained on fewer rows (2020-2021 dropped) -- coefficients
+    # need not be identical (they're allowed to differ; just confirm the
+    # pipeline ran both specs distinctly, not that it silently reused one
+    # fit for both).
+    main_coefs = main_result["aggregate_ar"]["coefficients"]
+    robustness_coefs = robustness_result["aggregate_ar"]["coefficients"]
+    assert "pandemic" in main_coefs
+    assert "pandemic" not in robustness_coefs
