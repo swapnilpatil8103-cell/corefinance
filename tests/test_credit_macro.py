@@ -238,7 +238,28 @@ def test_build_macro_chart_series_labels_actual_and_each_scenario():
         history, {"baseline": baseline, "severely_adverse": severely_adverse}, "Unemployment rate"
     )
     assert set(chart_series["series"]) == {"actual", "baseline", "severely_adverse"}
-    assert len(chart_series) == 3
+    # 1 actual row + (1 prepended last-actual point + 1 own row) per scenario
+    assert len(chart_series) == 5
+
+
+def test_build_macro_chart_series_scenario_lines_start_from_the_last_actual():
+    # No visual gap at the history/scenario boundary: each scenario's
+    # first plotted point must be the last actual quarter's own value,
+    # not the scenario's own first (later) quarter in isolation.
+    history = pd.DataFrame(
+        {"Unemployment rate": [4.4, 4.5]}, index=pd.PeriodIndex(["2025Q3", "2025Q4"], freq="Q")
+    )
+    baseline = pd.DataFrame(
+        {"Unemployment rate": [4.6, 4.7]}, index=pd.PeriodIndex(["2026Q1", "2026Q2"], freq="Q")
+    )
+    chart_series = macro.build_macro_chart_series(
+        history, {"baseline": baseline}, "Unemployment rate"
+    )
+    baseline_rows = chart_series[chart_series["series"] == "baseline"].reset_index(drop=True)
+    assert baseline_rows.loc[0, "quarter"] == pd.Period("2025Q4", freq="Q")
+    assert baseline_rows.loc[0, "value"] == pytest.approx(4.5)
+    assert baseline_rows.loc[1, "quarter"] == pd.Period("2026Q1", freq="Q")
+    assert baseline_rows.loc[1, "value"] == pytest.approx(4.6)
 
 
 # ---------------------------------------------------- modeling dataset ---

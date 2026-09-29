@@ -13,7 +13,8 @@ proxy series (aggregated to quarterly, transformed -- see
 approach hit a real, verified problem on the full real build: FOUR of the
 16 Fed scenario variables have NO exact FRED equivalent and are on a
 DIFFERENT NUMERIC SCALE from the Fed's own scenario values --
-House Price Index (FRED's FHFA-based proxy ~720 vs the Fed's own ~273),
+House Price Index (FRED's FHFA-based proxy ~720 vs the Fed's own ~323
+(2025Q4 actual jump-off value)),
 the Dow Jones Total Stock Market Index (NASDAQ proxy ~26,100 vs the Fed's
 own ~67,500), Commercial Real Estate Price Index (FRED's COMREPUSQ159N is
 literally a year-over-year PERCENT CHANGE, not a level, confirmed via
@@ -282,6 +283,10 @@ def build_macro_chart_series(
     with each named scenario (e.g. {"baseline": ..., "severely_adverse":
     ...}) appended, continuing from the last actual quarter. Columns:
     "quarter" (Period), "series" ("actual" or a scenario name), "value".
+    Each scenario's own points are PREPENDED with the last actual
+    quarter's own (quarter, value) -- purely for drawing a connected line
+    with no visual gap at the history/scenario boundary; it does not
+    change `history` or add a real data point to the scenario itself.
     Does not itself validate continuity -- call
     `assert_scenario_continues_from_history` first."""
     frames = [
@@ -289,12 +294,12 @@ def build_macro_chart_series(
             {"quarter": history.index, "series": "actual", "value": history[variable].to_numpy()}
         )
     ]
+    last_actual_quarter = history.index.max()
+    last_actual_value = history.loc[last_actual_quarter, variable]
     for name, scenario in scenarios.items():
-        frames.append(
-            pd.DataFrame(
-                {"quarter": scenario.index, "series": name, "value": scenario[variable].to_numpy()}
-            )
-        )
+        quarters = [last_actual_quarter, *scenario.index]
+        values = [last_actual_value, *scenario[variable].to_numpy()]
+        frames.append(pd.DataFrame({"quarter": quarters, "series": name, "value": values}))
     return pd.concat(frames, ignore_index=True)
 
 
