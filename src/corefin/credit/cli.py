@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 import typer
 
-from corefin.credit import charts, macro
+from corefin.credit import backtest, charts, macro, models
 from corefin.credit.panel import build_industry_nco_rate_report, build_panel, flag_chargeoff_gaps
 from corefin.credit.schema import LoanCategory
 from corefin.credit.sources import fed_scenarios as fed_scenarios_source
@@ -29,6 +29,7 @@ DEFAULT_MODELING_DATASET_PATH = Path("data/processed/modeling_dataset.parquet")
 DEFAULT_MODELING_DATASET_HOLDOUT_PATH = Path("data/processed/modeling_dataset_holdout.parquet")
 DEFAULT_CHARTS_DIR = Path("data/processed/charts")
 DEFAULT_TRAINING_JUMP_OFF_QUARTER = "2025Q4"
+DEFAULT_MODELS_DIR = Path("data/processed/models")
 
 
 def _quarter_range(start: str, end: str) -> list[pd.Period]:
@@ -481,4 +482,185 @@ def chart_macro(
         safe_name = variable.replace(" ", "_").replace("/", "_").replace("%", "pct")
         chart_path = output_dir / f"{safe_name}.png"
         charts.render_macro_variable_chart(history, scenarios, variable, str(chart_path))
+        typer.echo(f"wrote {chart_path}")
+
+
+def _record_family_result(
+    category: str,
+    dependent: str,
+    covid_spec: str,
+    window: str,
+    family: str,
+    result: dict,
+    backtest_rows: list[dict],
+    coefficient_rows: list[dict],
+    importance_rows: list[dict],
+    forecast_store: dict,
+) -> None:
+    backtest_rows.append(
+        {
+            "category": category,
+            "dependent": dependent,
+            "covid_spec": covid_spec,
+            "window": window,
+            "model_family": family,
+            **result["metrics"],
+        }
+    )
+    if "coefficients" in result:
+        signs = models.check_coefficient_signs(result["coefficients"])
+        for feature, coefficient in result["coefficients"].items():
+            coefficient_rows.append(
+                {
+                    "category": category,
+                    "dependent": dependent,
+                    "covid_spec": covid_spec,
+                    "window": window,
+                    "model_family": family,
+                    "feature": feature,
+                    "coefficient": coefficient,
+                    "expected_sign_ok": signs.get(feature),
+                }
+            )
+    if "feature_importances" in result:
+        for feature, importance in result["feature_importances"].items():
+            importance_rows.append(
+                {
+                    "category": category,
+                    "dependent": dependent,
+                    "covid_spec": covid_spec,
+                    "window": window,
+                    "feature": feature,
+                    "importance": importance,
+                }
+            )
+    forecast_store[(category, dependent, covid_spec, window)] = forecast_store.get(
+        (category, dependent, covid_spec, window), {}
+    )
+    forecast_store[(category, dependent, covid_spec, window)][family] = result["forecast"]
+
+
+@app.command("fit-models")
+def fit_models(
+    panel_path: Path = typer.Option(
+        DEFAULT_MODELING_DATASET_PATH,
+        "--panel",
+        help="Training modeling dataset (quarter <= 2025Q4).",
+    ),
+    holdout_path: Path = typer.Option(
+        DEFAULT_MODELING_DATASET_HOLDOUT_PATH,
+        "--holdout",
+        help="Held-out modeling dataset (2026Q1+).",
+    ),
+    output_dir: Path = typer.Option(
+        DEFAULT_MODELS_DIR, "--output-dir", help="Where to write backtest/coefficient/chart output."
+    ),
+    categories: str | None = typer.Option(
+        None,
+        "--categories",
+        help="Comma-separated LoanCategory values to run (default: every category "
+        "backtest.MODELING_CATEGORIES lists).",
+    ),
+) -> None:
+    """Stage 4: for every loan category, dependent variable (NCO rate,
+    NPL ratio), and COVID specification (main, robustness), fits all
+    three model families (credit/models.py) over both required
+    out-of-time validation windows (2007-2010, 2020-2021) and the
+    2026Q1-Q2 holdout, and writes backtest_table.csv, coefficient_table.csv
+    (with each core macro feature's expected-sign check), gbm_feature_
+    importances.csv, and one actual-vs-predicted PNG per category/
+    dependent for the main-spec 2007-2010 window to `output_dir`."""
+    training = pd.read_parquet(panel_path)
+    training["quarter"] = pd.PeriodIndex(training["quarter"].astype(str), freq="Q")
+    training = backtest.add_npl_ratio_columns(training)
+
+    holdout = pd.read_parquet(holdout_path)
+    holdout["quarter"] = pd.PeriodIndex(holdout["quarter"].astype(str), freq="Q")
+    holdout = backtest.add_npl_ratio_columns(holdout)
+
+    selected_categories = (
+        [LoanCategory(c.strip()) for c in categories.split(",")]
+        if categories
+        else list(backtest.MODELING_CATEGORIES)
+    )
+
+    backtest_rows: list[dict] = []
+    coefficient_rows: list[dict] = []
+    importance_rows: list[dict] = []
+    forecast_store: dict = {}
+
+    for category in selected_categories:
+        category_train = training[training["category"] == category]
+        category_holdout = holdout[holdout["category"] == category]
+        if category_train.empty:
+            typer.echo(f"{category}: no training rows -- skipping", err=True)
+            continue
+        typer.echo(f"=== {category} ({len(category_train):,} training rows) ===")
+
+        for dep_label, dep_column in backtest.DEPENDENT_VARIABLES.items():
+            for covid_spec in backtest.COVID_SPECS:
+                typer.echo(f"  {dep_label} / {covid_spec}: backtesting...")
+                window_results = backtest.run_category_backtests(
+                    category_train, dep_column, covid_spec
+                )
+                for window_label, family_results in window_results.items():
+                    for family, result in family_results.items():
+                        _record_family_result(
+                            category,
+                            dep_label,
+                            covid_spec,
+                            window_label,
+                            family,
+                            result,
+                            backtest_rows,
+                            coefficient_rows,
+                            importance_rows,
+                            forecast_store,
+                        )
+
+                if not category_holdout.empty:
+                    typer.echo(f"  {dep_label} / {covid_spec}: scoring 2026 holdout...")
+                    holdout_results = backtest.run_holdout_backtest(
+                        category_train, category_holdout, dep_column, covid_spec
+                    )
+                    for family, result in holdout_results.items():
+                        _record_family_result(
+                            category,
+                            dep_label,
+                            covid_spec,
+                            "2026_holdout",
+                            family,
+                            result,
+                            backtest_rows,
+                            coefficient_rows,
+                            importance_rows,
+                            forecast_store,
+                        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(backtest_rows).to_csv(output_dir / "backtest_table.csv", index=False)
+    pd.DataFrame(coefficient_rows).to_csv(output_dir / "coefficient_table.csv", index=False)
+    pd.DataFrame(importance_rows).to_csv(output_dir / "gbm_feature_importances.csv", index=False)
+    typer.echo(
+        f"wrote backtest_table.csv / coefficient_table.csv / "
+        f"gbm_feature_importances.csv to {output_dir}"
+    )
+
+    charts_dir = output_dir / "charts"
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    for (category, dep_label, covid_spec, window_label), family_forecasts in forecast_store.items():
+        if window_label != "2007-2010" or covid_spec != "main":
+            continue
+        category_train = training[training["category"] == category]
+        dep_column = backtest.DEPENDENT_VARIABLES[dep_label]
+        actual_industry = models.build_industry_series(category_train, dep_column).frame
+        actual_series = actual_industry.set_index("quarter")["industry_rate"]
+        chart_path = charts_dir / f"{category}_{dep_label}_2007-2010.png"
+        charts.render_backtest_chart(
+            actual_series,
+            family_forecasts,
+            title=f"{category} -- {dep_label} (2007-2010 backtest)",
+            y_label=dep_label,
+            path=str(chart_path),
+        )
         typer.echo(f"wrote {chart_path}")
