@@ -235,6 +235,48 @@ def test_project_category_nco_rate_covers_every_scenario_quarter(family):
     assert forecast.notna().all()
 
 
+def test_project_category_nco_rate_truncates_long_history_that_overlaps_the_scenario():
+    # Real bug this reproduces: the raw FRED pull behind long_history_frame
+    # can extend a quarter or two past the Fed's own historic actuals
+    # table (macro_history's own last quarter) -- e.g. 2026Q1-Q2 real FRED
+    # data existing even though the Fed's table stops at 2025Q4. Left
+    # untruncated, concatenating that extra data with the scenario (which
+    # ALSO starts at 2026Q1) duplicates those quarters and corrupts the
+    # forecast (each duplicated quarter's "row" becomes a 2-row slice, not
+    # a scalar, and result.predict(...).iloc[0] raises instead of a float).
+    macro_history, scenario = _synthetic_macro_history_and_scenario()
+    category_train_dataset = _synthetic_category_train_dataset(macro_history)
+    from corefin.credit import industry_history
+
+    long_rate = models.build_industry_series(
+        category_train_dataset, "winsorized_nco_rate"
+    ).frame.set_index("quarter")["industry_rate"]
+    # extend long_rate 2 quarters PAST macro_history's own last quarter,
+    # overlapping scenario's first 2 quarters -- the real situation.
+    overlap_quarters = scenario.index[:2]
+    extended_long_rate = pd.concat(
+        [long_rate, pd.Series([0.5, 0.5], index=overlap_quarters)]
+    )
+    extended_macro_history_for_long = pd.concat(
+        [macro_history, scenario.iloc[:2]]
+    )  # so build_long_industry_frame has macro data to join against
+    long_history_frame = industry_history.build_long_industry_frame(
+        extended_long_rate, extended_macro_history_for_long
+    )
+    assert long_history_frame["quarter"].max() > macro_history.index.max()  # confirms the overlap
+
+    forecast = projection.project_category_nco_rate(
+        _CATEGORY,
+        "aggregate_long",
+        category_train_dataset,
+        macro_history,
+        scenario,
+        long_history_frame,
+    )
+    assert list(forecast.index) == list(scenario.index)
+    assert forecast.notna().all()
+
+
 def test_project_category_nco_rate_raises_without_long_history_when_required():
     macro_history, scenario = _synthetic_macro_history_and_scenario()
     category_train_dataset = _synthetic_category_train_dataset(macro_history)

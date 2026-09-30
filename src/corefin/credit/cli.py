@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 import typer
 
-from corefin.credit import backtest, charts, industry_history, macro, models
+from corefin.credit import backtest, charts, industry_history, macro, models, projection
 from corefin.credit.panel import build_industry_nco_rate_report, build_panel, flag_chargeoff_gaps
 from corefin.credit.schema import LoanCategory
 from corefin.credit.sources import fed_scenarios as fed_scenarios_source
@@ -32,6 +32,8 @@ DEFAULT_TRAINING_JUMP_OFF_QUARTER = "2025Q4"
 DEFAULT_MODELS_DIR = Path("data/processed/models")
 DEFAULT_INDUSTRY_HISTORY_RAW_DIR = Path("data/raw/fred_industry")
 DEFAULT_INDUSTRY_HISTORY_PATH = Path("data/processed/industry_history_fred.parquet")
+DEFAULT_PROJECTIONS_DIR = Path("data/processed/projections")
+FALLBACK_MODEL_FAMILY = "aggregate_ar"
 
 
 def _quarter_range(start: str, end: str) -> list[pd.Period]:
@@ -845,3 +847,161 @@ def fit_models(
         grid_path = output_dir / "backtest_chart_grid_2007-2010.png"
         charts.render_backtest_chart_grid(grid_entries, str(grid_path))
         typer.echo(f"wrote {grid_path}")
+
+
+def _determine_best_nco_model(backtest_table: pd.DataFrame, category: str) -> str:
+    """The NCO-rate model family Stage 4's own backtest found best for
+    `category`, per the user's explicit Stage 5 choice ("best backtested
+    model per category"). Tries the primary 2007-2010/main window first;
+    falls back to 2020-2021/main for a category with no data that far
+    back (e.g. AUTO, which starts in 2011); falls back to
+    FALLBACK_MODEL_FAMILY (the simplest, always-available family) if
+    neither window has a row for this category at all."""
+    for window in ("2007-2010", "2020-2021"):
+        summary = backtest.build_backtest_summary(backtest_table, window=window, covid_spec="main")
+        row = summary[(summary["category"] == category) & (summary["dependent"] == "nco_rate")]
+        if not row.empty:
+            return row.iloc[0]["best_model"]
+    return FALLBACK_MODEL_FAMILY
+
+
+@app.command("project")
+def project_cmd(
+    panel_path: Path = typer.Option(
+        DEFAULT_MODELING_DATASET_PATH,
+        "--panel",
+        help="Training modeling dataset (quarter <= 2025Q4) -- the FULL sample Stage 5 fits on.",
+    ),
+    macro_history_path: Path = typer.Option(
+        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-fed-history`."
+    ),
+    industry_history_path: Path = typer.Option(
+        DEFAULT_INDUSTRY_HISTORY_PATH,
+        "--industry-history",
+        help="Output of `fetch-industry-history` (optional -- categories whose best "
+        "model needs it are skipped if absent).",
+    ),
+    scenario_dir: Path = typer.Option(
+        DEFAULT_SCENARIO_DIR, "--scenario-dir", help="Output directory of `fetch-scenarios`."
+    ),
+    models_dir: Path = typer.Option(
+        DEFAULT_MODELS_DIR,
+        "--models-dir",
+        help="Output directory of `fit-models` (backtest_table.csv).",
+    ),
+    output_dir: Path = typer.Option(
+        DEFAULT_PROJECTIONS_DIR, "--output-dir", help="Where to write the projection tables/charts."
+    ),
+    categories: str | None = typer.Option(
+        None,
+        "--categories",
+        help="Comma-separated LoanCategory values to run (default: every category "
+        "backtest.MODELING_CATEGORIES lists).",
+    ),
+) -> None:
+    """Stage 5: for every loan category, fits the model Stage 4's own
+    backtest found best (`_determine_best_nco_model`) on the FULL sample
+    through 2025Q4, projects the NCO rate forward under both Fed
+    scenarios (baseline, severely_adverse), and builds the simplified
+    CECL allowance/provision roll-forward (credit/projection.py) from
+    each projected path. Writes projection_table.csv (one row per
+    category/scenario/quarter: the projected NCO rate, lifetime expected
+    loss rate, required allowance, net charge-off and provision expense)
+    and one NCO-rate chart per category (both scenarios plus history)."""
+    training = pd.read_parquet(panel_path)
+    training["quarter"] = pd.PeriodIndex(training["quarter"].astype(str), freq="Q")
+
+    macro_history = pd.read_parquet(macro_history_path)
+    macro_history["quarter"] = pd.PeriodIndex(macro_history["quarter"].astype(str), freq="Q")
+    macro_history = macro_history.set_index("quarter")
+
+    backtest_table_path = models_dir / "backtest_table.csv"
+    if not backtest_table_path.exists():
+        typer.echo(f"no backtest table at {backtest_table_path} -- run fit-models first", err=True)
+        raise typer.Exit(code=1)
+    backtest_table = pd.read_csv(backtest_table_path)
+
+    long_history_frames = _load_long_history_frames(industry_history_path, macro_history)
+
+    scenarios: dict[str, pd.DataFrame] = {}
+    for scenario_name in ("baseline", "severely_adverse"):
+        path = scenario_dir / f"{scenario_name}.parquet"
+        if not path.exists():
+            typer.echo(f"no cached scenario at {path} -- run fetch-scenarios first", err=True)
+            raise typer.Exit(code=1)
+        scenario = pd.read_parquet(path)
+        scenario["quarter"] = pd.PeriodIndex(scenario["quarter"].astype(str), freq="Q")
+        scenarios[scenario_name] = scenario.set_index("quarter")
+
+    selected_categories = (
+        [LoanCategory(c.strip()) for c in categories.split(",")]
+        if categories
+        else list(backtest.MODELING_CATEGORIES)
+    )
+
+    projection_rows: list[dict] = []
+    chart_dir = output_dir / "charts"
+    chart_dir.mkdir(parents=True, exist_ok=True)
+
+    for category in selected_categories:
+        category_train = training[training["category"] == category]
+        if category_train.empty:
+            typer.echo(f"{category}: no training rows -- skipping", err=True)
+            continue
+
+        best_model = _determine_best_nco_model(backtest_table, category)
+        long_history_frame = long_history_frames.get((category, "nco_rate"))
+        if best_model in projection.FAMILIES_REQUIRING_LONG_HISTORY and long_history_frame is None:
+            typer.echo(
+                f"{category}: best model {best_model} needs long-history data that "
+                "isn't cached -- falling back to aggregate_ar",
+                err=True,
+            )
+            best_model = FALLBACK_MODEL_FAMILY
+        typer.echo(f"=== {category}: projecting with {best_model} ===")
+
+        realized_series = models.build_industry_series(category_train, "winsorized_nco_rate").frame
+        realized_rate = realized_series.set_index("quarter")["industry_rate"]
+        last_quarter = category_train["quarter"].max()
+        starting_balance = category_train[category_train["quarter"] == last_quarter][
+            "average_balance"
+        ].sum()
+
+        scenario_forecasts: dict[str, pd.Series] = {}
+        for scenario_name, scenario in scenarios.items():
+            forecast = projection.project_category_nco_rate(
+                category, best_model, category_train, macro_history, scenario, long_history_frame
+            )
+            scenario_forecasts[scenario_name] = forecast
+            cecl = projection.build_cecl_projection(
+                realized_rate, forecast, category, starting_balance
+            )
+            for quarter, row in cecl.iterrows():
+                projection_rows.append(
+                    {
+                        "category": category,
+                        "scenario": scenario_name,
+                        "best_model": best_model,
+                        "quarter": str(quarter),
+                        "projected_nco_rate": forecast.get(quarter),
+                        "lifetime_expected_loss_rate": row["lifetime_expected_loss_rate"],
+                        "allowance_required": row["allowance_required"],
+                        "net_charge_off": row["net_charge_off"],
+                        "provision_expense": row["provision_expense"],
+                    }
+                )
+
+        chart_path = chart_dir / f"{category}_projection.png"
+        charts.render_backtest_chart(
+            realized_rate,
+            scenario_forecasts,
+            title=f"{category} -- NCO rate projection ({best_model})",
+            y_label="nco_rate",
+            path=str(chart_path),
+        )
+        typer.echo(f"wrote {chart_path}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    table_path = output_dir / "projection_table.csv"
+    pd.DataFrame(projection_rows).to_csv(table_path, index=False)
+    typer.echo(f"wrote {table_path}")

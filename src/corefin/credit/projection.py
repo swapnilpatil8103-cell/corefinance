@@ -251,10 +251,20 @@ def project_category_nco_rate(
     normalize_scenario produce. `long_history_frame` (industry_history.
     build_long_industry_frame's output) is required for "aggregate_long"
     and "anchored_to_aggregate" (see FAMILIES_REQUIRING_LONG_HISTORY),
-    ignored otherwise. Returns a quarter-indexed Series covering
-    `scenario`'s own quarters (the industry-level projected NCO rate)."""
+    ignored otherwise -- truncated here to `macro_history`'s own last
+    quarter if it reaches any further (a real gap this project hit: the
+    raw FRED pull behind `long_history_frame` can extend a quarter or two
+    past the Fed's own historic actuals table, e.g. 2026Q1-Q2, which
+    would otherwise DUPLICATE the quarters `scenario` itself covers once
+    concatenated, corrupting the forecast). Returns a quarter-indexed
+    Series covering `scenario`'s own quarters (the industry-level
+    projected NCO rate)."""
     if best_model_family in FAMILIES_REQUIRING_LONG_HISTORY and long_history_frame is None:
         raise ValueError(f"{best_model_family} requires long_history_frame")
+
+    jump_off_quarter = macro_history.index.max()
+    if long_history_frame is not None:
+        long_history_frame = long_history_frame[long_history_frame["quarter"] <= jump_off_quarter]
 
     full_macro_path = macro.build_full_macro_path(macro_history, scenario)
     projection_quarters = list(scenario.index)

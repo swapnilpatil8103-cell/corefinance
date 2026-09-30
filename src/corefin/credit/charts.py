@@ -24,11 +24,27 @@ _MODEL_FAMILY_STYLE = {
     "aggregate_ar": {"color": "tab:blue", "linestyle": "--", "marker": "o", "markersize": 3},
     "panel_fe": {"color": "tab:orange", "linestyle": "--", "marker": "s", "markersize": 3},
     "gbm": {"color": "tab:green", "linestyle": "--", "marker": "^", "markersize": 3},
+    "aggregate_long": {"color": "tab:purple", "linestyle": "--", "marker": "d", "markersize": 3},
+    "anchored_to_aggregate": {
+        "color": "tab:brown",
+        "linestyle": "--",
+        "marker": "v",
+        "markersize": 3,
+    },
+    # Stage 5's projection charts reuse this same style lookup keyed by
+    # SCENARIO name instead of model family -- matching the macro chart's
+    # own baseline/severely_adverse colors (_SERIES_STYLE above).
+    "baseline": {"color": "tab:blue", "linestyle": "--", "marker": "o", "markersize": 3},
+    "severely_adverse": {"color": "tab:red", "linestyle": "--", "marker": "o", "markersize": 3},
 }
 _MODEL_FAMILY_LABELS = {
     "aggregate_ar": "Aggregate AR",
     "panel_fe": "Bank panel (FE)",
     "gbm": "Gradient boosting",
+    "aggregate_long": "Aggregate (long history)",
+    "anchored_to_aggregate": "Anchored to aggregate",
+    "baseline": "Baseline",
+    "severely_adverse": "Severely Adverse",
 }
 
 
