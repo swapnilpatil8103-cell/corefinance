@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 import typer
 
-from corefin.credit import backtest, charts, macro, models
+from corefin.credit import backtest, charts, industry_history, macro, models
 from corefin.credit.panel import build_industry_nco_rate_report, build_panel, flag_chargeoff_gaps
 from corefin.credit.schema import LoanCategory
 from corefin.credit.sources import fed_scenarios as fed_scenarios_source
@@ -30,6 +30,8 @@ DEFAULT_MODELING_DATASET_HOLDOUT_PATH = Path("data/processed/modeling_dataset_ho
 DEFAULT_CHARTS_DIR = Path("data/processed/charts")
 DEFAULT_TRAINING_JUMP_OFF_QUARTER = "2025Q4"
 DEFAULT_MODELS_DIR = Path("data/processed/models")
+DEFAULT_INDUSTRY_HISTORY_RAW_DIR = Path("data/raw/fred_industry")
+DEFAULT_INDUSTRY_HISTORY_PATH = Path("data/processed/industry_history_fred.parquet")
 
 
 def _quarter_range(start: str, end: str) -> list[pd.Period]:
@@ -317,6 +319,70 @@ def fetch_macro_fred(
     typer.echo(f"wrote {len(history):,} quarters x {len(history.columns)} variables to {output}")
 
 
+@app.command("fetch-industry-history")
+def fetch_industry_history(
+    start: str = typer.Option(
+        "1985-01-01", "--start", help="First date to pull FRED industry series from."
+    ),
+    raw_dir: Path = typer.Option(
+        DEFAULT_INDUSTRY_HISTORY_RAW_DIR,
+        "--raw-dir",
+        help="Gitignored directory to cache each raw FRED pull in.",
+    ),
+    output: Path = typer.Option(
+        DEFAULT_INDUSTRY_HISTORY_PATH,
+        "--output",
+        help="Where to write the long-format industry charge-off/delinquency table.",
+    ),
+) -> None:
+    """Fetches FRED's industry-wide charge-off and delinquency rate
+    series (fred.INDUSTRY_CHARGEOFF_DELINQUENCY_SERIES -- one per loan
+    category, verified live; home_equity deliberately has none) for every
+    mapped category, or reuses a cached raw pull, and writes a long-format
+    table (columns: category, series_type ["chargeoff"/"delinquency"],
+    date, value_percent) to `output`. Values are left in the Fed's own
+    PERCENT units here (not yet converted to this project's decimal-
+    fraction scale) -- `fit-models` converts via industry_history.
+    build_long_industry_rate when it loads this file. Requires
+    FRED_API_KEY."""
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    seen_series_ids: set[str] = set()
+    for category, mapping in fred.INDUSTRY_CHARGEOFF_DELINQUENCY_SERIES.items():
+        for series_type, series_id in (
+            ("chargeoff", mapping.chargeoff_series_id),
+            ("delinquency", mapping.delinquency_series_id),
+        ):
+            if series_id is None:
+                continue
+            cache_path = raw_dir / f"{series_id}.csv"
+            if cache_path.exists():
+                if series_id not in seen_series_ids:
+                    typer.echo(f"{series_id}: cached")
+                observations = pd.read_csv(cache_path, parse_dates=["date"])
+            else:
+                typer.echo(f"{series_id}: fetching...")
+                observations = fred.fetch_series(series_id, start_date=start)
+                observations.to_csv(cache_path, index=False)
+            seen_series_ids.add(series_id)
+            for _, row in observations.iterrows():
+                rows.append(
+                    {
+                        "category": category,
+                        "series_type": series_type,
+                        "date": row["date"],
+                        "value_percent": row["value"],
+                    }
+                )
+
+    table = pd.DataFrame(rows)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    table.to_parquet(output, index=False)
+    typer.echo(
+        f"wrote {len(table):,} rows ({len(seen_series_ids)} distinct FRED series) to {output}"
+    )
+
+
 @app.command("fetch-scenarios")
 def fetch_scenarios(
     vintage: int = typer.Option(
@@ -542,6 +608,35 @@ def _record_family_result(
     forecast_store[(category, dependent, covid_spec, window)][family] = result["forecast"]
 
 
+_DEPENDENT_TO_INDUSTRY_SERIES_TYPE = {"nco_rate": "chargeoff", "npl_ratio": "delinquency"}
+
+
+def _load_long_history_frames(
+    industry_history_path: Path, macro_history: pd.DataFrame
+) -> dict[tuple[str, str], pd.DataFrame]:
+    """Returns {(category, dependent_label) -> long-history frame} for
+    every category/series_type fred.INDUSTRY_CHARGEOFF_DELINQUENCY_SERIES
+    covers -- built once so `fit_models` doesn't reparse the raw table
+    per category/dependent/covid_spec/window."""
+    if not industry_history_path.exists():
+        return {}
+    raw_table = pd.read_parquet(industry_history_path)
+    raw_table["date"] = pd.to_datetime(raw_table["date"])
+    frames: dict[tuple[str, str], pd.DataFrame] = {}
+    for (category, series_type), group in raw_table.groupby(["category", "series_type"]):
+        dep_label = next(
+            (k for k, v in _DEPENDENT_TO_INDUSTRY_SERIES_TYPE.items() if v == series_type), None
+        )
+        if dep_label is None:
+            continue
+        observations = group.rename(columns={"value_percent": "value"})[["date", "value"]]
+        long_rate = industry_history.build_long_industry_rate(observations)
+        frames[(category, dep_label)] = industry_history.build_long_industry_frame(
+            long_rate, macro_history
+        )
+    return frames
+
+
 @app.command("fit-models")
 def fit_models(
     panel_path: Path = typer.Option(
@@ -554,6 +649,15 @@ def fit_models(
         "--holdout",
         help="Held-out modeling dataset (2026Q1+).",
     ),
+    macro_history_path: Path = typer.Option(
+        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-fed-history`."
+    ),
+    industry_history_path: Path = typer.Option(
+        DEFAULT_INDUSTRY_HISTORY_PATH,
+        "--industry-history",
+        help="Output of `fetch-industry-history` (optional -- if absent, only the "
+        "Call-Report-based aggregate_ar/panel_fe/gbm families run, same as before).",
+    ),
     output_dir: Path = typer.Option(
         DEFAULT_MODELS_DIR, "--output-dir", help="Where to write backtest/coefficient/chart output."
     ),
@@ -565,11 +669,17 @@ def fit_models(
     ),
 ) -> None:
     """Stage 4: for every loan category, dependent variable (NCO rate,
-    NPL ratio), and COVID specification (main, robustness), fits all
-    three model families (credit/models.py) over both required
-    out-of-time validation windows (2007-2010, 2020-2021) and the
-    2026Q1-Q2 holdout, and writes backtest_table.csv, coefficient_table.csv
-    (with each core macro feature's expected-sign check), gbm_feature_
+    NPL ratio), and COVID specification (main, robustness), fits every
+    model family (credit/models.py) over both required out-of-time
+    validation windows (2007-2010, 2020-2021) and the 2026Q1-Q2 holdout.
+    When `industry_history_path` exists, ALSO fits aggregate_long (the
+    same aggregate model trained on FRED's much longer industry history,
+    back to 1991Q1 for most categories) and anchored_to_aggregate (bank-
+    level projections anchored to that long-history forecast), and writes
+    industry_history_comparison.csv checking the FRED-derived and Call-
+    Report-derived industry rates agree over their 2001-2025 overlap.
+    Writes backtest_table.csv, coefficient_table.csv (t-values and each
+    core macro feature's 3-way sign classification), gbm_feature_
     importances.csv, and one actual-vs-predicted PNG per category/
     dependent for the main-spec 2007-2010 window to `output_dir`."""
     training = pd.read_parquet(panel_path)
@@ -580,6 +690,22 @@ def fit_models(
     holdout["quarter"] = pd.PeriodIndex(holdout["quarter"].astype(str), freq="Q")
     holdout = backtest.add_npl_ratio_columns(holdout)
 
+    macro_history = pd.read_parquet(macro_history_path)
+    macro_history["quarter"] = pd.PeriodIndex(macro_history["quarter"].astype(str), freq="Q")
+    macro_history = macro_history.set_index("quarter")
+    long_history_frames = _load_long_history_frames(industry_history_path, macro_history)
+    if long_history_frames:
+        typer.echo(
+            f"loaded long-history industry frames for {len(long_history_frames)} "
+            "category/dependent combinations"
+        )
+    else:
+        typer.echo(
+            f"no industry history at {industry_history_path} -- run fetch-industry-history "
+            "first for the aggregate_long/anchored_to_aggregate families",
+            err=True,
+        )
+
     selected_categories = (
         [LoanCategory(c.strip()) for c in categories.split(",")]
         if categories
@@ -589,6 +715,7 @@ def fit_models(
     backtest_rows: list[dict] = []
     coefficient_rows: list[dict] = []
     importance_rows: list[dict] = []
+    comparison_rows: list[dict] = []
     forecast_store: dict = {}
 
     for category in selected_categories:
@@ -600,10 +727,28 @@ def fit_models(
         typer.echo(f"=== {category} ({len(category_train):,} training rows) ===")
 
         for dep_label, dep_column in backtest.DEPENDENT_VARIABLES.items():
+            long_history_frame = long_history_frames.get((category, dep_label))
+            if long_history_frame is not None:
+                call_report_frame = models.build_industry_series(category_train, dep_column).frame
+                comparison = industry_history.compare_with_call_report_aggregate(
+                    long_history_frame, call_report_frame
+                )
+                for _, row in comparison.iterrows():
+                    comparison_rows.append(
+                        {
+                            "category": category,
+                            "dependent": dep_label,
+                            "quarter": str(row["quarter"]),
+                            "fred_rate": row["fred_rate"],
+                            "call_report_rate": row["call_report_rate"],
+                            "difference": row["difference"],
+                        }
+                    )
+
             for covid_spec in backtest.COVID_SPECS:
                 typer.echo(f"  {dep_label} / {covid_spec}: backtesting...")
                 window_results = backtest.run_category_backtests(
-                    category_train, dep_column, covid_spec
+                    category_train, dep_column, covid_spec, long_history_frame=long_history_frame
                 )
                 for window_label, family_results in window_results.items():
                     for family, result in family_results.items():
@@ -623,7 +768,11 @@ def fit_models(
                 if not category_holdout.empty:
                     typer.echo(f"  {dep_label} / {covid_spec}: scoring 2026 holdout...")
                     holdout_results = backtest.run_holdout_backtest(
-                        category_train, category_holdout, dep_column, covid_spec
+                        category_train,
+                        category_holdout,
+                        dep_column,
+                        covid_spec,
+                        long_history_frame=long_history_frame,
                     )
                     if holdout_results is None:
                         typer.echo(
@@ -654,6 +803,10 @@ def fit_models(
         f"wrote backtest_table.csv / coefficient_table.csv / "
         f"gbm_feature_importances.csv to {output_dir}"
     )
+    if comparison_rows:
+        comparison_path = output_dir / "industry_history_comparison.csv"
+        pd.DataFrame(comparison_rows).to_csv(comparison_path, index=False)
+        typer.echo(f"wrote {comparison_path}")
 
     charts_dir = output_dir / "charts"
     charts_dir.mkdir(parents=True, exist_ok=True)
