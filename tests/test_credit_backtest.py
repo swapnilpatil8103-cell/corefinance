@@ -65,6 +65,57 @@ def _synthetic_category_dataset(start="2001Q1", n_quarters=84, n_banks=8, seed=1
     return backtest.add_npl_ratio_columns(pd.DataFrame(rows))
 
 
+def _synthetic_long_history_frame(start="1991Q1", n_quarters=124, seed=3) -> pd.DataFrame:
+    # Same shape as industry_history.build_long_industry_frame's output,
+    # built directly here to avoid depending on a real FRED macro history
+    # fixture just to exercise the wiring.
+    rng = np.random.default_rng(seed)
+    quarters = pd.period_range(pd.Period(start, freq="Q"), periods=n_quarters, freq="Q")
+    unemployment = 5.0 + np.cumsum(rng.normal(0, 0.2, size=n_quarters))
+    hpi_yoy = 2.0 + np.cumsum(rng.normal(0, 0.3, size=n_quarters))
+    cre_yoy = 2.0 + np.cumsum(rng.normal(0, 0.3, size=n_quarters))
+    stock_yoy = 4.0 + np.cumsum(rng.normal(0, 0.4, size=n_quarters))
+    industry_rate = np.clip(
+        0.01 + 0.0015 * unemployment - 0.001 * hpi_yoy + rng.normal(0, 0.0004, size=n_quarters),
+        -0.05,
+        None,
+    )
+    frame = pd.DataFrame(
+        {
+            "quarter": quarters,
+            "industry_rate": industry_rate,
+            models.feature_column("Unemployment rate"): unemployment,
+            models.feature_column("House Price Index YoY % change"): hpi_yoy,
+            models.feature_column("Commercial Real Estate Price Index YoY % change"): cre_yoy,
+            models.feature_column("Dow Jones Total Stock Market Index YoY % change"): stock_yoy,
+        }
+    )
+    frame["pandemic"] = models.add_pandemic_indicator(frame)
+    frame["industry_rate_lag1"] = frame["industry_rate"].shift(1)
+    return frame
+
+
+def test_run_category_backtests_adds_long_history_families_when_given():
+    dataset = _synthetic_category_dataset(n_quarters=84, n_banks=8)  # 2001Q1..2021Q4
+    long_history_frame = _synthetic_long_history_frame()  # 1991Q1..2021Q4
+    results = backtest.run_category_backtests(
+        dataset, "winsorized_nco_rate", covid_spec="main", long_history_frame=long_history_frame
+    )
+    for window_result in results.values():
+        assert "aggregate_long" in window_result
+        assert "anchored_to_aggregate" in window_result
+        assert window_result["aggregate_long"]["metrics"]["n"] > 0
+        assert window_result["anchored_to_aggregate"]["metrics"]["n"] > 0
+
+
+def test_run_category_backtests_without_long_history_frame_omits_those_families():
+    dataset = _synthetic_category_dataset(n_quarters=84, n_banks=8)
+    results = backtest.run_category_backtests(dataset, "winsorized_nco_rate", covid_spec="main")
+    for window_result in results.values():
+        assert "aggregate_long" not in window_result
+        assert "anchored_to_aggregate" not in window_result
+
+
 def test_add_npl_ratio_columns_adds_both_columns():
     dataset = _synthetic_category_dataset(n_quarters=4, n_banks=2)
     assert "npl_ratio" in dataset.columns

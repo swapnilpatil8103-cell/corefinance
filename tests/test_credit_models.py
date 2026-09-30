@@ -43,25 +43,48 @@ def test_exclude_pandemic_years_drops_all_of_2020_and_2021_only():
 # ------------------------------------------------------- sign checking ---
 
 
-def test_check_coefficient_signs_flags_wrong_and_right_signs():
-    coefficients = {
-        models.feature_column("Unemployment rate"): 0.003,  # correct: positive
-        models.feature_column("House Price Index YoY % change"): 0.001,  # WRONG: should be negative
-    }
-    result = models.check_coefficient_signs(coefficients)
-    assert result[models.feature_column("Unemployment rate")] is True
-    assert result[models.feature_column("House Price Index YoY % change")] is False
+def test_classify_coefficient_significance_correct_sign():
+    coefficients = {models.feature_column("Unemployment rate"): 0.003}
+    t_values = {models.feature_column("Unemployment rate"): 3.5}
+    result = models.classify_coefficient_significance(coefficients, t_values)
+    assert result[models.feature_column("Unemployment rate")] == models.CORRECT_SIGN
 
 
-def test_check_coefficient_signs_treats_exact_zero_as_not_matching():
+def test_classify_coefficient_significance_wrong_sign_but_insignificant():
+    # WRONG: should be negative, but |t| < threshold -- not a real problem.
+    coefficients = {models.feature_column("House Price Index YoY % change"): 0.001}
+    t_values = {models.feature_column("House Price Index YoY % change"): 0.5}
+    result = models.classify_coefficient_significance(coefficients, t_values)
+    key = models.feature_column("House Price Index YoY % change")
+    assert result[key] == models.WRONG_SIGN_INSIGNIFICANT
+
+
+def test_classify_coefficient_significance_wrong_sign_and_significant():
+    coefficients = {models.feature_column("House Price Index YoY % change"): 0.001}
+    t_values = {models.feature_column("House Price Index YoY % change"): 2.5}
+    result = models.classify_coefficient_significance(coefficients, t_values)
+    key = models.feature_column("House Price Index YoY % change")
+    assert result[key] == models.WRONG_SIGN_SIGNIFICANT
+
+
+def test_classify_coefficient_significance_treats_exact_zero_as_wrong_sign():
     coefficients = {models.feature_column("Unemployment rate"): 0.0}
-    result = models.check_coefficient_signs(coefficients)
-    assert result[models.feature_column("Unemployment rate")] is False
+    t_values = {models.feature_column("Unemployment rate"): 0.0}
+    result = models.classify_coefficient_significance(coefficients, t_values)
+    assert result[models.feature_column("Unemployment rate")] == models.WRONG_SIGN_INSIGNIFICANT
 
 
-def test_check_coefficient_signs_only_reports_present_features():
-    result = models.check_coefficient_signs({models.feature_column("Unemployment rate"): 1.0})
+def test_classify_coefficient_significance_only_reports_present_features():
+    coefficients = {models.feature_column("Unemployment rate"): 1.0}
+    t_values = {models.feature_column("Unemployment rate"): 3.0}
+    result = models.classify_coefficient_significance(coefficients, t_values)
     assert set(result) == {models.feature_column("Unemployment rate")}
+
+
+def test_classify_coefficient_significance_requires_both_dicts_to_have_the_feature():
+    coefficients = {models.feature_column("Unemployment rate"): 1.0}
+    result = models.classify_coefficient_significance(coefficients, {})
+    assert result == {}
 
 
 # --------------------------------------------------------- feature prep ---
@@ -154,9 +177,10 @@ def test_fit_aggregate_model_recovers_the_known_signs():
     series = models.build_industry_series(dataset, "winsorized_nco_rate").frame
     result = models.fit_aggregate_model(series, include_pandemic_dummy=False)
     coefficients = result.params.to_dict()
-    signs = models.check_coefficient_signs(coefficients)
-    assert signs[models.feature_column("Unemployment rate")] is True
-    assert signs[models.feature_column("House Price Index YoY % change")] is True
+    t_values = result.tvalues.to_dict()
+    signs = models.classify_coefficient_significance(coefficients, t_values)
+    assert signs[models.feature_column("Unemployment rate")] == models.CORRECT_SIGN
+    assert signs[models.feature_column("House Price Index YoY % change")] == models.CORRECT_SIGN
 
 
 def test_forecast_aggregate_dynamic_never_reads_the_actual_future_rate():
@@ -231,9 +255,20 @@ def test_fit_panel_fe_model_recovers_the_known_signs():
     dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=40)
     fit = models.fit_panel_fe_model(dataset, "winsorized_nco_rate", include_pandemic_dummy=False)
     coefficients = fit.result.params.to_dict()
-    signs = models.check_coefficient_signs(coefficients)
-    assert signs[models.feature_column("Unemployment rate")] is True
-    assert signs[models.feature_column("House Price Index YoY % change")] is True
+    t_values = fit.result.tvalues.to_dict()
+    signs = models.classify_coefficient_significance(coefficients, t_values)
+    assert signs[models.feature_column("Unemployment rate")] == models.CORRECT_SIGN
+    assert signs[models.feature_column("House Price Index YoY % change")] == models.CORRECT_SIGN
+
+
+def test_fit_panel_fe_model_uses_clustered_standard_errors():
+    # A real requirement this project's brief asked for explicitly: t-stats
+    # for the panel model must be clustered by bank, not the OLS default
+    # (which would treat every bank-quarter row as independent and
+    # understate standard errors given repeated observations per bank).
+    dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=40)
+    fit = models.fit_panel_fe_model(dataset, "winsorized_nco_rate", include_pandemic_dummy=False)
+    assert fit.result.cov_type == "cluster"
 
 
 def test_predict_panel_fe_uses_training_means_not_prediction_data_means():
@@ -316,3 +351,70 @@ def test_aggregate_bank_predictions_to_industry_rate_is_balance_weighted():
     industry = models.aggregate_bank_predictions_to_industry_rate(dataset, predicted)
     expected = (100.0 * 0.01 + 300.0 * 0.05) / 400.0
     assert industry.iloc[0] == pytest.approx(expected)
+
+
+# ---------------------------------------------------- anchored family ---
+
+
+def test_compute_bank_relative_levels_is_bank_mean_over_aggregate_mean():
+    train_bank = pd.DataFrame(
+        {
+            "bank_id": [1, 1, 2, 2],
+            "winsorized_nco_rate": [0.02, 0.02, 0.01, 0.01],
+        }
+    )
+    train_industry = pd.DataFrame({"industry_rate": [0.01, 0.02]})
+    relative = models.compute_bank_relative_levels(
+        train_bank, "winsorized_nco_rate", train_industry
+    )
+    # aggregate mean = 0.015; bank 1's mean 0.02 -> 0.02/0.015; bank 2's -> 0.01/0.015
+    assert relative.loc[1] == pytest.approx(0.02 / 0.015)
+    assert relative.loc[2] == pytest.approx(0.01 / 0.015)
+
+
+def test_forecast_anchored_to_aggregate_multiplies_relative_level_by_aggregate_forecast():
+    relative_levels = pd.Series({1: 2.0, 2: 0.5})
+    aggregate_forecast = pd.Series(
+        {pd.Period("2007Q1", freq="Q"): 0.04, pd.Period("2007Q2", freq="Q"): 0.06}
+    )
+    test_bank = pd.DataFrame(
+        {
+            "bank_id": [1, 2],
+            "quarter": [pd.Period("2007Q1", freq="Q"), pd.Period("2007Q1", freq="Q")],
+        }
+    )
+    predicted = models.forecast_anchored_to_aggregate(
+        relative_levels, aggregate_forecast, test_bank
+    )
+    assert predicted.loc[0] == pytest.approx(2.0 * 0.04)
+    assert predicted.loc[1] == pytest.approx(0.5 * 0.04)
+
+
+def test_forecast_anchored_to_aggregate_drops_a_bank_never_seen_in_training():
+    relative_levels = pd.Series({1: 2.0})
+    aggregate_forecast = pd.Series({pd.Period("2007Q1", freq="Q"): 0.04})
+    test_bank = pd.DataFrame(
+        {"bank_id": [1, 99], "quarter": [pd.Period("2007Q1", freq="Q")] * 2}
+    )
+    predicted = models.forecast_anchored_to_aggregate(
+        relative_levels, aggregate_forecast, test_bank
+    )
+    assert list(predicted.index) == [0]
+
+
+def test_forecast_anchored_to_aggregate_reflects_a_worse_long_history_peak():
+    # This is the whole point of anchoring: a bank whose own Call-Report-
+    # era history understates crisis severity should still get a bigger
+    # projected peak when anchored to a long-history aggregate forecast
+    # that itself captures a worse crisis peak.
+    relative_levels = pd.Series({1: 1.0})
+    mild_aggregate_forecast = pd.Series({pd.Period("2009Q1", freq="Q"): 0.01})
+    severe_aggregate_forecast = pd.Series({pd.Period("2009Q1", freq="Q"): 0.07})
+    test_bank = pd.DataFrame({"bank_id": [1], "quarter": [pd.Period("2009Q1", freq="Q")]})
+    mild = models.forecast_anchored_to_aggregate(
+        relative_levels, mild_aggregate_forecast, test_bank
+    )
+    severe = models.forecast_anchored_to_aggregate(
+        relative_levels, severe_aggregate_forecast, test_bank
+    )
+    assert severe.iloc[0] > mild.iloc[0]

@@ -34,7 +34,7 @@ rising stock market should LOWER losses, so a NEGATIVE coefficient on
 each of those YoY-change features is expected (equivalently: FALLING
 prices, a negative change value, combined with a negative coefficient,
 raise losses -- the sign convention the project brief asks to check).
-See `EXPECTED_COEFFICIENT_SIGNS` and `check_coefficient_signs`.
+See `EXPECTED_COEFFICIENT_SIGNS` and `classify_coefficient_significance`.
 
 COVID TREATMENT: `PANDEMIC_START`/`PANDEMIC_END` (2020Q2-2021Q4) define a
 0/1 indicator included as an extra regressor in the MAIN specification
@@ -113,20 +113,46 @@ def exclude_pandemic_years(dataset: pd.DataFrame, quarter_column: str = "quarter
     return dataset[~excluded]
 
 
-def check_coefficient_signs(coefficients: dict[str, float]) -> dict[str, bool]:
-    """coefficients: {feature column name -> fitted coefficient}, as
-    produced by `fit_aggregate_model`/`fit_panel_fe_model`'s `.params`
-    (converted to a dict) or `feature_importance_signs` for the GBM
-    family (see there). Returns {feature column name -> True/False} for
-    every core macro feature present, True iff the fitted coefficient's
-    sign matches `EXPECTED_COEFFICIENT_SIGNS`. A coefficient of exactly
-    0.0 is treated as NOT matching (a real relationship should be
-    nonzero, not just "not wrong-signed")."""
+# Two-sided ~5% significance cutoff on |t| -- the conventional threshold,
+# not tuned for this project's data.
+SIGNIFICANCE_T_THRESHOLD = 1.96
+
+CORRECT_SIGN = "correct_sign"
+WRONG_SIGN_INSIGNIFICANT = "wrong_sign_insignificant"
+WRONG_SIGN_SIGNIFICANT = "wrong_sign_significant"
+
+
+def classify_coefficient_significance(
+    coefficients: dict[str, float], t_values: dict[str, float]
+) -> dict[str, str]:
+    """coefficients/t_values: {feature column name -> value}, as produced
+    by an OLS result's `.params`/`.tvalues` (converted to dicts) --
+    `fit_panel_fe_model`'s result uses bank-clustered standard errors, so
+    its t-values already account for repeated observations per bank, not
+    just the demeaned regression's naive (and too-small) residual
+    variance. For every core macro feature present in BOTH dicts,
+    classifies it as one of three buckets (only the last is a real
+    problem worth flagging, per this project's brief -- a wrong sign
+    that isn't statistically distinguishable from zero isn't a confirmed
+    contradiction of the expected relationship, just noise):
+    - CORRECT_SIGN: matches EXPECTED_COEFFICIENT_SIGNS.
+    - WRONG_SIGN_INSIGNIFICANT: wrong sign, but |t| < SIGNIFICANCE_T_THRESHOLD.
+    - WRONG_SIGN_SIGNIFICANT: wrong sign AND |t| >= SIGNIFICANCE_T_THRESHOLD.
+    A coefficient of exactly 0.0 is treated as wrong-signed (a real
+    relationship should be nonzero, not just "not wrong"), though in
+    practice t=0 there too, so it lands in WRONG_SIGN_INSIGNIFICANT."""
     result = {}
     for variable, expected_sign in EXPECTED_COEFFICIENT_SIGNS.items():
         column = feature_column(variable)
-        if column in coefficients:
-            result[column] = (coefficients[column] * expected_sign) > 0
+        if column not in coefficients or column not in t_values:
+            continue
+        correct_sign = (coefficients[column] * expected_sign) > 0
+        if correct_sign:
+            result[column] = CORRECT_SIGN
+        elif abs(t_values[column]) >= SIGNIFICANCE_T_THRESHOLD:
+            result[column] = WRONG_SIGN_SIGNIFICANT
+        else:
+            result[column] = WRONG_SIGN_INSIGNIFICANT
     return result
 
 
@@ -268,18 +294,23 @@ def fit_panel_fe_model(
     the within (demeaning) estimator -- each bank's own TRAINING-SAMPLE
     mean is subtracted from every variable (dependent + features) before
     an OLS fit with no intercept, the standard way to fit large-N fixed
-    effects without materializing one dummy column per bank. A
-    simplification worth being explicit about (this project's "keep
-    models simple and explainable" -- not a hidden shortcut): residual
-    degrees of freedom aren't corrected for the banks' own absorbed
-    intercepts, so this fit's standard errors/p-values are not exactly
-    right; the point estimates (coefficients, predictions) the fit is
-    actually used for here are unaffected. Features: CORE_MACRO_FEATURES
-    at `LAG`, the pandemic dummy (if `include_pandemic_dummy`), and
-    log(average_balance) as the one bank characteristic (a simple,
-    standard bank-size control). Returns a `PanelFEFit` bundling the
-    fitted result with the per-bank training means `predict_panel_fe`
-    needs to demean new data consistently, without leakage."""
+    effects without materializing one dummy column per bank. Standard
+    errors are CLUSTERED BY BANK (`cov_type="cluster"`) -- a single
+    bank's own quarters are correlated with each other (the same bank's
+    unobserved shocks persist across time), so treating every bank-
+    quarter row as an independent observation (the OLS default) would
+    understate standard errors and overstate significance; clustering is
+    the standard fix. This does NOT correct residual degrees of freedom
+    for the banks' own absorbed intercepts (a separate, smaller
+    simplification worth being explicit about -- this project's "keep
+    models simple and explainable," not a hidden shortcut); the point
+    estimates (coefficients, predictions) are unaffected either way.
+    Features: CORE_MACRO_FEATURES at `LAG`, the pandemic dummy (if
+    `include_pandemic_dummy`), and log(average_balance) as the one bank
+    characteristic (a simple, standard bank-size control). Returns a
+    `PanelFEFit` bundling the fitted result with the per-bank training
+    means `predict_panel_fe` needs to demean new data consistently,
+    without leakage."""
     data = _add_bank_characteristics(bank_dataset)
     feature_columns = [*_macro_feature_columns(include_pandemic_dummy), "log_balance"]
     data = data.dropna(subset=[dependent_column, *feature_columns, "bank_id"])
@@ -292,7 +323,9 @@ def fit_panel_fe_model(
     demeaned_x = data[feature_columns] - means_aligned_x
     demeaned_y = data[dependent_column] - means_aligned_y
 
-    result = sm.OLS(demeaned_y, demeaned_x).fit()
+    result = sm.OLS(demeaned_y, demeaned_x).fit(
+        cov_type="cluster", cov_kwds={"groups": data["bank_id"].to_numpy()}
+    )
     return PanelFEFit(result=result, bank_training_means=bank_training_means)
 
 
@@ -382,3 +415,43 @@ def aggregate_bank_predictions_to_industry_rate(
     grouped_weight = weight.groupby(scoped["quarter"], observed=True).sum()
     grouped_weighted = weighted.groupby(scoped["quarter"], observed=True).sum()
     return (grouped_weighted / grouped_weight).rename_axis("quarter")
+
+
+def compute_bank_relative_levels(
+    train_bank: pd.DataFrame, dependent_column: str, train_industry: pd.DataFrame
+) -> pd.Series:
+    """Model family 5 (anchored): each bank's own mean `dependent_column`
+    over the training period, divided by the aggregate's own mean
+    "industry_rate" over the SAME period -- a bank-specific multiplicative
+    factor capturing how much riskier/safer that bank's own history has
+    been relative to the industry as a whole. `train_industry`: a
+    quarter-indexed frame with an "industry_rate" column (e.g. a slice of
+    industry_history.build_long_industry_frame's output) covering the
+    SAME quarters `train_bank` does -- using a different period's
+    aggregate mean here than what `train_bank` itself covers would bias
+    every bank's relative level by however much the aggregate moved
+    between the two periods."""
+    bank_means = train_bank.groupby("bank_id")[dependent_column].mean()
+    aggregate_mean = train_industry["industry_rate"].mean()
+    return bank_means / aggregate_mean
+
+
+def forecast_anchored_to_aggregate(
+    bank_relative_levels: pd.Series, aggregate_forecast: pd.Series, test_bank: pd.DataFrame
+) -> pd.Series:
+    """Model family 5 (anchored): predicts each bank-quarter row in
+    `test_bank` as that bank's relative level (`compute_bank_relative_
+    levels`) times the aggregate model's own forecast for that row's
+    quarter (`aggregate_forecast` -- typically the LONG-HISTORY aggregate
+    model's forecast, `forecast_aggregate_dynamic` run against
+    industry_history's frame, per this project's brief: anchoring a
+    bank's projection to a longer, more crisis-informed aggregate view
+    rather than the bank's own possibly too-short training window).
+    A bank absent from `bank_relative_levels` (never seen in training)
+    is dropped -- the same expected limitation as `predict_panel_fe`."""
+    known_banks = test_bank["bank_id"].isin(bank_relative_levels.index)
+    scoped = test_bank[known_banks]
+    relative = scoped["bank_id"].map(bank_relative_levels)
+    aggregate_value = scoped["quarter"].map(aggregate_forecast)
+    predicted = (relative * aggregate_value).dropna()
+    return predicted

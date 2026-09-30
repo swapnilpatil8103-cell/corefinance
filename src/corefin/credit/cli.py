@@ -508,7 +508,8 @@ def _record_family_result(
         }
     )
     if "coefficients" in result:
-        signs = models.check_coefficient_signs(result["coefficients"])
+        t_values = result.get("t_values", {})
+        classification = models.classify_coefficient_significance(result["coefficients"], t_values)
         for feature, coefficient in result["coefficients"].items():
             coefficient_rows.append(
                 {
@@ -519,7 +520,8 @@ def _record_family_result(
                     "model_family": family,
                     "feature": feature,
                     "coefficient": coefficient,
-                    "expected_sign_ok": signs.get(feature),
+                    "t_value": t_values.get(feature),
+                    "sign_classification": classification.get(feature),
                 }
             )
     if "feature_importances" in result:

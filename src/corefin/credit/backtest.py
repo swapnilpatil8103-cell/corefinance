@@ -77,22 +77,29 @@ def add_npl_ratio_columns(dataset: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def _run_three_families(
+def _run_model_families(
     industry_series_full: pd.DataFrame,
     train_industry: pd.DataFrame,
     train_bank: pd.DataFrame,
     test_bank: pd.DataFrame,
     dependent_column: str,
     covid_spec: str,
+    train_end: pd.Period,
     test_start: pd.Period,
     test_end: pd.Period,
+    long_history_frame: pd.DataFrame | None = None,
 ) -> dict:
-    """Fits and backtests all three model families for one (category,
-    dependent, covid_spec, window) combination. `industry_series_full`
-    must cover at least [<= train_industry's start>, test_end] -- it's
-    both the actual series backtest metrics are scored against AND the
-    only source `forecast_aggregate_dynamic` reads for its (real,
-    historical) macro lag features and its seed quarter's actual rate."""
+    """Fits and backtests every model family for one (category,
+    dependent, covid_spec, window) combination: always aggregate_ar
+    (Call-Report-based), panel_fe, and gbm; ALSO aggregate_long and
+    anchored_to_aggregate when `long_history_frame` is given (a FRED-
+    derived long-history industry frame -- industry_history.
+    build_long_industry_frame's output -- covering at least [<= train_end,
+    test_end]). `industry_series_full` must cover at least [<=
+    train_industry's start>, test_end] -- it's both the actual (Call-
+    Report) series every family's backtest metrics are scored against AND
+    the source aggregate_ar's own forecast reads for its macro lag
+    features and seed quarter."""
     include_pandemic = covid_spec == "main"
     if covid_spec == "robustness":
         train_industry = models.exclude_pandemic_years(train_industry)
@@ -128,15 +135,17 @@ def _run_three_families(
     gbm_forecast = models.aggregate_bank_predictions_to_industry_rate(test_bank, gbm_predicted_bank)
     gbm_metrics = validation.backtest_summary(actual_industry, gbm_forecast)
 
-    return {
+    results = {
         "aggregate_ar": {
             "metrics": agg_metrics,
             "coefficients": agg_result.params.to_dict(),
+            "t_values": agg_result.tvalues.to_dict(),
             "forecast": agg_forecast,
         },
         "panel_fe": {
             "metrics": fe_metrics,
             "coefficients": fe_fit.result.params.to_dict(),
+            "t_values": fe_fit.result.tvalues.to_dict(),
             "forecast": fe_forecast,
         },
         "gbm": {
@@ -148,20 +157,70 @@ def _run_three_families(
         },
     }
 
+    if long_history_frame is not None:
+        long_train = long_history_frame[long_history_frame["quarter"] <= train_end]
+        if covid_spec == "robustness":
+            long_train = models.exclude_pandemic_years(long_train)
+        if len(long_train) >= MIN_TRAINING_QUARTERS:
+            long_result = models.fit_aggregate_model(
+                long_train, include_pandemic_dummy=include_pandemic
+            )
+            long_forecast = models.forecast_aggregate_dynamic(
+                long_result,
+                long_history_frame,
+                test_start,
+                test_end,
+                include_pandemic_dummy=include_pandemic,
+            )
+            long_metrics = validation.backtest_summary(actual_industry, long_forecast)
+            results["aggregate_long"] = {
+                "metrics": long_metrics,
+                "coefficients": long_result.params.to_dict(),
+                "t_values": long_result.tvalues.to_dict(),
+                "forecast": long_forecast,
+            }
+
+            long_train_matching_bank_period = long_history_frame[
+                long_history_frame["quarter"].isin(train_bank["quarter"])
+            ]
+            relative_levels = models.compute_bank_relative_levels(
+                train_bank, dependent_column, long_train_matching_bank_period
+            )
+            anchored_predicted_bank = models.forecast_anchored_to_aggregate(
+                relative_levels, long_forecast, test_bank
+            )
+            anchored_forecast = models.aggregate_bank_predictions_to_industry_rate(
+                test_bank, anchored_predicted_bank
+            )
+            anchored_metrics = validation.backtest_summary(actual_industry, anchored_forecast)
+            results["anchored_to_aggregate"] = {
+                "metrics": anchored_metrics,
+                "forecast": anchored_forecast,
+            }
+
+    return results
+
 
 def run_category_backtests(
-    category_bank_dataset: pd.DataFrame, dependent_column: str, covid_spec: str
+    category_bank_dataset: pd.DataFrame,
+    dependent_column: str,
+    covid_spec: str,
+    long_history_frame: pd.DataFrame | None = None,
 ) -> dict[str, dict]:
     """Runs both required out-of-time validation windows
     (VALIDATION_WINDOWS) for one category/dependent/covid_spec, using
     ONLY the training dataset (quarter <= 2025Q4) -- the holdout window
-    is separate, see `run_holdout_backtest`. Returns {window_label ->
-    `_run_three_families`'s result dict}, OMITTING any window whose
-    training slice has fewer than MIN_TRAINING_QUARTERS of data or whose
-    test slice is entirely empty -- a real, expected situation for a
-    category with a documented start-date gap (e.g. AUTO has no data
-    before 2011Q1, so the 2006Q4-training/2007-2010 window has nothing to
-    fit or score for it), not an error to raise on."""
+    is separate, see `run_holdout_backtest`. `long_history_frame`
+    (optional): a FRED-derived long-history industry frame
+    (industry_history.build_long_industry_frame's output) for this
+    category/dependent -- if given, also runs the aggregate_long and
+    anchored_to_aggregate families (see `_run_model_families`). Returns
+    {window_label -> `_run_model_families`'s result dict}, OMITTING any
+    window whose training slice has fewer than MIN_TRAINING_QUARTERS of
+    data or whose test slice is entirely empty -- a real, expected
+    situation for a category with a documented start-date gap (e.g. AUTO
+    has no data before 2011Q1, so the 2006Q4-training/2007-2010 window
+    has nothing to fit or score for it), not an error to raise on."""
     industry_series_full = models.build_industry_series(
         category_bank_dataset, dependent_column
     ).frame
@@ -173,15 +232,17 @@ def run_category_backtests(
         )
         if len(train_industry) < MIN_TRAINING_QUARTERS or test_bank.empty:
             continue
-        results[label] = _run_three_families(
+        results[label] = _run_model_families(
             industry_series_full,
             train_industry,
             train_bank,
             test_bank,
             dependent_column,
             covid_spec,
+            train_end,
             test_start,
             test_end,
+            long_history_frame=long_history_frame,
         )
     return results
 
@@ -191,6 +252,7 @@ def run_holdout_backtest(
     category_holdout_dataset: pd.DataFrame,
     dependent_column: str,
     covid_spec: str,
+    long_history_frame: pd.DataFrame | None = None,
 ) -> dict | None:
     """Fits on the FULL training history (quarter <= HOLDOUT_TRAIN_END,
     2025Q4) and scores against the real, already-known 2026Q1-Q2 holdout
@@ -210,13 +272,15 @@ def run_holdout_backtest(
 
     test_start = category_holdout_dataset["quarter"].min()
     test_end = category_holdout_dataset["quarter"].max()
-    return _run_three_families(
+    return _run_model_families(
         industry_series_full,
         train_industry,
         category_train_dataset,
         category_holdout_dataset,
         dependent_column,
         covid_spec,
+        HOLDOUT_TRAIN_END,
         test_start,
         test_end,
+        long_history_frame=long_history_frame,
     )
