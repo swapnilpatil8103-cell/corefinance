@@ -11,6 +11,12 @@ import pytest
 
 from corefin.credit import models
 
+# The synthetic fixtures below all use this category -- commercial_and_industrial
+# keeps every one of CORE_MACRO_FEATURES (including the stock index),
+# which these tests' fixtures generate values for, matching
+# models.CATEGORY_MACRO_FEATURES.
+_CATEGORY = "commercial_and_industrial"
+
 
 def _quarters(start: str, n: int) -> pd.PeriodIndex:
     return pd.period_range(pd.Period(start, freq="Q"), periods=n, freq="Q")
@@ -85,6 +91,71 @@ def test_classify_coefficient_significance_requires_both_dicts_to_have_the_featu
     coefficients = {models.feature_column("Unemployment rate"): 1.0}
     result = models.classify_coefficient_significance(coefficients, {})
     assert result == {}
+
+
+# --------------------------------------------- per-category feature sets ---
+
+
+def test_category_macro_features_ci_keeps_the_stock_index():
+    features = models.CATEGORY_MACRO_FEATURES["commercial_and_industrial"]
+    assert models.STOCK_INDEX_FEATURE in features
+    assert len(features) == 4
+
+
+def test_category_macro_features_every_other_category_drops_the_stock_index():
+    # Real finding on the actual build: the stock index's YoY change was
+    # wrong-signed AND statistically significant in the bank panel model
+    # for several real-estate/consumer categories (see models.py's module
+    # docstring for the investigated mechanism) -- dropped everywhere
+    # except commercial_and_industrial.
+    for category in models.CATEGORY_MACRO_FEATURES:
+        if category == "commercial_and_industrial":
+            continue
+        features = models.CATEGORY_MACRO_FEATURES[category]
+        assert models.STOCK_INDEX_FEATURE not in features
+        assert len(features) == 3
+
+
+def test_category_macro_features_lookup_works_with_a_loancategory_member():
+    from corefin.credit.schema import LoanCategory
+
+    by_enum = models.CATEGORY_MACRO_FEATURES[LoanCategory.CI]
+    by_string = models.CATEGORY_MACRO_FEATURES["commercial_and_industrial"]
+    assert by_enum == by_string
+
+
+def test_fit_aggregate_model_excludes_stock_index_for_a_non_ci_category():
+    dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=20)
+    series = models.build_industry_series(dataset, "winsorized_nco_rate").frame
+    result = models.fit_aggregate_model(
+        series, "residential_mortgage", include_pandemic_dummy=False
+    )
+    assert models.feature_column(models.STOCK_INDEX_FEATURE) not in result.params.index
+    assert models.feature_column("Unemployment rate") in result.params.index
+
+
+def test_fit_panel_fe_model_excludes_stock_index_for_a_non_ci_category():
+    dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=40)
+    fit = models.fit_panel_fe_model(
+        dataset, "auto", "winsorized_nco_rate", include_pandemic_dummy=False
+    )
+    assert models.feature_column(models.STOCK_INDEX_FEATURE) not in fit.result.params.index
+
+
+def test_predict_panel_fe_and_fit_must_agree_on_category_or_columns_mismatch():
+    # fit and predict must be called with the SAME category -- using a
+    # mismatched one would look up the wrong feature set and either KeyError
+    # or silently use the wrong columns. This test documents/locks the
+    # matching-category contract by confirming a mismatched category raises.
+    dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=20)
+    fit = models.fit_panel_fe_model(
+        dataset, "residential_mortgage", "winsorized_nco_rate", include_pandemic_dummy=False
+    )
+    with pytest.raises(KeyError):
+        models.predict_panel_fe(
+            fit, dataset, "commercial_and_industrial", "winsorized_nco_rate",
+            include_pandemic_dummy=False,
+        )
 
 
 # --------------------------------------------------------- feature prep ---
@@ -175,7 +246,7 @@ def test_build_industry_series_lag1_is_shifted_by_exactly_one_quarter_no_leakage
 def test_fit_aggregate_model_recovers_the_known_signs():
     dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=20)
     series = models.build_industry_series(dataset, "winsorized_nco_rate").frame
-    result = models.fit_aggregate_model(series, include_pandemic_dummy=False)
+    result = models.fit_aggregate_model(series, _CATEGORY, include_pandemic_dummy=False)
     coefficients = result.params.to_dict()
     t_values = result.tvalues.to_dict()
     signs = models.classify_coefficient_significance(coefficients, t_values)
@@ -191,13 +262,13 @@ def test_forecast_aggregate_dynamic_never_reads_the_actual_future_rate():
     dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=20)
     series = models.build_industry_series(dataset, "winsorized_nco_rate").frame
     train = series[series["quarter"] <= pd.Period("2022Q4", freq="Q")]
-    result = models.fit_aggregate_model(train, include_pandemic_dummy=False)
+    result = models.fit_aggregate_model(train, _CATEGORY, include_pandemic_dummy=False)
 
     forecast_start = pd.Period("2023Q1", freq="Q")
     forecast_end = pd.Period("2024Q4", freq="Q")
 
     forecast_a = models.forecast_aggregate_dynamic(
-        result, series, forecast_start, forecast_end, include_pandemic_dummy=False
+        result, series, _CATEGORY, forecast_start, forecast_end, include_pandemic_dummy=False
     )
 
     corrupted = series.copy()
@@ -205,7 +276,7 @@ def test_forecast_aggregate_dynamic_never_reads_the_actual_future_rate():
     corrupted.loc[in_window, "industry_rate"] = 999.0  # garbage actual values
 
     forecast_b = models.forecast_aggregate_dynamic(
-        result, corrupted, forecast_start, forecast_end, include_pandemic_dummy=False
+        result, corrupted, _CATEGORY, forecast_start, forecast_end, include_pandemic_dummy=False
     )
     pd.testing.assert_series_equal(forecast_a, forecast_b)
 
@@ -216,12 +287,12 @@ def test_forecast_aggregate_dynamic_is_recursive_not_one_step():
     dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=20)
     series = models.build_industry_series(dataset, "winsorized_nco_rate").frame
     train = series[series["quarter"] <= pd.Period("2022Q4", freq="Q")]
-    result = models.fit_aggregate_model(train, include_pandemic_dummy=False)
+    result = models.fit_aggregate_model(train, _CATEGORY, include_pandemic_dummy=False)
 
     forecast_start = pd.Period("2023Q1", freq="Q")
     forecast_end = pd.Period("2023Q2", freq="Q")
     forecast = models.forecast_aggregate_dynamic(
-        result, series, forecast_start, forecast_end, include_pandemic_dummy=False
+        result, series, _CATEGORY, forecast_start, forecast_end, include_pandemic_dummy=False
     )
 
     # manually recompute Q2's prediction using Q1's PREDICTED value as the
@@ -253,7 +324,9 @@ def test_forecast_aggregate_dynamic_is_recursive_not_one_step():
 
 def test_fit_panel_fe_model_recovers_the_known_signs():
     dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=40)
-    fit = models.fit_panel_fe_model(dataset, "winsorized_nco_rate", include_pandemic_dummy=False)
+    fit = models.fit_panel_fe_model(
+        dataset, _CATEGORY, "winsorized_nco_rate", include_pandemic_dummy=False
+    )
     coefficients = fit.result.params.to_dict()
     t_values = fit.result.tvalues.to_dict()
     signs = models.classify_coefficient_significance(coefficients, t_values)
@@ -267,7 +340,9 @@ def test_fit_panel_fe_model_uses_clustered_standard_errors():
     # (which would treat every bank-quarter row as independent and
     # understate standard errors given repeated observations per bank).
     dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=40)
-    fit = models.fit_panel_fe_model(dataset, "winsorized_nco_rate", include_pandemic_dummy=False)
+    fit = models.fit_panel_fe_model(
+        dataset, _CATEGORY, "winsorized_nco_rate", include_pandemic_dummy=False
+    )
     assert fit.result.cov_type == "cluster"
 
 
@@ -280,18 +355,20 @@ def test_predict_panel_fe_uses_training_means_not_prediction_data_means():
     # the shared row's prediction.
     dataset = _synthetic_bank_dataset(n_quarters=30, n_banks=10)
     train = dataset[dataset["quarter"] <= pd.Period("2020Q4", freq="Q")]
-    fit = models.fit_panel_fe_model(train, "winsorized_nco_rate", include_pandemic_dummy=False)
+    fit = models.fit_panel_fe_model(
+        train, _CATEGORY, "winsorized_nco_rate", include_pandemic_dummy=False
+    )
 
     test = dataset[dataset["quarter"] > pd.Period("2020Q4", freq="Q")].reset_index(drop=True)
     shared_row = test.iloc[[0]]
 
     prediction_alone = models.predict_panel_fe(
-        fit, shared_row, "winsorized_nco_rate", include_pandemic_dummy=False
+        fit, shared_row, _CATEGORY, "winsorized_nco_rate", include_pandemic_dummy=False
     )
 
     extra_rows_same_bank = test[test["bank_id"] == shared_row["bank_id"].iloc[0]]
     prediction_with_more_rows = models.predict_panel_fe(
-        fit, extra_rows_same_bank, "winsorized_nco_rate", include_pandemic_dummy=False
+        fit, extra_rows_same_bank, _CATEGORY, "winsorized_nco_rate", include_pandemic_dummy=False
     )
 
     assert prediction_alone.iloc[0] == pytest.approx(
@@ -302,11 +379,13 @@ def test_predict_panel_fe_uses_training_means_not_prediction_data_means():
 def test_predict_panel_fe_drops_a_bank_never_seen_in_training():
     dataset = _synthetic_bank_dataset(n_quarters=10, n_banks=5)
     train = dataset[dataset["bank_id"] != 4]
-    fit = models.fit_panel_fe_model(train, "winsorized_nco_rate", include_pandemic_dummy=False)
+    fit = models.fit_panel_fe_model(
+        train, _CATEGORY, "winsorized_nco_rate", include_pandemic_dummy=False
+    )
 
     unseen_bank_rows = dataset[dataset["bank_id"] == 4]
     predicted = models.predict_panel_fe(
-        fit, unseen_bank_rows, "winsorized_nco_rate", include_pandemic_dummy=False
+        fit, unseen_bank_rows, _CATEGORY, "winsorized_nco_rate", include_pandemic_dummy=False
     )
     assert len(predicted) == 0
 
@@ -316,7 +395,9 @@ def test_predict_panel_fe_drops_a_bank_never_seen_in_training():
 
 def test_fit_gbm_model_predicts_higher_losses_for_higher_unemployment():
     dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=30)
-    model = models.fit_gbm_model(dataset, "winsorized_nco_rate", include_pandemic_dummy=False)
+    model = models.fit_gbm_model(
+        dataset, _CATEGORY, "winsorized_nco_rate", include_pandemic_dummy=False
+    )
 
     base_row = dataset.iloc[[0]].copy()
     low_unemployment = base_row.copy()
@@ -324,15 +405,21 @@ def test_fit_gbm_model_predicts_higher_losses_for_higher_unemployment():
     high_unemployment = base_row.copy()
     high_unemployment[models.feature_column("Unemployment rate")] = 10.0
 
-    low_pred = models.predict_gbm(model, low_unemployment, include_pandemic_dummy=False)
-    high_pred = models.predict_gbm(model, high_unemployment, include_pandemic_dummy=False)
+    low_pred = models.predict_gbm(model, low_unemployment, _CATEGORY, include_pandemic_dummy=False)
+    high_pred = models.predict_gbm(
+        model, high_unemployment, _CATEGORY, include_pandemic_dummy=False
+    )
     assert high_pred.iloc[0] > low_pred.iloc[0]
 
 
 def test_gbm_subsamples_when_training_data_exceeds_the_row_cap():
     dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=30)  # 1,200 rows
     model = models.fit_gbm_model(
-        dataset, "winsorized_nco_rate", include_pandemic_dummy=False, max_training_rows=100
+        dataset,
+        _CATEGORY,
+        "winsorized_nco_rate",
+        include_pandemic_dummy=False,
+        max_training_rows=100,
     )
     assert model.train_score_.shape[0] == model.n_estimators  # fit succeeded on the subsample
 

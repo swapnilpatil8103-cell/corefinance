@@ -12,21 +12,57 @@ model uses the SAME single lag (`LAG` = 1 quarter) for every macro driver
 conditions from about a quarter earlier, the standard convention in
 credit-loss stress-testing literature, and using one lag uniformly (not a
 per-category or per-variable search) is what "keep models simple" means
-here. `CORE_MACRO_FEATURES` is a small, fixed set of 4 macro drivers
-chosen for broad relevance across loan categories, not tuned per
-category: unemployment rate (labor-market stress, relevant to every
-consumer/C&I/CRE category), and the YoY percent-change (not the raw
-level -- Stage 3 built these specifically because the levels are
-non-stationary) of the three price/index variables: House Price Index
-(mortgage/home equity), Commercial Real Estate Price Index (CRE
-categories), and the Dow Jones Total Stock Market Index proxy (broad
-wealth-effect/credit-availability signal for C&I/consumer). The same 4
-features are used for every category and both dependent variables
-(NCO rate, NPL ratio) -- this is a deliberate simplicity choice, not an
-oversight: a category-specific feature search would multiply the
-combinations Stage 4 already has to run (3 families x 2 dependents x 2
-COVID specs x 3 validation windows x 9 categories) far beyond what "keep
-models simple and explainable" asks for.
+here. `CORE_MACRO_FEATURES` is the full universe of 4 macro drivers this
+project's Stage 4 modeling dataset makes available: unemployment rate
+(labor-market stress), and the YoY percent-change (not the raw level --
+Stage 3 built these specifically because the levels are non-stationary)
+of three price/index variables: House Price Index, Commercial Real
+Estate Price Index, and the Dow Jones Total Stock Market Index proxy.
+
+`CATEGORY_MACRO_FEATURES` selects, PER CATEGORY, which of those 4 a model
+actually uses -- not a per-category search over many candidates (still
+"keep models simple"), but ONE documented exception found on the real
+build: the stock index's YoY change came back wrong-signed AND
+statistically significant (see `classify_coefficient_significance`) in
+the bank panel model for cre_multifamily, cre_nonfarm_nonresidential,
+residential_mortgage, auto, and other_consumer -- a real finding, not
+noise (consistent across multiple validation windows and both COVID
+specs for each). The likely mechanism: 2009-2010's sharp equity-market
+rebound coincided with the same quarters' peak loss rates for these
+categories (losses lag the initial shock; the market recovery does not
+wait for losses to peak), so at LAG=1 the stock index's YoY change is
+still deeply negative (base effect: measured against the 2008-2009
+trough) while losses are at their worst -- a real, contemporaneous
+COINCIDENCE of the recovery and the loss peak, not a genuine causal
+"rising stocks raise these categories' losses" relationship. Only
+commercial_and_industrial keeps the stock index (a business-lending
+category genuinely sensitive to equity/credit-market conditions, and
+where the coefficient came back correctly signed); every other category
+uses the remaining 3 features. This changes 3->4 features for one
+category and 4->3 for the rest -- not a widened search, a single,
+documented correction based on a confirmed sign problem.
+
+A SEPARATE finding, investigated but NOT changed: the aggregate_long
+family (industry_history.py's FRED-derived long-history aggregate model)
+shows a significant NEGATIVE unemployment coefficient for credit_card,
+auto, and other_consumer specifically. Investigated via real correlation
+diagnostics (not assumed): unemployment_lag1's UNIVARIATE correlation
+with the industry rate is positive for all three (0.20-0.36, the
+expected direction), but the AR term (industry_rate_lag1) is extremely
+dominant for these series (0.85-0.94 correlation with the industry
+rate itself) and is itself moderately correlated with unemployment_lag1
+(0.30-0.43) -- textbook AR-term collinearity: with so much of the
+variance already absorbed by the lagged dependent variable, the
+REMAINING (partial) relationship attributed to unemployment is small and
+statistically unstable, and can flip sign in a finite sample without
+implying a real, wrong economic relationship. This is NOT fixed by
+dropping the AR term (the aggregate model is explicitly specified with
+one, per the original brief) or by changing the lag (that would be
+exactly the per-category lag search this project deliberately avoids) --
+it's disclosed here and in the coefficient table instead. The FRED series
+themselves were re-checked and are not the cause (verified live in an
+earlier round: real, sensible charge-off magnitudes, correctly annualized
+percent units).
 
 EXPECTED COEFFICIENT SIGNS: higher unemployment should raise losses
 (positive coefficient); rising home prices, rising CRE prices, and a
@@ -57,6 +93,8 @@ import pandas as pd
 import statsmodels.api as sm
 from sklearn.ensemble import GradientBoostingRegressor
 
+from corefin.credit.schema import LoanCategory
+
 PANDEMIC_START = pd.Period("2020Q2", freq="Q")
 PANDEMIC_END = pd.Period("2021Q4", freq="Q")
 ROBUSTNESS_EXCLUDE_START = pd.Period("2020Q1", freq="Q")
@@ -64,18 +102,40 @@ ROBUSTNESS_EXCLUDE_END = pd.Period("2021Q4", freq="Q")
 
 LAG = 1
 
+UNEMPLOYMENT_FEATURE = "Unemployment rate"
+HPI_FEATURE = "House Price Index YoY % change"
+CRE_PRICE_FEATURE = "Commercial Real Estate Price Index YoY % change"
+STOCK_INDEX_FEATURE = "Dow Jones Total Stock Market Index YoY % change"
+
 CORE_MACRO_FEATURES: tuple[str, ...] = (
-    "Unemployment rate",
-    "House Price Index YoY % change",
-    "Commercial Real Estate Price Index YoY % change",
-    "Dow Jones Total Stock Market Index YoY % change",
+    UNEMPLOYMENT_FEATURE,
+    HPI_FEATURE,
+    CRE_PRICE_FEATURE,
+    STOCK_INDEX_FEATURE,
 )
 
+_FEATURES_WITHOUT_STOCK_INDEX: tuple[str, ...] = (
+    UNEMPLOYMENT_FEATURE,
+    HPI_FEATURE,
+    CRE_PRICE_FEATURE,
+)
+
+# Per-category feature set -- see the module docstring for why C&I is the
+# one category that keeps the stock index. Keyed by the LoanCategory's
+# own string value (StrEnum), so both a LoanCategory member and its plain
+# string value look up the same entry.
+CATEGORY_MACRO_FEATURES: dict[str, tuple[str, ...]] = {
+    str(category): (
+        CORE_MACRO_FEATURES if category == LoanCategory.CI else _FEATURES_WITHOUT_STOCK_INDEX
+    )
+    for category in LoanCategory
+}
+
 EXPECTED_COEFFICIENT_SIGNS: dict[str, int] = {
-    "Unemployment rate": 1,
-    "House Price Index YoY % change": -1,
-    "Commercial Real Estate Price Index YoY % change": -1,
-    "Dow Jones Total Stock Market Index YoY % change": -1,
+    UNEMPLOYMENT_FEATURE: 1,
+    HPI_FEATURE: -1,
+    CRE_PRICE_FEATURE: -1,
+    STOCK_INDEX_FEATURE: -1,
 }
 
 # GBM is fit on a random sample (fixed seed, for reproducibility) when a
@@ -156,8 +216,12 @@ def classify_coefficient_significance(
     return result
 
 
-def _macro_feature_columns(include_pandemic: bool) -> list[str]:
-    columns = [feature_column(variable) for variable in CORE_MACRO_FEATURES]
+def _macro_feature_columns(category: str, include_pandemic: bool) -> list[str]:
+    """The macro feature columns a model for `category` uses -- see
+    CATEGORY_MACRO_FEATURES (every category except commercial_and_
+    industrial drops the stock index)."""
+    variables = CATEGORY_MACRO_FEATURES[category]
+    columns = [feature_column(variable) for variable in variables]
     if include_pandemic:
         columns = [*columns, "pandemic"]
     return columns
@@ -193,7 +257,11 @@ def build_industry_series(
     sums = grouped[["_w", "_wx"]].sum()
     industry_rate = (sums["_wx"] / sums["_w"]).rename("industry_rate")
 
-    macro_columns = _macro_feature_columns(include_pandemic=False)
+    # always the FULL set of macro columns (not the category-specific
+    # subset) -- this is just a data-carrying frame; fit_aggregate_model/
+    # forecast_aggregate_dynamic select the category-appropriate subset
+    # when they actually use it as regressors.
+    macro_columns = [feature_column(variable) for variable in CORE_MACRO_FEATURES]
     macro_first = scoped.groupby("quarter", observed=True)[macro_columns].first()
 
     frame = pd.concat([industry_rate, macro_first], axis=1).reset_index()
@@ -204,14 +272,18 @@ def build_industry_series(
 
 
 def fit_aggregate_model(
-    industry_series: pd.DataFrame, include_pandemic_dummy: bool = True
+    industry_series: pd.DataFrame, category: str, include_pandemic_dummy: bool = True
 ) -> sm.regression.linear_model.RegressionResultsWrapper:
     """Model family 1: OLS of the industry rate on its own lag
-    ("industry_rate_lag1") plus CORE_MACRO_FEATURES at `LAG` (plus the
-    pandemic dummy if `include_pandemic_dummy`). `industry_series`:
-    output of `build_industry_series`'s `.frame` (already possibly
-    filtered to a training window / pandemic-excluded by the caller)."""
-    feature_columns = ["industry_rate_lag1", *_macro_feature_columns(include_pandemic_dummy)]
+    ("industry_rate_lag1") plus `category`'s own macro features
+    (CATEGORY_MACRO_FEATURES) at `LAG` (plus the pandemic dummy if
+    `include_pandemic_dummy`). `industry_series`: output of
+    `build_industry_series`'s `.frame` (already possibly filtered to a
+    training window / pandemic-excluded by the caller)."""
+    feature_columns = [
+        "industry_rate_lag1",
+        *_macro_feature_columns(category, include_pandemic_dummy),
+    ]
     data = industry_series.dropna(subset=["industry_rate", *feature_columns])
     x = sm.add_constant(data[feature_columns], has_constant="add")
     y = data["industry_rate"]
@@ -221,6 +293,7 @@ def fit_aggregate_model(
 def forecast_aggregate_dynamic(
     result: sm.regression.linear_model.RegressionResultsWrapper,
     industry_series: pd.DataFrame,
+    category: str,
     forecast_start: pd.Period,
     forecast_end: pd.Period,
     include_pandemic_dummy: bool = True,
@@ -240,7 +313,10 @@ def forecast_aggregate_dynamic(
     seed_quarter = forecast_start - 1
     prior_rate = indexed.loc[seed_quarter, "industry_rate"]
 
-    feature_columns = ["industry_rate_lag1", *_macro_feature_columns(include_pandemic_dummy)]
+    feature_columns = [
+        "industry_rate_lag1",
+        *_macro_feature_columns(category, include_pandemic_dummy),
+    ]
     predictions: dict[pd.Period, float] = {}
     quarter = forecast_start
     while quarter <= forecast_end:
@@ -288,7 +364,10 @@ class PanelFEFit:
 
 
 def fit_panel_fe_model(
-    bank_dataset: pd.DataFrame, dependent_column: str, include_pandemic_dummy: bool = True
+    bank_dataset: pd.DataFrame,
+    category: str,
+    dependent_column: str,
+    include_pandemic_dummy: bool = True,
 ) -> PanelFEFit:
     """Model family 2: bank-level panel with bank FIXED EFFECTS, fit via
     the within (demeaning) estimator -- each bank's own TRAINING-SAMPLE
@@ -305,14 +384,14 @@ def fit_panel_fe_model(
     simplification worth being explicit about -- this project's "keep
     models simple and explainable," not a hidden shortcut); the point
     estimates (coefficients, predictions) are unaffected either way.
-    Features: CORE_MACRO_FEATURES at `LAG`, the pandemic dummy (if
-    `include_pandemic_dummy`), and log(average_balance) as the one bank
-    characteristic (a simple, standard bank-size control). Returns a
-    `PanelFEFit` bundling the fitted result with the per-bank training
-    means `predict_panel_fe` needs to demean new data consistently,
-    without leakage."""
+    Features: `category`'s own macro features (CATEGORY_MACRO_FEATURES)
+    at `LAG`, the pandemic dummy (if `include_pandemic_dummy`), and
+    log(average_balance) as the one bank characteristic (a simple,
+    standard bank-size control). Returns a `PanelFEFit` bundling the
+    fitted result with the per-bank training means `predict_panel_fe`
+    needs to demean new data consistently, without leakage."""
     data = _add_bank_characteristics(bank_dataset)
-    feature_columns = [*_macro_feature_columns(include_pandemic_dummy), "log_balance"]
+    feature_columns = [*_macro_feature_columns(category, include_pandemic_dummy), "log_balance"]
     data = data.dropna(subset=[dependent_column, *feature_columns, "bank_id"])
 
     bank_training_means = data.groupby("bank_id")[[dependent_column, *feature_columns]].mean()
@@ -332,23 +411,26 @@ def fit_panel_fe_model(
 def predict_panel_fe(
     fit: PanelFEFit,
     bank_dataset: pd.DataFrame,
+    category: str,
     dependent_column: str,
     include_pandemic_dummy: bool = True,
 ) -> pd.Series:
     """Predicts LEVEL values (not just within-estimator deviations) for
-    `bank_dataset` using `fit` (from `fit_panel_fe_model`): each bank's
-    fixed effect is recovered via the standard within-estimator identity
-    alpha_i = ybar_i - beta @ xbar_i, using `fit.bank_training_means` --
-    the TRAINING sample's own per-bank means, never recomputed from
-    `bank_dataset` itself (recomputing from the data being predicted,
-    e.g. a forecast window, would leak that data into the demeaning
-    basis -- the same leakage risk `fit_panel_fe_model` avoids). A bank
-    absent from `fit.bank_training_means` (never seen in training) has no
-    estimable fixed effect and is dropped -- an expected limitation of a
-    bank fixed-effects model, not a bug: it cannot predict for a bank it
-    never trained on."""
+    `bank_dataset` using `fit` (from `fit_panel_fe_model` -- `category`
+    must be the SAME one `fit_panel_fe_model` was called with, so the
+    feature set matches): each bank's fixed effect is recovered via the
+    standard within-estimator identity alpha_i = ybar_i - beta @ xbar_i,
+    using `fit.bank_training_means` -- the TRAINING sample's own per-bank
+    means, never recomputed from `bank_dataset` itself (recomputing from
+    the data being predicted, e.g. a forecast window, would leak that
+    data into the demeaning basis -- the same leakage risk
+    `fit_panel_fe_model` avoids). A bank absent from `fit.
+    bank_training_means` (never seen in training) has no estimable fixed
+    effect and is dropped -- an expected limitation of a bank fixed-
+    effects model, not a bug: it cannot predict for a bank it never
+    trained on."""
     data = _add_bank_characteristics(bank_dataset)
-    feature_columns = [*_macro_feature_columns(include_pandemic_dummy), "log_balance"]
+    feature_columns = [*_macro_feature_columns(category, include_pandemic_dummy), "log_balance"]
     data = data.dropna(subset=[*feature_columns, "bank_id"])
     data = data[data["bank_id"].isin(fit.bank_training_means.index)]
 
@@ -364,6 +446,7 @@ def predict_panel_fe(
 
 def fit_gbm_model(
     bank_dataset: pd.DataFrame,
+    category: str,
     dependent_column: str,
     include_pandemic_dummy: bool = True,
     max_training_rows: int = GBM_MAX_TRAINING_ROWS,
@@ -372,13 +455,14 @@ def fit_gbm_model(
     """Model family 3: gradient boosting (sklearn's GradientBoostingRegressor
     -- 100 shallow trees, depth 3, for a simple/fast/explainable-via-
     feature_importances_ fit, not a tuned model) on the same features as
-    `fit_panel_fe_model` (CORE_MACRO_FEATURES at `LAG`, the pandemic
-    dummy, log(average_balance)) -- no bank fixed effects (trees don't
-    need them; log_balance is the bank characteristic instead). Subsamples
-    to `max_training_rows` (fixed `random_state`) if the training data
-    has more rows, to keep runtime bounded across the full Stage 4 sweep."""
+    `fit_panel_fe_model` (`category`'s own CATEGORY_MACRO_FEATURES at
+    `LAG`, the pandemic dummy, log(average_balance)) -- no bank fixed
+    effects (trees don't need them; log_balance is the bank
+    characteristic instead). Subsamples to `max_training_rows` (fixed
+    `random_state`) if the training data has more rows, to keep runtime
+    bounded across the full Stage 4 sweep."""
     data = _add_bank_characteristics(bank_dataset)
-    feature_columns = [*_macro_feature_columns(include_pandemic_dummy), "log_balance"]
+    feature_columns = [*_macro_feature_columns(category, include_pandemic_dummy), "log_balance"]
     data = data.dropna(subset=[dependent_column, *feature_columns])
     if len(data) > max_training_rows:
         data = data.sample(n=max_training_rows, random_state=random_state)
@@ -393,10 +477,13 @@ def fit_gbm_model(
 def predict_gbm(
     model: GradientBoostingRegressor,
     bank_dataset: pd.DataFrame,
+    category: str,
     include_pandemic_dummy: bool = True,
 ) -> pd.Series:
+    """`category` must be the SAME one `fit_gbm_model` was called with,
+    so the feature set matches."""
     data = _add_bank_characteristics(bank_dataset)
-    feature_columns = [*_macro_feature_columns(include_pandemic_dummy), "log_balance"]
+    feature_columns = [*_macro_feature_columns(category, include_pandemic_dummy), "log_balance"]
     valid = data.dropna(subset=feature_columns)
     predicted = model.predict(valid[feature_columns])
     return pd.Series(predicted, index=valid.index)

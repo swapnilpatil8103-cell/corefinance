@@ -14,6 +14,9 @@ import pytest
 
 from corefin.credit import backtest, models
 
+# Matches _synthetic_category_dataset's own "category" column below.
+_CATEGORY = "commercial_and_industrial"
+
 
 def _synthetic_category_dataset(start="2001Q1", n_quarters=84, n_banks=8, seed=1) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
@@ -99,7 +102,11 @@ def test_run_category_backtests_adds_long_history_families_when_given():
     dataset = _synthetic_category_dataset(n_quarters=84, n_banks=8)  # 2001Q1..2021Q4
     long_history_frame = _synthetic_long_history_frame()  # 1991Q1..2021Q4
     results = backtest.run_category_backtests(
-        dataset, "winsorized_nco_rate", covid_spec="main", long_history_frame=long_history_frame
+        dataset,
+        _CATEGORY,
+        "winsorized_nco_rate",
+        covid_spec="main",
+        long_history_frame=long_history_frame,
     )
     for window_result in results.values():
         assert "aggregate_long" in window_result
@@ -110,7 +117,9 @@ def test_run_category_backtests_adds_long_history_families_when_given():
 
 def test_run_category_backtests_without_long_history_frame_omits_those_families():
     dataset = _synthetic_category_dataset(n_quarters=84, n_banks=8)
-    results = backtest.run_category_backtests(dataset, "winsorized_nco_rate", covid_spec="main")
+    results = backtest.run_category_backtests(
+        dataset, _CATEGORY, "winsorized_nco_rate", covid_spec="main"
+    )
     for window_result in results.values():
         assert "aggregate_long" not in window_result
         assert "anchored_to_aggregate" not in window_result
@@ -124,7 +133,9 @@ def test_add_npl_ratio_columns_adds_both_columns():
 
 def test_run_category_backtests_covers_both_windows_and_all_three_families():
     dataset = _synthetic_category_dataset(n_quarters=84, n_banks=8)  # 2001Q1..2021Q4
-    results = backtest.run_category_backtests(dataset, "winsorized_nco_rate", covid_spec="main")
+    results = backtest.run_category_backtests(
+        dataset, _CATEGORY, "winsorized_nco_rate", covid_spec="main"
+    )
     assert set(results) == {"2007-2010", "2020-2021"}
     for window_result in results.values():
         assert set(window_result) == {"aggregate_ar", "panel_fe", "gbm"}
@@ -139,7 +150,9 @@ def test_run_category_backtests_skips_a_window_with_no_training_data():
     # results, not crash the whole sweep with an empty-design-matrix error.
     # covers 2015Q1..2022Q4
     dataset = _synthetic_category_dataset(start="2015Q1", n_quarters=32, n_banks=8)
-    results = backtest.run_category_backtests(dataset, "winsorized_nco_rate", covid_spec="main")
+    results = backtest.run_category_backtests(
+        dataset, _CATEGORY, "winsorized_nco_rate", covid_spec="main"
+    )
     assert "2007-2010" not in results
     assert "2020-2021" in results
 
@@ -148,7 +161,7 @@ def test_run_holdout_backtest_returns_none_with_insufficient_training_data():
     train_dataset = _synthetic_category_dataset(start="2025Q1", n_quarters=4, n_banks=8)
     holdout_dataset = _synthetic_category_dataset(start="2026Q1", n_quarters=2, n_banks=8, seed=2)
     result = backtest.run_holdout_backtest(
-        train_dataset, holdout_dataset, "winsorized_nco_rate", covid_spec="main"
+        train_dataset, holdout_dataset, _CATEGORY, "winsorized_nco_rate", covid_spec="main"
     )
     assert result is None
 
@@ -157,7 +170,7 @@ def test_run_holdout_backtest_returns_none_with_empty_holdout():
     train_dataset = _synthetic_category_dataset(start="2019Q1", n_quarters=28, n_banks=8)
     empty_holdout = train_dataset.iloc[0:0]
     result = backtest.run_holdout_backtest(
-        train_dataset, empty_holdout, "winsorized_nco_rate", covid_spec="main"
+        train_dataset, empty_holdout, _CATEGORY, "winsorized_nco_rate", covid_spec="main"
     )
     assert result is None
 
@@ -170,10 +183,10 @@ def test_main_and_robustness_are_identical_for_pre_covid_validation_windows():
     # the two specs must produce numerically identical backtests here.
     dataset = _synthetic_category_dataset(n_quarters=84, n_banks=8)
     main_results = backtest.run_category_backtests(
-        dataset, "winsorized_nco_rate", covid_spec="main"
+        dataset, _CATEGORY, "winsorized_nco_rate", covid_spec="main"
     )
     robustness_results = backtest.run_category_backtests(
-        dataset, "winsorized_nco_rate", covid_spec="robustness"
+        dataset, _CATEGORY, "winsorized_nco_rate", covid_spec="robustness"
     )
     for window_label in main_results:
         main_metrics = main_results[window_label]["aggregate_ar"]["metrics"]
@@ -191,10 +204,10 @@ def test_run_holdout_backtest_main_and_robustness_can_differ():
     train_dataset = _synthetic_category_dataset(start="2019Q1", n_quarters=28, n_banks=8)
     holdout_dataset = _synthetic_category_dataset(start="2026Q1", n_quarters=2, n_banks=8, seed=2)
     main_result = backtest.run_holdout_backtest(
-        train_dataset, holdout_dataset, "winsorized_nco_rate", covid_spec="main"
+        train_dataset, holdout_dataset, _CATEGORY, "winsorized_nco_rate", covid_spec="main"
     )
     robustness_result = backtest.run_holdout_backtest(
-        train_dataset, holdout_dataset, "winsorized_nco_rate", covid_spec="robustness"
+        train_dataset, holdout_dataset, _CATEGORY, "winsorized_nco_rate", covid_spec="robustness"
     )
     assert main_result["aggregate_ar"]["metrics"]["n"] > 0
     assert robustness_result["aggregate_ar"]["metrics"]["n"] > 0

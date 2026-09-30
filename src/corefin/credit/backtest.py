@@ -82,6 +82,7 @@ def _run_model_families(
     train_industry: pd.DataFrame,
     train_bank: pd.DataFrame,
     test_bank: pd.DataFrame,
+    category: str,
     dependent_column: str,
     covid_spec: str,
     train_end: pd.Period,
@@ -99,7 +100,8 @@ def _run_model_families(
     train_industry's start>, test_end] -- it's both the actual (Call-
     Report) series every family's backtest metrics are scored against AND
     the source aggregate_ar's own forecast reads for its macro lag
-    features and seed quarter."""
+    features and seed quarter. `category` selects each family's macro
+    feature set (models.CATEGORY_MACRO_FEATURES)."""
     include_pandemic = covid_spec == "main"
     if covid_spec == "robustness":
         train_industry = models.exclude_pandemic_years(train_industry)
@@ -107,10 +109,13 @@ def _run_model_families(
 
     actual_industry = industry_series_full.set_index("quarter")["industry_rate"]
 
-    agg_result = models.fit_aggregate_model(train_industry, include_pandemic_dummy=include_pandemic)
+    agg_result = models.fit_aggregate_model(
+        train_industry, category, include_pandemic_dummy=include_pandemic
+    )
     agg_forecast = models.forecast_aggregate_dynamic(
         agg_result,
         industry_series_full,
+        category,
         test_start,
         test_end,
         include_pandemic_dummy=include_pandemic,
@@ -118,19 +123,19 @@ def _run_model_families(
     agg_metrics = validation.backtest_summary(actual_industry, agg_forecast)
 
     fe_fit = models.fit_panel_fe_model(
-        train_bank, dependent_column, include_pandemic_dummy=include_pandemic
+        train_bank, category, dependent_column, include_pandemic_dummy=include_pandemic
     )
     fe_predicted_bank = models.predict_panel_fe(
-        fe_fit, test_bank, dependent_column, include_pandemic_dummy=include_pandemic
+        fe_fit, test_bank, category, dependent_column, include_pandemic_dummy=include_pandemic
     )
     fe_forecast = models.aggregate_bank_predictions_to_industry_rate(test_bank, fe_predicted_bank)
     fe_metrics = validation.backtest_summary(actual_industry, fe_forecast)
 
     gbm_model = models.fit_gbm_model(
-        train_bank, dependent_column, include_pandemic_dummy=include_pandemic
+        train_bank, category, dependent_column, include_pandemic_dummy=include_pandemic
     )
     gbm_predicted_bank = models.predict_gbm(
-        gbm_model, test_bank, include_pandemic_dummy=include_pandemic
+        gbm_model, test_bank, category, include_pandemic_dummy=include_pandemic
     )
     gbm_forecast = models.aggregate_bank_predictions_to_industry_rate(test_bank, gbm_predicted_bank)
     gbm_metrics = validation.backtest_summary(actual_industry, gbm_forecast)
@@ -163,11 +168,12 @@ def _run_model_families(
             long_train = models.exclude_pandemic_years(long_train)
         if len(long_train) >= MIN_TRAINING_QUARTERS:
             long_result = models.fit_aggregate_model(
-                long_train, include_pandemic_dummy=include_pandemic
+                long_train, category, include_pandemic_dummy=include_pandemic
             )
             long_forecast = models.forecast_aggregate_dynamic(
                 long_result,
                 long_history_frame,
+                category,
                 test_start,
                 test_end,
                 include_pandemic_dummy=include_pandemic,
@@ -203,6 +209,7 @@ def _run_model_families(
 
 def run_category_backtests(
     category_bank_dataset: pd.DataFrame,
+    category: str,
     dependent_column: str,
     covid_spec: str,
     long_history_frame: pd.DataFrame | None = None,
@@ -237,6 +244,7 @@ def run_category_backtests(
             train_industry,
             train_bank,
             test_bank,
+            category,
             dependent_column,
             covid_spec,
             train_end,
@@ -250,6 +258,7 @@ def run_category_backtests(
 def run_holdout_backtest(
     category_train_dataset: pd.DataFrame,
     category_holdout_dataset: pd.DataFrame,
+    category: str,
     dependent_column: str,
     covid_spec: str,
     long_history_frame: pd.DataFrame | None = None,
@@ -277,6 +286,7 @@ def run_holdout_backtest(
         train_industry,
         category_train_dataset,
         category_holdout_dataset,
+        category,
         dependent_column,
         covid_spec,
         HOLDOUT_TRAIN_END,

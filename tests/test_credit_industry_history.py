@@ -81,10 +81,13 @@ def test_build_long_industry_frame_is_directly_usable_by_fit_aggregate_model():
     )
     frame = industry_history.build_long_industry_frame(long_rate, macro_history)
     train = frame[frame["quarter"] <= pd.Period("1994Q4", freq="Q")]
-    result = models.fit_aggregate_model(train, include_pandemic_dummy=False)
+    result = models.fit_aggregate_model(
+        train, "commercial_and_industrial", include_pandemic_dummy=False
+    )
     forecast = models.forecast_aggregate_dynamic(
         result,
         frame,
+        "commercial_and_industrial",
         pd.Period("1995Q1", freq="Q"),
         pd.Period("1995Q4", freq="Q"),
         include_pandemic_dummy=False,

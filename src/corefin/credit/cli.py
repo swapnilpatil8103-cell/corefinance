@@ -748,7 +748,11 @@ def fit_models(
             for covid_spec in backtest.COVID_SPECS:
                 typer.echo(f"  {dep_label} / {covid_spec}: backtesting...")
                 window_results = backtest.run_category_backtests(
-                    category_train, dep_column, covid_spec, long_history_frame=long_history_frame
+                    category_train,
+                    category,
+                    dep_column,
+                    covid_spec,
+                    long_history_frame=long_history_frame,
                 )
                 for window_label, family_results in window_results.items():
                     for family, result in family_results.items():
@@ -770,6 +774,7 @@ def fit_models(
                     holdout_results = backtest.run_holdout_backtest(
                         category_train,
                         category_holdout,
+                        category,
                         dep_column,
                         covid_spec,
                         long_history_frame=long_history_frame,
