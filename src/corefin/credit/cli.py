@@ -808,8 +808,15 @@ def fit_models(
         pd.DataFrame(comparison_rows).to_csv(comparison_path, index=False)
         typer.echo(f"wrote {comparison_path}")
 
+    backtest_table = pd.DataFrame(backtest_rows)
+    summary = backtest.build_backtest_summary(backtest_table)
+    summary_path = output_dir / "backtest_summary.csv"
+    summary.to_csv(summary_path, index=False)
+    typer.echo(f"wrote {summary_path}")
+
     charts_dir = output_dir / "charts"
     charts_dir.mkdir(parents=True, exist_ok=True)
+    grid_entries: list[tuple[str, pd.Series, dict]] = []
     for (category, dep_label, covid_spec, window_label), family_forecasts in forecast_store.items():
         if window_label != "2007-2010" or covid_spec != "main":
             continue
@@ -817,12 +824,19 @@ def fit_models(
         dep_column = backtest.DEPENDENT_VARIABLES[dep_label]
         actual_industry = models.build_industry_series(category_train, dep_column).frame
         actual_series = actual_industry.set_index("quarter")["industry_rate"]
+        title = f"{category} -- {dep_label} (2007-2010 backtest)"
         chart_path = charts_dir / f"{category}_{dep_label}_2007-2010.png"
         charts.render_backtest_chart(
             actual_series,
             family_forecasts,
-            title=f"{category} -- {dep_label} (2007-2010 backtest)",
+            title=title,
             y_label=dep_label,
             path=str(chart_path),
         )
         typer.echo(f"wrote {chart_path}")
+        grid_entries.append((title, actual_series, family_forecasts))
+
+    if grid_entries:
+        grid_path = output_dir / "backtest_chart_grid_2007-2010.png"
+        charts.render_backtest_chart_grid(grid_entries, str(grid_path))
+        typer.echo(f"wrote {grid_path}")

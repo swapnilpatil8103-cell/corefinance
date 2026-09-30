@@ -206,3 +206,86 @@ def test_run_holdout_backtest_main_and_robustness_can_differ():
     robustness_coefs = robustness_result["aggregate_ar"]["coefficients"]
     assert "pandemic" in main_coefs
     assert "pandemic" not in robustness_coefs
+
+
+# ------------------------------------------------------ backtest summary ---
+
+
+def test_build_backtest_summary_picks_the_lowest_rmse_family():
+    table = pd.DataFrame(
+        [
+            {
+                "category": "commercial_and_industrial",
+                "dependent": "nco_rate",
+                "covid_spec": "main",
+                "window": "2007-2010",
+                "model_family": "aggregate_ar",
+                "rmse": 0.02,
+                "actual_peak_rate": 0.03,
+                "predicted_peak_rate": 0.05,
+                "peak_rate_error": 0.02,
+                "peak_timing_error_quarters": -1,
+            },
+            {
+                "category": "commercial_and_industrial",
+                "dependent": "nco_rate",
+                "covid_spec": "main",
+                "window": "2007-2010",
+                "model_family": "panel_fe",
+                "rmse": 0.006,
+                "actual_peak_rate": 0.03,
+                "predicted_peak_rate": 0.018,
+                "peak_rate_error": -0.012,
+                "peak_timing_error_quarters": -1,
+            },
+        ]
+    )
+    summary = backtest.build_backtest_summary(table)
+    assert len(summary) == 1
+    row = summary.iloc[0]
+    assert row["best_model"] == "panel_fe"
+    assert row["rmse"] == pytest.approx(0.006)
+
+
+def test_build_backtest_summary_omits_a_category_with_no_rows_in_the_window():
+    table = pd.DataFrame(
+        [
+            {
+                "category": "auto",
+                "dependent": "nco_rate",
+                "covid_spec": "main",
+                "window": "2020-2021",  # not 2007-2010 -- AUTO has no data that far back
+                "model_family": "aggregate_ar",
+                "rmse": 0.01,
+                "actual_peak_rate": 0.02,
+                "predicted_peak_rate": 0.02,
+                "peak_rate_error": 0.0,
+                "peak_timing_error_quarters": 0,
+            }
+        ]
+    )
+    summary = backtest.build_backtest_summary(table)
+    assert summary.empty
+
+
+def test_build_backtest_summary_one_row_per_category_dependent_pair():
+    table = pd.DataFrame(
+        [
+            {
+                "category": "commercial_and_industrial",
+                "dependent": dep,
+                "covid_spec": "main",
+                "window": "2007-2010",
+                "model_family": "aggregate_ar",
+                "rmse": 0.01,
+                "actual_peak_rate": 0.02,
+                "predicted_peak_rate": 0.02,
+                "peak_rate_error": 0.0,
+                "peak_timing_error_quarters": 0,
+            }
+            for dep in ("nco_rate", "npl_ratio")
+        ]
+    )
+    summary = backtest.build_backtest_summary(table)
+    assert len(summary) == 2
+    assert set(summary["dependent"]) == {"nco_rate", "npl_ratio"}

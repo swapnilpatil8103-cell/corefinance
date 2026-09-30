@@ -284,3 +284,39 @@ def run_holdout_backtest(
         test_end,
         long_history_frame=long_history_frame,
     )
+
+
+def build_backtest_summary(
+    backtest_table: pd.DataFrame, window: str = "2007-2010", covid_spec: str = "main"
+) -> pd.DataFrame:
+    """One-page backtest summary, per the brief: one row per (category,
+    dependent) with the BEST model family (lowest RMSE) in `window`/
+    `covid_spec` (2007-2010/main by default -- the crisis backtest this
+    whole fix was about), and that family's predicted vs actual peak rate
+    and peak-timing error. `backtest_table`: the tidy rows `fit-models`
+    writes to backtest_table.csv (or an equivalent DataFrame with the
+    same columns). Categories/dependents with no row in `window`/
+    `covid_spec` (e.g. AUTO has no 2007-2010 data at all) are omitted,
+    not filled with a placeholder."""
+    scoped = backtest_table[
+        (backtest_table["window"] == window) & (backtest_table["covid_spec"] == covid_spec)
+    ]
+    rows = []
+    for (category, dependent), group in scoped.groupby(["category", "dependent"]):
+        valid = group.dropna(subset=["rmse"])
+        if valid.empty:
+            continue
+        best = valid.loc[valid["rmse"].idxmin()]
+        rows.append(
+            {
+                "category": category,
+                "dependent": dependent,
+                "best_model": best["model_family"],
+                "rmse": best["rmse"],
+                "actual_peak_rate": best["actual_peak_rate"],
+                "predicted_peak_rate": best["predicted_peak_rate"],
+                "peak_rate_error": best["peak_rate_error"],
+                "peak_timing_error_quarters": best["peak_timing_error_quarters"],
+            }
+        )
+    return pd.DataFrame(rows)
