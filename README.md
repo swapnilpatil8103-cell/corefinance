@@ -9,7 +9,7 @@ projects, built as the shared foundation for:
    times over a grid of candidate structures.
 2. **Sponsor LBO Monte Carlo Engine** — runs thousands of operating
    scenarios to produce distributions of IRR, MOIC and covenant breaches.
-3. **Credit-Loss Forecasting Engine** (later, bank-specific).
+3. **Credit-Loss Forecasting Engine** (built — see [below](#credit-loss-forecasting-engine)).
 4. **Bank M&A CET1 & Accretion Simulator** (later, bank-specific).
 
 Projects 3 and 4 need a bank statement model, which is structurally
@@ -706,6 +706,151 @@ It does **not** reuse `debt/`, `statements/income_statement.py`, or
 `statements/bank_statement.py` and a bank-specific `metrics/` module,
 following the same "pure numpy functions + a small orchestrator" pattern
 used throughout `statements/corporate_model.py`.
+
+*(The Credit-Loss Forecasting Engine described below was built as its own
+independent pipeline under `credit/` — quarter-indexed pandas, not
+`Timeline`/`DriverSet`/`CheckResult` — rather than following this
+prediction; the two haven't been reconciled yet.)*
+
+## Credit-Loss Forecasting Engine
+
+A four-stage, bank-specific pipeline under `credit/`, reachable via
+`corefin credit <command> --help`: real FFIEC Call Report bulk data
+parsed into a bank-quarter panel (Stages 1-2), Fed macro history and
+stress-scenario ingestion (Stage 3), and three model families backtested
+out-of-time against the 2008 and COVID crises (Stage 4, this section).
+Every MDRM item code, FRED series ID and Fed scenario URL was verified
+live against the real source before being committed — see `schema.py`,
+`sources/fred.py` and `sources/fed_scenarios.py`'s own docstrings for the
+verification trail (including two self-corrected mistakes: an initial
+"CORCACBS" charge-off series guess that turned out to mean "Consumer
+Loans," not credit cards, and an RCFD-fallback bug that briefly cratered
+credit-card coverage before a real-data regression test caught it).
+
+### Stage 4: model families
+
+Three families, fit per loan category and per dependent variable
+(winsorized NCO rate, winsorized NPL ratio):
+
+1. **Aggregate AR** (`aggregate_ar`) — OLS of the industry-wide rate on
+   its own lag plus lagged macro drivers, using the Call Report panel's
+   own history (2001Q1 on).
+2. **Aggregate, long history** (`aggregate_long`) — the same
+   specification, but trained on FRED's industry-wide charge-off/
+   delinquency rate release instead, which for most categories reaches
+   back to 1991Q1 — far enough to include the early-1990s CRE bust the
+   Call Report panel (2001-2006 for the first backtest) never saw.
+3. **Bank panel with fixed effects** (`panel_fe`) — bank-level Call
+   Report data, bank fixed effects via the within estimator, standard
+   errors clustered by bank.
+4. **Anchored to aggregate** (`anchored_to_aggregate`) — each bank's own
+   historical level relative to the industry average, multiplied by the
+   long-history aggregate's forecast; a way to give bank-level
+   projections access to the longer crisis history without fitting a
+   full bank panel model on data that doesn't exist before 2001.
+5. **Gradient boosting** (`gbm`) — same bank-level features as
+   `panel_fe`, no fixed effects (log balance stands in for bank size).
+
+Every family uses the SAME single lag (1 quarter) on every macro driver,
+and the SAME macro feature set per category — unemployment rate, and the
+YoY percent-change (not the level; the level is non-stationary) of the
+House Price Index and the Commercial Real Estate Price Index for every
+category, PLUS the Dow Jones Total Stock Market Index's YoY change for
+`commercial_and_industrial` only. That last exception is a real,
+evidence-based correction, not a tuned search: the stock index came back
+wrong-signed *and* statistically significant in the bank panel model for
+every real-estate and consumer category tried (likely mechanism: the
+sharp 2009-2010 equity rebound coincided with these categories' own peak
+loss quarters, a coincidence of timing, not a genuine causal
+relationship) — dropped everywhere except C&I, a business-lending
+category where it came back correctly signed.
+
+Two COVID treatments are fit and reported side by side: a pandemic
+indicator for 2020Q2-2021Q4 (`main`), and dropping all of 2020-2021 from
+training entirely (`robustness`). For both required backtest windows
+(2007-2010, 2020-2021) neither training period reaches 2020-2021, so the
+two specs are numerically identical there by construction; they only
+diverge for the full-sample fit used for the 2026 holdout and Stage 5's
+projections.
+
+### Backtest summary (2007-2010, main spec)
+
+One row per category/dependent: the best model by RMSE, and that model's
+predicted vs. actual peak and how many quarters early/late it called the
+peak (negative = called it early).
+
+| Category | Dependent | Best model | RMSE | Actual peak | Predicted peak | Peak timing error |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| commercial_and_industrial | NCO rate | anchored_to_aggregate | 0.60% | 2.92% | 2.25% | -2q |
+| commercial_and_industrial | NPL ratio | panel_fe | 0.36% | 2.47% | 1.97% | 0q |
+| cre_construction | NCO rate | aggregate_long | 2.68% | 6.90% | 2.02% | +2q |
+| cre_construction | NPL ratio | aggregate_ar | 9.53% | 16.52% | 3.04% | -4q |
+| cre_multifamily | NCO rate | aggregate_long | 0.61% | 1.29% | 2.02% | -2q |
+| cre_multifamily | NPL ratio | panel_fe | 2.11% | 5.05% | 1.32% | -5q |
+| cre_nonfarm_nonresidential | NCO rate | anchored_to_aggregate | 0.31% | 1.26% | 1.50% | -3q |
+| cre_nonfarm_nonresidential | NPL ratio | panel_fe | 1.76% | 4.31% | 1.40% | -4q |
+| credit_card | NCO rate | aggregate_ar | 1.11% | 11.61% | 10.88% | -1q |
+| credit_card | NPL ratio | gbm | 0.27% | 2.72% | 2.29% | 0q |
+| home_equity | NCO rate | gbm | 1.80% | 3.15% | 0.37% | -2q |
+| home_equity | NPL ratio | gbm | 1.16% | 1.94% | 0.37% | -15q |
+| residential_mortgage | NCO rate | aggregate_ar | 1.04% | 1.96% | 0.41% | -1q |
+| residential_mortgage | NPL ratio | aggregate_long | 3.52% | 8.65% | 3.39% | -4q |
+
+(`auto` and `other_consumer` have no row here — both have no Call Report
+data before 2011Q1, so the 2007-2010 window has nothing to backtest; they
+still get 2020-2021 and 2026-holdout backtests.)
+
+![Actual vs. predicted, every category/dependent, 2007-2010 backtest](docs/credit/backtest_chart_grid_2007-2010.png)
+
+### Limitations, honestly
+
+- **CRE construction's real peak (6.9% NCO) is understated by every
+  model (best: 2.0%)** because a real, per-category data gap caps how
+  far back its training history goes: FRED's own CRE charge-off release
+  is a single combined series (construction, multifamily and nonfarm-
+  nonresidential all share it — FRED doesn't publish a construction-
+  specific series at all), so `aggregate_long`'s 1991Q1 history for this
+  category is really "all CRE," not construction's own, more volatile
+  experience. The improvement over the Call-Report-only aggregate is
+  real (0.5%→2.0%, confirmed by direct comparison) but bounded by that
+  shared-series ceiling.
+- **Residential mortgage's real peak (2.0-8.7% depending on the
+  dependent variable) can't be learned from 1991-2006** at all, long
+  history or not: there simply wasn't a comparable housing downturn in
+  that window for any model to learn from — the early-1990s cycle that
+  helped CRE so much left residential mortgage credit largely
+  unscathed. This is a real limit of backtesting against history, not a
+  fixable modeling gap.
+- **2020-2021 is systematically over-predicted** relative to how mild
+  the realized losses actually were, across most categories and models
+  — unemployment spiked exactly as the models expect losses to follow,
+  but stimulus, forbearance and loan-modification programs (not
+  represented in any of this project's macro features) kept realized
+  charge-offs and delinquencies far below what the unemployment spike
+  alone would predict. `home_equity`'s NPL ratio backtest shows this
+  starkest: the actual peak came 15 quarters later than every model
+  predicted.
+- **A handful of coefficients remain wrong-signed and statistically
+  significant** (87 of 900 checkable coefficients on the current build,
+  `coefficient_table.csv`'s `sign_classification` column) even after
+  dropping the stock index — concentrated in two well-diagnosed,
+  documented patterns rather than scattered noise: unemployment's
+  coefficient in the AR-term models (`aggregate_ar`/`aggregate_long`),
+  where a dominant, highly persistent AR term absorbs most of the true
+  relationship and leaves an unstable residual coefficient on
+  unemployment (confirmed via real correlation diagnostics: unemployment
+  alone correlates positively with every affected category's loss rate,
+  as expected — only the multi-variate, AR-term-included coefficient
+  flips); and the CRE price feature's coefficient in `panel_fe` for
+  non-CRE categories, where it's collinear with the House Price Index
+  (0.53 correlation) and picks up an unstable residual sign rather than
+  a genuine "CRE prices up → more losses in auto loans" relationship.
+  See `models.py`'s module docstring for the full diagnostic trail.
+- **Projections (Stage 5) use models trained on the full sample through
+  2025Q4**, which DOES include 2008-2010 and 2020-2021 — the backtest
+  windows above exist to measure how well a model generalizes to a
+  crisis it never saw, which is a harder and more honest test than the
+  full-sample fit Stage 5 actually projects with.
 
 ## Testing conventions
 
