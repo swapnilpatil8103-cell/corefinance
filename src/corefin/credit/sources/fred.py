@@ -185,3 +185,110 @@ FED_SCENARIO_VARIABLE_TO_FRED: dict[str, FredSeriesMapping] = {
     ),
     "Market Volatility Index": FredSeriesMapping("VIXCLS", "D", "1990-01-02", "level", True),
 }
+
+
+@dataclass(frozen=True)
+class IndustrySeriesMapping:
+    chargeoff_series_id: str
+    delinquency_series_id: str | None
+    observation_start: str
+    is_exact_match: bool
+    note: str = ""
+
+
+# FRED's own "Charge-Off and Delinquency Rates on Loans and Leases at
+# Commercial Banks" release (verified live via the FRED API's series-
+# search endpoint, not guessed -- an initial guess at these IDs based on
+# naming conventions from a similar, differently-scoped series would have
+# been wrong: e.g. "CORCACBS" is real but is "Charge-Off Rate on CONSUMER
+# Loans," not credit cards specifically -- the real credit-card series is
+# CORCCACBS). All values are ALREADY ANNUALIZED, in PERCENT (e.g. 5.80
+# means 5.80%, not 0.058) -- divide by 100 before comparing against this
+# project's own decimal-fraction rate columns (annualized_nco_rate,
+# winsorized_nco_rate, etc.). NSA (not seasonally adjusted) variants are
+# used throughout to match this project's own Call-Report aggregation,
+# which is likewise raw/unadjusted -- an SA variant of the same series
+# exists for every one of these (just drop the trailing "N" for "S").
+#
+# These are INDUSTRY-WIDE aggregates across ALL commercial banks (not
+# bank-level data) -- used only to extend model family 1's (the
+# aggregate AR model's) TRAINING HISTORY back before the Call Report
+# panel's own 2001Q1 start, especially to 1991Q1 (where CRE/residential
+# mortgage data begins), covering the early-1990s CRE bust the
+# 2001-2006 Call Report window misses entirely. Bank-level models (family
+# 2/3) stay on the Call Report panel -- these series have no bank-level
+# breakdown to join against individual banks' characteristics.
+INDUSTRY_CHARGEOFF_DELINQUENCY_SERIES: dict[str, IndustrySeriesMapping] = {
+    "commercial_and_industrial": IndustrySeriesMapping(
+        "CORBLACBN",
+        "DRBLACBN",
+        "1985-01-01",
+        False,
+        "FRED's 'Business Loans' series is the closest available match to this project's "
+        "commercial_and_industrial category, but 'business loans' is not necessarily an exact "
+        "definitional match to Call Report Schedule RC-C C&I loans -- real crisis-era values "
+        "(e.g. 2008Q3-2009Q2: 0.98/1.55/1.71/2.31 percent) are in the right ballpark for known "
+        "C&I charge-off experience, but this is a proxy, not a confirmed identical series.",
+    ),
+    "cre_construction": IndustrySeriesMapping(
+        "CORCREXFACBN",
+        "DRCRELEXFACBN",
+        "1991-01-01",
+        False,
+        "FRED publishes ONE combined 'Commercial Real Estate Loans (Excluding Farmland)' "
+        "series -- it does NOT split by construction/multifamily/nonfarm-nonresidential the "
+        "way this project's schema does. The SAME series is used for all three CRE "
+        "categories below; each one's long-history aggregate model is really being trained "
+        "against overall CRE charge-off experience, not its own sub-category's specific "
+        "dynamics -- a real, documented limitation, not a precise match.",
+    ),
+    "cre_multifamily": IndustrySeriesMapping(
+        "CORCREXFACBN",
+        "DRCRELEXFACBN",
+        "1991-01-01",
+        False,
+        "Same series/caveat as cre_construction.",
+    ),
+    "cre_nonfarm_nonresidential": IndustrySeriesMapping(
+        "CORCREXFACBN",
+        "DRCRELEXFACBN",
+        "1991-01-01",
+        False,
+        "Same series/caveat as cre_construction.",
+    ),
+    "residential_mortgage": IndustrySeriesMapping(
+        "CORSFRMACBN",
+        "DRSFRMACBN",
+        "1991-01-01",
+        True,
+        "'Single Family Residential Mortgages, Booked in Domestic Offices' is essentially the "
+        "same definition as this project's residential_mortgage category.",
+    ),
+    "credit_card": IndustrySeriesMapping(
+        "CORCCACBN",
+        "DRCCLACBN",
+        "1985-01-01",
+        True,
+        "'Charge-Off Rate on Credit Card Loans' is an exact definitional match.",
+    ),
+    "auto": IndustrySeriesMapping(
+        "COROCLACBN",
+        "DROCLACBN",
+        "1985-01-01",
+        False,
+        "FRED has no series isolating auto loans specifically for all commercial banks -- "
+        "confirmed via a live series search (no match for 'automobile'/'auto loan' charge-off "
+        "or delinquency scoped to all commercial banks). 'Other Consumer Loans' (FRED's only "
+        "non-credit-card consumer bucket) is used as an imperfect proxy -- auto loans are a "
+        "large component of it, but so is everything else non-credit-card. The SAME series is "
+        "also used for other_consumer below (FRED doesn't split the two either).",
+    ),
+    "other_consumer": IndustrySeriesMapping(
+        "COROCLACBN", "DROCLACBN", "1985-01-01", False, "Same series/caveat as auto."
+    ),
+    # home_equity: deliberately absent. No FRED series (charge-off,
+    # delinquency, or otherwise) isolates home equity loans/lines for all
+    # commercial banks -- confirmed via a live series search. This
+    # category's aggregate model has no long-history option and stays on
+    # the Call Report panel's own 2001Q1-onward history, same as before.
+}
