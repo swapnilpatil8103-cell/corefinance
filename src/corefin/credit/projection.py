@@ -32,6 +32,14 @@ from __future__ import annotations
 
 import pandas as pd
 
+from corefin.credit import macro, models
+
+# Model families that need the FRED-derived long-history aggregate frame
+# (industry_history.build_long_industry_frame's output) rather than the
+# Call-Report-only one: aggregate_long fits directly on it; anchored_to_
+# aggregate anchors bank-level projections to ITS forecast.
+FAMILIES_REQUIRING_LONG_HISTORY = ("aggregate_long", "anchored_to_aggregate")
+
 # Weighted-average-life, in QUARTERS, per category -- industry rule-of-
 # thumb figures for the "lifetime" horizon the simplified CECL allowance
 # averages projected losses over (see module docstring: NOT derived from
@@ -163,3 +171,170 @@ def build_cecl_projection(
         prior_allowance = allowance_required
 
     return pd.DataFrame(rows).set_index("quarter")
+
+
+def build_projection_macro_lag_frame(
+    combined_macro_path: pd.DataFrame, projection_quarters: list[pd.Period]
+) -> pd.DataFrame:
+    """combined_macro_path: quarter-indexed RAW (unlagged) macro columns
+    covering at least one quarter before `projection_quarters[0]` -- e.g.
+    macro.build_full_macro_path(macro_history, scenario)'s output, which
+    concatenates the Fed's own actual history with a scenario path (Stage
+    3) and validates they adjoin with no gap. Returns a frame with
+    "quarter", one models.feature_column(variable) per models.
+    CORE_MACRO_FEATURES at models.LAG, and "pandemic" (always 0.0 --
+    every projection quarter here is 2026Q1 or later, past
+    models.PANDEMIC_END; set explicitly rather than left to default-fill
+    as NaN after a concat, which would otherwise poison every family that
+    reads "pandemic" directly from the frame rather than recomputing it
+    -- a real bug this project's own tests caught: forecast_aggregate_
+    dynamic reads it as a plain feature column, unlike fit_panel_fe_model/
+    fit_gbm_model, which always recompute it fresh via
+    models.add_pandemic_indicator regardless of what's already there).
+    The model-fitting functions select each category's own relevant
+    subset of the macro columns; this builds the full set unconditionally,
+    the same division of responsibility industry_history.py uses."""
+    rows = []
+    for quarter in projection_quarters:
+        lagged_quarter = quarter - models.LAG
+        row = {"quarter": quarter, "pandemic": 0.0}
+        for variable in models.CORE_MACRO_FEATURES:
+            row[models.feature_column(variable)] = combined_macro_path.loc[lagged_quarter, variable]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_synthetic_future_bank_frame(
+    last_actual_bank_quarter: pd.DataFrame, projection_macro_lag_frame: pd.DataFrame
+) -> pd.DataFrame:
+    """last_actual_bank_quarter: one category's bank-level rows for the
+    LAST ACTUAL quarter only (e.g. 2025Q4) -- every bank's own
+    characteristics (average_balance, bank_id, etc.) held STATIC at this
+    level for every future quarter (the same static-balance-sheet
+    convention this module uses throughout -- a bank-level analogue of
+    holding the aggregate balance constant). `projection_macro_lag_frame`:
+    `build_projection_macro_lag_frame`'s output. Returns one row per
+    (bank, projection quarter), with every macro lag column OVERWRITTEN
+    by that quarter's own projection value (broadcast identically across
+    banks, matching how these columns are already constant across banks
+    within a real quarter) -- used by the bank-level families (panel_fe,
+    gbm, and, for just its bank_id/quarter columns, anchored_to_
+    aggregate) to project forward."""
+    macro_columns = [c for c in projection_macro_lag_frame.columns if c != "quarter"]
+    frames = []
+    for _, macro_row in projection_macro_lag_frame.iterrows():
+        quarter_frame = last_actual_bank_quarter.copy()
+        quarter_frame["quarter"] = macro_row["quarter"]
+        for column in macro_columns:
+            quarter_frame[column] = macro_row[column]
+        frames.append(quarter_frame)
+    return pd.concat(frames, ignore_index=True)
+
+
+def project_category_nco_rate(
+    category: str,
+    best_model_family: str,
+    category_train_dataset: pd.DataFrame,
+    macro_history: pd.DataFrame,
+    scenario: pd.DataFrame,
+    long_history_frame: pd.DataFrame | None,
+) -> pd.Series:
+    """Fits `best_model_family` on the FULL sample (`category_train_
+    dataset`, quarter <= 2025Q4, "winsorized_nco_rate" as the dependent
+    variable -- CECL allowances fund future charge-offs, so the NCO rate
+    is the relevant loss-rate driver, not the NPL ratio) and projects the
+    industry NCO rate forward over `scenario`'s own quarters, using
+    `scenario`'s macro path (NOT real historical macro data -- this is a
+    genuine forecast into the unknown future, unlike Stage 4's
+    backtests). `macro_history`/`scenario`: quarter-indexed, raw
+    (unlagged) macro columns, as macro.normalize_fed_historic/
+    normalize_scenario produce. `long_history_frame` (industry_history.
+    build_long_industry_frame's output) is required for "aggregate_long"
+    and "anchored_to_aggregate" (see FAMILIES_REQUIRING_LONG_HISTORY),
+    ignored otherwise. Returns a quarter-indexed Series covering
+    `scenario`'s own quarters (the industry-level projected NCO rate)."""
+    if best_model_family in FAMILIES_REQUIRING_LONG_HISTORY and long_history_frame is None:
+        raise ValueError(f"{best_model_family} requires long_history_frame")
+
+    full_macro_path = macro.build_full_macro_path(macro_history, scenario)
+    projection_quarters = list(scenario.index)
+    macro_lag_frame = build_projection_macro_lag_frame(full_macro_path, projection_quarters)
+
+    industry_series_full = models.build_industry_series(
+        category_train_dataset, "winsorized_nco_rate"
+    ).frame
+
+    if best_model_family in ("aggregate_ar", "aggregate_long"):
+        source_frame = (
+            long_history_frame if best_model_family == "aggregate_long" else industry_series_full
+        )
+        extended = pd.concat([source_frame, macro_lag_frame], ignore_index=True, sort=False)
+        result = models.fit_aggregate_model(source_frame, category, include_pandemic_dummy=True)
+        return models.forecast_aggregate_dynamic(
+            result,
+            extended,
+            category,
+            projection_quarters[0],
+            projection_quarters[-1],
+            include_pandemic_dummy=True,
+        )
+
+    last_quarter = category_train_dataset["quarter"].max()
+    last_actual_bank_quarter = category_train_dataset[
+        category_train_dataset["quarter"] == last_quarter
+    ]
+    synthetic_future_bank = build_synthetic_future_bank_frame(
+        last_actual_bank_quarter, macro_lag_frame
+    )
+
+    if best_model_family == "panel_fe":
+        fit = models.fit_panel_fe_model(
+            category_train_dataset, category, "winsorized_nco_rate", include_pandemic_dummy=True
+        )
+        predicted_bank = models.predict_panel_fe(
+            fit, synthetic_future_bank, category, "winsorized_nco_rate", include_pandemic_dummy=True
+        )
+        return models.aggregate_bank_predictions_to_industry_rate(
+            synthetic_future_bank, predicted_bank
+        )
+
+    if best_model_family == "gbm":
+        gbm_model = models.fit_gbm_model(
+            category_train_dataset, category, "winsorized_nco_rate", include_pandemic_dummy=True
+        )
+        predicted_bank = models.predict_gbm(
+            gbm_model, synthetic_future_bank, category, include_pandemic_dummy=True
+        )
+        return models.aggregate_bank_predictions_to_industry_rate(
+            synthetic_future_bank, predicted_bank
+        )
+
+    if best_model_family == "anchored_to_aggregate":
+        long_extended = pd.concat(
+            [long_history_frame, macro_lag_frame], ignore_index=True, sort=False
+        )
+        long_result = models.fit_aggregate_model(
+            long_history_frame, category, include_pandemic_dummy=True
+        )
+        long_forecast = models.forecast_aggregate_dynamic(
+            long_result,
+            long_extended,
+            category,
+            projection_quarters[0],
+            projection_quarters[-1],
+            include_pandemic_dummy=True,
+        )
+        long_train_matching_bank_period = long_history_frame[
+            long_history_frame["quarter"].isin(category_train_dataset["quarter"])
+        ]
+        relative_levels = models.compute_bank_relative_levels(
+            category_train_dataset, "winsorized_nco_rate", long_train_matching_bank_period
+        )
+        predicted_bank = models.forecast_anchored_to_aggregate(
+            relative_levels, long_forecast, synthetic_future_bank
+        )
+        return models.aggregate_bank_predictions_to_industry_rate(
+            synthetic_future_bank, predicted_bank
+        )
+
+    raise ValueError(f"unknown model family {best_model_family!r}")

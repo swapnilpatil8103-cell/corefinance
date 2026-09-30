@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
-from corefin.credit import projection
+from corefin.credit import models, projection
 
 
 def _quarters(start: str, n: int) -> pd.PeriodIndex:
@@ -132,3 +133,129 @@ def test_category_weighted_average_life_covers_every_modeling_category():
     for category in MODELING_CATEGORIES:
         assert str(category) in projection.CATEGORY_WEIGHTED_AVERAGE_LIFE_QUARTERS
         assert projection.CATEGORY_WEIGHTED_AVERAGE_LIFE_QUARTERS[str(category)] > 0
+
+
+# ----------------------------------------------------- forward projection ---
+
+_CATEGORY = "commercial_and_industrial"
+
+
+def _synthetic_macro_history_and_scenario():
+    history_quarters = pd.period_range(pd.Period("2001Q1", freq="Q"), periods=100, freq="Q")
+    scenario_quarters = pd.period_range(pd.Period("2026Q1", freq="Q"), periods=13, freq="Q")
+    n_history = len(history_quarters)
+    n_scenario = len(scenario_quarters)
+
+    def _series(n, seed_offset):
+        r = np.random.default_rng(7 + seed_offset)
+        return 5.0 + np.cumsum(r.normal(0, 0.2, size=n))
+
+    history = pd.DataFrame(
+        {
+            "Unemployment rate": _series(n_history, 1),
+            "House Price Index YoY % change": _series(n_history, 2),
+            "Commercial Real Estate Price Index YoY % change": _series(n_history, 3),
+            "Dow Jones Total Stock Market Index YoY % change": _series(n_history, 4),
+        },
+        index=history_quarters,
+    )
+    scenario = pd.DataFrame(
+        {
+            "Unemployment rate": _series(n_scenario, 5) + 3,
+            "House Price Index YoY % change": _series(n_scenario, 6) - 2,
+            "Commercial Real Estate Price Index YoY % change": _series(n_scenario, 7) - 2,
+            "Dow Jones Total Stock Market Index YoY % change": _series(n_scenario, 8) - 5,
+        },
+        index=scenario_quarters,
+    )
+    return history, scenario
+
+
+def _synthetic_category_train_dataset(macro_history: pd.DataFrame, n_banks=10, seed=9):
+    rng = np.random.default_rng(seed)
+    quarters = macro_history.index
+    rows = []
+    for bank_idx in range(n_banks):
+        base_balance = rng.uniform(5_000.0, 50_000.0)
+        for quarter in quarters:
+            balance = base_balance * (1.0 + rng.normal(0, 0.02))
+            true_nco = max(
+                0.01
+                + 0.0015 * macro_history.loc[quarter, "Unemployment rate"]
+                - 0.001 * macro_history.loc[quarter, "House Price Index YoY % change"]
+                + rng.normal(0, 0.0004),
+                -0.05,
+            )
+            rows.append(
+                {
+                    "bank_id": bank_idx,
+                    "quarter": quarter,
+                    "category": _CATEGORY,
+                    "average_balance": balance,
+                    "winsorized_nco_rate": true_nco,
+                    models.feature_column("Unemployment rate"): macro_history.loc[
+                        quarter, "Unemployment rate"
+                    ],
+                    models.feature_column("House Price Index YoY % change"): macro_history.loc[
+                        quarter, "House Price Index YoY % change"
+                    ],
+                    models.feature_column(
+                        "Commercial Real Estate Price Index YoY % change"
+                    ): macro_history.loc[
+                        quarter, "Commercial Real Estate Price Index YoY % change"
+                    ],
+                    models.feature_column(
+                        "Dow Jones Total Stock Market Index YoY % change"
+                    ): macro_history.loc[
+                        quarter, "Dow Jones Total Stock Market Index YoY % change"
+                    ],
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+@pytest.mark.parametrize(
+    "family", ["aggregate_ar", "aggregate_long", "panel_fe", "gbm", "anchored_to_aggregate"]
+)
+def test_project_category_nco_rate_covers_every_scenario_quarter(family):
+    macro_history, scenario = _synthetic_macro_history_and_scenario()
+    category_train_dataset = _synthetic_category_train_dataset(macro_history)
+    from corefin.credit import industry_history
+
+    long_history_frame = industry_history.build_long_industry_frame(
+        models.build_industry_series(category_train_dataset, "winsorized_nco_rate").frame.set_index(
+            "quarter"
+        )["industry_rate"],
+        macro_history,
+    )
+    forecast = projection.project_category_nco_rate(
+        _CATEGORY, family, category_train_dataset, macro_history, scenario, long_history_frame
+    )
+    assert list(forecast.index) == list(scenario.index)
+    assert forecast.notna().all()
+
+
+def test_project_category_nco_rate_raises_without_long_history_when_required():
+    macro_history, scenario = _synthetic_macro_history_and_scenario()
+    category_train_dataset = _synthetic_category_train_dataset(macro_history)
+    with pytest.raises(ValueError, match="requires long_history_frame"):
+        projection.project_category_nco_rate(
+            _CATEGORY, "aggregate_long", category_train_dataset, macro_history, scenario, None
+        )
+
+
+def test_build_cecl_projection_end_to_end_with_a_projected_path():
+    macro_history, scenario = _synthetic_macro_history_and_scenario()
+    category_train_dataset = _synthetic_category_train_dataset(macro_history)
+    forecast = projection.project_category_nco_rate(
+        _CATEGORY, "aggregate_ar", category_train_dataset, macro_history, scenario, None
+    )
+    realized = models.build_industry_series(category_train_dataset, "winsorized_nco_rate").frame
+    realized_rate = realized.set_index("quarter")["industry_rate"]
+    last_quarter = category_train_dataset["quarter"].max()
+    starting_balance = category_train_dataset[category_train_dataset["quarter"] == last_quarter][
+        "average_balance"
+    ].sum()
+    result = projection.build_cecl_projection(realized_rate, forecast, _CATEGORY, starting_balance)
+    assert len(result) == len(scenario) + 1  # + the jump-off row
+    assert result["allowance_required"].notna().all()
