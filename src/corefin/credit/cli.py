@@ -9,7 +9,16 @@ from pathlib import Path
 import pandas as pd
 import typer
 
-from corefin.credit import backtest, charts, industry_history, macro, models, projection
+from corefin.credit import (
+    backtest,
+    charts,
+    industry_history,
+    macro,
+    models,
+    monte_carlo,
+    projection,
+    seed_decomposition,
+)
 from corefin.credit.panel import build_industry_nco_rate_report, build_panel, flag_chargeoff_gaps
 from corefin.credit.schema import LoanCategory
 from corefin.credit.sources import fed_scenarios as fed_scenarios_source
@@ -1359,3 +1368,287 @@ def crisis_replay_cmd(
     output.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(output, index=False)
     typer.echo(f"\nwrote {output}")
+
+
+@app.command("monte-carlo")
+def monte_carlo_cmd(
+    panel_path: Path = typer.Option(
+        DEFAULT_MODELING_DATASET_PATH,
+        "--panel",
+        help="Training modeling dataset (quarter <= 2025Q4) -- the SAME full sample "
+        "`project` fits on.",
+    ),
+    macro_history_path: Path = typer.Option(
+        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-fed-history`."
+    ),
+    industry_history_path: Path = typer.Option(
+        DEFAULT_INDUSTRY_HISTORY_PATH,
+        "--industry-history",
+        help="Output of `fetch-industry-history` (optional -- aggregate_long/"
+        "anchored_to_aggregate are skipped as not-applicable without it).",
+    ),
+    scenario_dir: Path = typer.Option(
+        DEFAULT_SCENARIO_DIR, "--scenario-dir", help="Output directory of `fetch-scenarios`."
+    ),
+    model_selection_path: Path = typer.Option(
+        DEFAULT_PROJECTIONS_DIR / "model_selection.csv",
+        "--model-selection",
+        help="Output of `project` -- the selected model family per category.",
+    ),
+    n_draws: int = typer.Option(
+        monte_carlo.DEFAULT_N_DRAWS,
+        "--n-draws",
+        help="Number of Monte Carlo draws per category/scenario.",
+    ),
+    random_state: int = typer.Option(
+        0, "--random-state", help="Seed for reproducible draws."
+    ),
+    output: Path = typer.Option(
+        DEFAULT_PROJECTIONS_DIR / "monte_carlo_loss_distribution.csv",
+        "--output",
+        help="Where to write the loss-distribution summary table.",
+    ),
+    categories: str | None = typer.Option(
+        None,
+        "--categories",
+        help="Comma-separated LoanCategory values to run (default: every category "
+        "backtest.MODELING_CATEGORIES lists).",
+    ),
+) -> None:
+    """Stage 6 (first build): for each category's SELECTED model family
+    (read from `model_selection_path`, `project`'s own output), fits it
+    ONCE on the full sample (`monte_carlo.fit_monte_carlo_model`) and
+    runs `n_draws` Monte Carlo draws per scenario (baseline,
+    severely_adverse), combining macro path uncertainty (each draw
+    perturbs the scenario with an independent shock per quarter, scaled
+    by that macro variable's OWN real historical quarter-over-quarter
+    standard deviation -- `monte_carlo.estimate_macro_shock_std`) and the
+    fitted model's own residual uncertainty. Produces a loss
+    DISTRIBUTION per category/scenario (mean, std, and the 5/25/50/75/95
+    percentiles of the cumulative loss rate over the full scenario
+    horizon), not just Stage 5's single deterministic path -- see
+    monte_carlo.py's module docstring for exactly what's randomized and
+    the documented simplifications (independent, not correlated, macro
+    shocks; residual noise added independently per quarter rather than
+    propagated through the AR recursion)."""
+    training = pd.read_parquet(panel_path)
+    training["quarter"] = pd.PeriodIndex(training["quarter"].astype(str), freq="Q")
+
+    macro_history = pd.read_parquet(macro_history_path)
+    macro_history["quarter"] = pd.PeriodIndex(macro_history["quarter"].astype(str), freq="Q")
+    macro_history = macro_history.set_index("quarter")
+    shock_std = monte_carlo.estimate_macro_shock_std(macro_history)
+
+    long_history_frames = _load_long_history_frames(industry_history_path, macro_history)
+
+    scenarios: dict[str, pd.DataFrame] = {}
+    for scenario_name in ("baseline", "severely_adverse"):
+        path = scenario_dir / f"{scenario_name}.parquet"
+        if not path.exists():
+            typer.echo(f"no cached scenario at {path} -- run fetch-scenarios first", err=True)
+            raise typer.Exit(code=1)
+        scenario = pd.read_parquet(path)
+        scenario["quarter"] = pd.PeriodIndex(scenario["quarter"].astype(str), freq="Q")
+        scenarios[scenario_name] = scenario.set_index("quarter")
+
+    if not model_selection_path.exists():
+        typer.echo(f"no model selection at {model_selection_path} -- run project first", err=True)
+        raise typer.Exit(code=1)
+    model_selection = pd.read_csv(model_selection_path)
+    selected_family_by_category = (
+        model_selection[model_selection["selected"]].set_index("category")["model_family"].to_dict()
+    )
+
+    selected_categories = (
+        [LoanCategory(c.strip()) for c in categories.split(",")]
+        if categories
+        else list(backtest.MODELING_CATEGORIES)
+    )
+
+    rows = []
+    for category in selected_categories:
+        category_train = training[training["category"] == category]
+        if category_train.empty:
+            typer.echo(f"{category}: no training rows -- skipping", err=True)
+            continue
+        family = selected_family_by_category.get(str(category))
+        if family is None:
+            typer.echo(f"{category}: not in {model_selection_path} -- skipping", err=True)
+            continue
+
+        long_history_frame = long_history_frames.get((category, "nco_rate"))
+        if family in projection.FAMILIES_REQUIRING_LONG_HISTORY and long_history_frame is None:
+            typer.echo(
+                f"{category}: selected model {family} needs long-history data that "
+                "isn't cached -- falling back to aggregate_ar",
+                err=True,
+            )
+            family = FALLBACK_MODEL_FAMILY
+
+        mc_model = monte_carlo.fit_monte_carlo_model(
+            category, family, category_train, long_history_frame
+        )
+        for scenario_name, scenario in scenarios.items():
+            losses = monte_carlo.simulate_category_losses(
+                mc_model,
+                macro_history,
+                scenario,
+                shock_std,
+                n_draws=n_draws,
+                random_state=random_state,
+            )
+            summary = monte_carlo.summarize_loss_distribution(
+                str(category), scenario_name, family, losses
+            )
+            typer.echo(
+                f"{category} / {scenario_name} ({family}): mean={summary.mean:.4%} "
+                f"p5={summary.percentiles[5]:.4%} p50={summary.percentiles[50]:.4%} "
+                f"p95={summary.percentiles[95]:.4%}"
+            )
+            percentile_columns = {
+                f"p{p}": summary.percentiles[p] for p in monte_carlo.MONTE_CARLO_PERCENTILES
+            }
+            rows.append(
+                {
+                    "category": str(category),
+                    "scenario": scenario_name,
+                    "model_family": family,
+                    "n_draws": summary.n_draws,
+                    "mean": summary.mean,
+                    "std": summary.std,
+                    **percentile_columns,
+                }
+            )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(output, index=False)
+    typer.echo(f"\nwrote {output}")
+
+
+@app.command("seed-decomposition")
+def seed_decomposition_cmd(
+    panel_path: Path = typer.Option(
+        DEFAULT_MODELING_DATASET_PATH,
+        "--panel",
+        help="Training modeling dataset (quarter <= 2025Q4) -- the SAME full sample "
+        "`project` fits on.",
+    ),
+    macro_history_path: Path = typer.Option(
+        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-fed-history`."
+    ),
+    industry_history_path: Path = typer.Option(
+        DEFAULT_INDUSTRY_HISTORY_PATH,
+        "--industry-history",
+        help="Output of `fetch-industry-history` (required for aggregate_long/"
+        "anchored_to_aggregate categories).",
+    ),
+    scenario_dir: Path = typer.Option(
+        DEFAULT_SCENARIO_DIR, "--scenario-dir", help="Output directory of `fetch-scenarios`."
+    ),
+    model_selection_path: Path = typer.Option(
+        DEFAULT_PROJECTIONS_DIR / "model_selection.csv",
+        "--model-selection",
+        help="Output of `project` -- the selected model family per category.",
+    ),
+    output_dir: Path = typer.Option(
+        DEFAULT_PROJECTIONS_DIR, "--output-dir", help="Where to write the decomposition tables."
+    ),
+    categories: str = typer.Option(
+        "commercial_and_industrial,cre_construction,cre_nonfarm_nonresidential,credit_card",
+        "--categories",
+        help="Comma-separated LoanCategory values -- must all use an AR-term family "
+        "(seed_decomposition.SEED_SWAPPABLE_FAMILIES).",
+    ),
+) -> None:
+    """Diagnostic (no model changes): decomposes the crisis-replay vs.
+    Fed-comparison gap for `categories` into a STARTING-POINT effect and
+    a MACRO-PATH effect (seed_decomposition.py). For each category's
+    SELECTED model family, reports all 4 variants (replay/scenario,
+    natural/swapped seed)'s 9- and 13-quarter cumulative loss and peak
+    quarter, and writes a quarter-by-quarter table of the key macro
+    drivers (unemployment, HPI YoY, CRE YoY) for both the real crisis
+    path and the Fed's severely-adverse scenario path, aligned by
+    position (not calendar quarter -- they're 18 years apart)."""
+    training = pd.read_parquet(panel_path)
+    training["quarter"] = pd.PeriodIndex(training["quarter"].astype(str), freq="Q")
+
+    macro_history = pd.read_parquet(macro_history_path)
+    macro_history["quarter"] = pd.PeriodIndex(macro_history["quarter"].astype(str), freq="Q")
+    macro_history = macro_history.set_index("quarter")
+    long_history_frames = _load_long_history_frames(industry_history_path, macro_history)
+
+    scenario_path = scenario_dir / "severely_adverse.parquet"
+    if not scenario_path.exists():
+        typer.echo(f"no cached scenario at {scenario_path} -- run fetch-scenarios first", err=True)
+        raise typer.Exit(code=1)
+    scenario = pd.read_parquet(scenario_path)
+    scenario["quarter"] = pd.PeriodIndex(scenario["quarter"].astype(str), freq="Q")
+    scenario = scenario.set_index("quarter")
+
+    if not model_selection_path.exists():
+        typer.echo(f"no model selection at {model_selection_path} -- run project first", err=True)
+        raise typer.Exit(code=1)
+    model_selection = pd.read_csv(model_selection_path)
+    selected_family_by_category = (
+        model_selection[model_selection["selected"]].set_index("category")["model_family"].to_dict()
+    )
+
+    rows = []
+    for category_str in categories.split(","):
+        category = LoanCategory(category_str.strip())
+        category_train = training[training["category"] == category]
+        family = selected_family_by_category.get(str(category))
+        if family is None:
+            typer.echo(f"{category}: not in {model_selection_path} -- skipping", err=True)
+            continue
+        if family not in seed_decomposition.SEED_SWAPPABLE_FAMILIES:
+            typer.echo(f"{category}: selected model {family} has no AR term -- skipping", err=True)
+            continue
+
+        long_history_frame = long_history_frames.get((category, "nco_rate"))
+        decomposition = seed_decomposition.decompose_seed_vs_macro(
+            category, family, category_train, macro_history, scenario, long_history_frame
+        )
+
+        replay_peak_quarter, replay_peak_rate = seed_decomposition.peak_quarter_and_rate(
+            decomposition.replay_natural
+        )
+        scenario_peak_quarter, scenario_peak_rate = seed_decomposition.peak_quarter_and_rate(
+            decomposition.scenario_natural
+        )
+        row = {"category": str(category), "model_family": family}
+        for n_quarters in (9, 13):
+            row[f"replay_natural_{n_quarters}q"] = projection.cumulative_loss_rate(
+                decomposition.replay_natural, n_quarters
+            )
+            row[f"replay_swapped_seed_{n_quarters}q"] = projection.cumulative_loss_rate(
+                decomposition.replay_swapped, n_quarters
+            )
+            row[f"scenario_natural_{n_quarters}q"] = projection.cumulative_loss_rate(
+                decomposition.scenario_natural, n_quarters
+            )
+            row[f"scenario_swapped_seed_{n_quarters}q"] = projection.cumulative_loss_rate(
+                decomposition.scenario_swapped, n_quarters
+            )
+        row["replay_peak_quarter"] = str(replay_peak_quarter)
+        row["replay_peak_rate"] = replay_peak_rate
+        row["scenario_peak_quarter"] = str(scenario_peak_quarter)
+        row["scenario_peak_rate"] = scenario_peak_rate
+        rows.append(row)
+
+        typer.echo(
+            f"{category} ({family}): replay 9Q natural={row['replay_natural_9q']:.4%} "
+            f"swapped-seed={row['replay_swapped_seed_9q']:.4%} | scenario 9Q "
+            f"natural={row['scenario_natural_9q']:.4%} "
+            f"swapped-seed={row['scenario_swapped_seed_9q']:.4%}"
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    table_path = output_dir / "seed_decomposition.csv"
+    pd.DataFrame(rows).to_csv(table_path, index=False)
+    typer.echo(f"wrote {table_path}")
+
+    macro_table = seed_decomposition.macro_driver_table(macro_history, scenario)
+    macro_table_path = output_dir / "seed_decomposition_macro_table.csv"
+    macro_table.to_csv(macro_table_path, index=False)
+    typer.echo(f"wrote {macro_table_path}")

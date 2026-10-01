@@ -897,18 +897,67 @@ still get 2020-2021 and 2026-holdout backtests.)
   damping found above. But C&I, CRE and consumer are 4.8-7.0 points
   lower than the Fed's, a gap an order of magnitude larger than anything
   the crisis replay shows for those same categories (C&I and CRE-nonfarm
-  didn't even under-predict in-sample). Put together, these two
-  diagnostics point to DIFFERENT explanations for different categories:
-  mortgage/home-equity/credit-card's gap is mostly this project's own
-  models being somewhat too conservative; C&I/CRE/consumer's much larger
-  gap is mostly population and scenario-severity differences — the Fed's
-  32 largest banks carry concentrated C&I/CRE/consumer risk their own
-  confidential supervisory models calibrate for severity, which an
-  industry-wide statistical model (diluted by thousands of smaller,
-  historically milder-loss community banks) doesn't fully capture. This
-  project does NOT apply a fudge multiplier to close either gap — see
-  the next bullet for the one structured feature addition that WAS tried
-  to narrow it, and why it was discarded.
+  didn't even under-predict in-sample) — an inconsistency investigated
+  directly below, not just asserted. This project does NOT apply a
+  fudge multiplier to close either gap — see two bullets down for the
+  one structured feature addition that WAS tried to narrow it, and why
+  it was discarded.
+- **Decomposing the inconsistency (`corefin credit seed-decomposition`):
+  it's the macro path's SHAPE, not the starting point, and NOT mainly
+  population.** The same selected model gives a much higher 9-quarter
+  loss on the real 2007Q4-2010Q4 macro path than on the Fed's severely
+  adverse scenario (e.g. C&I 5.43% vs. 2.61%; cre_construction 7.61% vs.
+  4.18%) even though both are dynamic AR-term models (aggregate_ar/
+  anchored_to_aggregate) whose forecast depends on BOTH the macro path
+  AND the level it's seeded from. Swapping ONLY the seed between the two
+  paths (same macro inputs, same fitted coefficients, just the AR term's
+  starting level exchanged) barely moves either number — at most 0.25
+  points of a multi-point gap, for every one of C&I, cre_construction,
+  cre_nonfarm_nonresidential and credit_card, at both the 9- and
+  13-quarter horizon:
+
+  | Category | Replay natural | Replay swapped-seed | Scenario natural | Scenario swapped-seed |
+  | --- | ---: | ---: | ---: | ---: |
+  | commercial_and_industrial | 5.43% | 5.68% | 2.61% | 2.50% |
+  | cre_construction | 7.61% | 7.66% | 4.18% | 4.16% |
+  | cre_nonfarm_nonresidential | 1.81% | 1.82% | 1.51% | 1.50% |
+  | credit_card | 14.78% | 14.57% | 15.35% | 15.56% |
+
+  So the starting point is NOT the explanation. Looking at the macro
+  paths and the peak quarter instead tells the real story — the real
+  crisis is a slower-building but far more PERSISTENT downturn, while
+  the Fed's severely-adverse scenario is a sharper but shorter V:
+
+  - **Unemployment**: the real path climbs more slowly but stays at or
+    above 9% for 6 STRAIGHT quarters late in the window (quarters 8-13
+    of 13: 9.3/9.6/9.9/9.8/9.6/9.5); the Fed's path peaks slightly
+    HIGHER (10.0% vs. 9.9%) and EARLIER (quarter 8 vs. 10), then
+    recovers noticeably faster, down to 8.4% by the end.
+  - **HPI/CRE YoY % change**: both paths bottom out at a comparably deep
+    trough, but the Fed's path recovers sharply in its back half — HPI
+    turns from -13.6% (quarter 9) to +6.5% (quarter 13), CRE from -24%
+    to +4.0% — while the real path's recovery is far more muted and
+    delayed (HPI is still -2.1% YoY, CRE barely positive, at quarter
+    13).
+  - **Peak timing and magnitude** confirm it: C&I's real-crisis peak
+    (3.61% annualized) lands at quarter 8 of 13 and is **2.4x** the Fed
+    scenario's peak (1.53%, at quarter 6); cre_construction's real peak
+    (5.65%, quarter 10) is **1.9x** the Fed's (2.96%, quarter 9).
+    credit_card's two peaks, by contrast, land at the SAME quarter (10)
+    and are nearly IDENTICAL in size (8.71% vs. 8.92%) — exactly the
+    category with almost no Fed-comparison gap.
+
+  Conclusion: for C&I/CRE, the Fed's own severely-adverse scenario is
+  simply a MILDER, SHORTER-DURATION shock than the real 2007-2010 crisis
+  was, when run through the SAME models this project selected — a real,
+  demonstrated macro-path-shape effect, not a starting-point artifact.
+  This does NOT rule out some additional population/scenario-calibration
+  effect on top of it (the Fed's 32 largest banks may still carry more
+  concentrated C&I/CRE risk their own models capture), but the
+  decomposition shows the DOMINANT, demonstrable driver is the shape and
+  persistence of the macro path itself, not which banks are in the
+  sample — the "mostly population" explanation in an earlier version of
+  this section was asserted, not demonstrated, and is corrected here.
 - **Tried: extending the aggregate/anchored models with a 4-quarter
   unemployment change and 8-quarter cumulative HPI/CRE price changes
   (`models.EXTENDED_AGGREGATE_FEATURES`) — discarded.** The idea: the
