@@ -47,9 +47,16 @@ def build_long_industry_frame(
     frame.index = frame.index.rename("quarter")
     frame = frame.reset_index()
     frame = frame.sort_values("quarter").reset_index(drop=True)
-    for variable in models.CORE_MACRO_FEATURES:
+    lagged_quarter = frame["quarter"] - models.LAG
+    # CORE_MACRO_FEATURES always; EXTENDED_AGGREGATE_FEATURES too, when
+    # macro_history actually has them (an older macro_history.parquet
+    # won't -- see macro.add_extended_change_features) -- aggregate_long/
+    # anchored_to_aggregate are the AGGREGATE/ANCHORED families this
+    # extension is for (models.USE_EXTENDED_AGGREGATE_FEATURES).
+    for variable in (*models.CORE_MACRO_FEATURES, *models.EXTENDED_AGGREGATE_FEATURES):
+        if variable not in macro_history.columns:
+            continue
         lookup = macro_history[variable]
-        lagged_quarter = frame["quarter"] - models.LAG
         frame[models.feature_column(variable)] = lagged_quarter.map(lookup)
     frame["pandemic"] = models.add_pandemic_indicator(frame)
     frame["industry_rate_lag1"] = frame["industry_rate"].shift(1)

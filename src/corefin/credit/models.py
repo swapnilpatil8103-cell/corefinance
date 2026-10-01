@@ -131,11 +131,67 @@ CATEGORY_MACRO_FEATURES: dict[str, tuple[str, ...]] = {
     for category in LoanCategory
 }
 
+# EXTENDED features for the aggregate/anchored model families ONLY
+# (fit_aggregate_model/forecast_aggregate_dynamic, via `_aggregate_
+# feature_columns`) -- NOT panel_fe/gbm (`_macro_feature_columns`,
+# unchanged). A single structured addition investigated on real Stage 5
+# review (not a broad search): the existing features are all either a
+# RATE LEVEL (unemployment) or a 1-year (YoY) price change; these add a
+# 1-year CHANGE in the unemployment rate itself (distinct from its
+# level) and a longer, 2-year CUMULATIVE price change for the two price
+# indices already in CORE_MACRO_FEATURES -- see macro.
+# add_extended_change_features for the exact definitions.
+UNEMPLOYMENT_4Q_CHANGE_FEATURE = "Unemployment rate 4Q change"
+HPI_8Q_CHANGE_FEATURE = "House Price Index 8Q change"
+CRE_8Q_CHANGE_FEATURE = "Commercial Real Estate Price Index 8Q change"
+
+EXTENDED_AGGREGATE_FEATURES: tuple[str, ...] = (
+    UNEMPLOYMENT_4Q_CHANGE_FEATURE,
+    HPI_8Q_CHANGE_FEATURE,
+    CRE_8Q_CHANGE_FEATURE,
+)
+
+# Whether fit_aggregate_model/forecast_aggregate_dynamic include
+# EXTENDED_AGGREGATE_FEATURES -- TRIED on the real data and NOT kept.
+# Tested by actually refitting every aggregate_ar/aggregate_long/
+# anchored_to_aggregate backtest and crisis-replay with this flag on
+# (coefficient_table.csv/backtest_table.csv/crisis_replay.csv, archived
+# before/after for comparison): the in-sample crisis-replay diagnostic
+# DID improve on average (mean |gap| across the 7 applicable categories:
+# 1.12 points -> 0.84 points), but at a real cost that fails this
+# project's own "don't keep it if it breaks backtests or signs" bar --
+# out-of-time backtest RMSE got WORSE in 35 of 44 (category, window,
+# family) cells, often severely (e.g. credit_card's 2020-2021 aggregate_ar
+# RMSE nearly quadrupled, 0.0178 -> 0.0672; commercial_and_industrial's
+# nearly sextupled, 0.0033 -> 0.0184) -- textbook overfitting: 3 extra
+# regressors fit on a short backtest-training window improve the IN-
+# SAMPLE crisis fit almost by construction, while hurting genuine out-of-
+# time generalization, especially for 2020-2021 (COVID's shock has no
+# precedent a smooth "4Q change"/"8Q cumulative change" feature can
+# represent). It also introduced a NEW wrong_sign_significant
+# classification not present before (cre_construction's aggregate_ar
+# unemployment coefficient). Documented here and in the README's Stage 5
+# limitations section, per this project's "do not add a fudge multiplier,
+# document the gap plainly" rule -- kept as working, tested, available
+# code (not deleted) in case a future, better-regularized version is
+# worth revisiting, but OFF by default. Regardless of this flag: `fit_
+# aggregate_model`/`forecast_aggregate_dynamic` filter to whatever
+# feature columns are ACTUALLY present, so this is a no-op against older
+# data/synthetic test fixtures that don't have them.
+USE_EXTENDED_AGGREGATE_FEATURES = False
+
 EXPECTED_COEFFICIENT_SIGNS: dict[str, int] = {
     UNEMPLOYMENT_FEATURE: 1,
     HPI_FEATURE: -1,
     CRE_PRICE_FEATURE: -1,
     STOCK_INDEX_FEATURE: -1,
+    # Rising unemployment (a positive 4Q change) raises losses, same
+    # direction as the level; rising home/CRE prices over 2 years (a
+    # positive 8Q change) lower losses, same direction as the existing
+    # 1-year (YoY) change.
+    UNEMPLOYMENT_4Q_CHANGE_FEATURE: 1,
+    HPI_8Q_CHANGE_FEATURE: -1,
+    CRE_8Q_CHANGE_FEATURE: -1,
 }
 
 # GBM is fit on a random sample (fixed seed, for reproducibility) when a
@@ -227,6 +283,21 @@ def _macro_feature_columns(category: str, include_pandemic: bool) -> list[str]:
     return columns
 
 
+def _aggregate_feature_columns(category: str, include_pandemic: bool) -> list[str]:
+    """Like `_macro_feature_columns`, but for the AGGREGATE/ANCHORED
+    families only (fit_aggregate_model/forecast_aggregate_dynamic): adds
+    EXTENDED_AGGREGATE_FEATURES when USE_EXTENDED_AGGREGATE_FEATURES is
+    set. panel_fe/gbm keep using `_macro_feature_columns` directly,
+    unaffected by this flag."""
+    variables = list(CATEGORY_MACRO_FEATURES[category])
+    if USE_EXTENDED_AGGREGATE_FEATURES:
+        variables.extend(EXTENDED_AGGREGATE_FEATURES)
+    columns = [feature_column(variable) for variable in variables]
+    if include_pandemic:
+        columns = [*columns, "pandemic"]
+    return columns
+
+
 @dataclass(frozen=True)
 class IndustrySeries:
     """One category's quarterly industry-level series: `frame` has columns
@@ -258,10 +329,14 @@ def build_industry_series(
     industry_rate = (sums["_wx"] / sums["_w"]).rename("industry_rate")
 
     # always the FULL set of macro columns (not the category-specific
-    # subset) -- this is just a data-carrying frame; fit_aggregate_model/
-    # forecast_aggregate_dynamic select the category-appropriate subset
-    # when they actually use it as regressors.
+    # subset), PLUS EXTENDED_AGGREGATE_FEATURES's lag columns when present
+    # (bank_dataset may not carry them -- an older modeling dataset, or a
+    # synthetic test fixture) -- this is just a data-carrying frame;
+    # fit_aggregate_model/forecast_aggregate_dynamic select the category-
+    # appropriate subset when they actually use it as regressors.
     macro_columns = [feature_column(variable) for variable in CORE_MACRO_FEATURES]
+    extended_columns = [feature_column(variable) for variable in EXTENDED_AGGREGATE_FEATURES]
+    macro_columns += [c for c in extended_columns if c in scoped.columns]
     macro_first = scoped.groupby("quarter", observed=True)[macro_columns].first()
 
     frame = pd.concat([industry_rate, macro_first], axis=1).reset_index()
@@ -276,14 +351,20 @@ def fit_aggregate_model(
 ) -> sm.regression.linear_model.RegressionResultsWrapper:
     """Model family 1: OLS of the industry rate on its own lag
     ("industry_rate_lag1") plus `category`'s own macro features
-    (CATEGORY_MACRO_FEATURES) at `LAG` (plus the pandemic dummy if
-    `include_pandemic_dummy`). `industry_series`: output of
-    `build_industry_series`'s `.frame` (already possibly filtered to a
-    training window / pandemic-excluded by the caller)."""
+    (CATEGORY_MACRO_FEATURES, plus EXTENDED_AGGREGATE_FEATURES if
+    USE_EXTENDED_AGGREGATE_FEATURES -- see `_aggregate_feature_columns`)
+    at `LAG` (plus the pandemic dummy if `include_pandemic_dummy`).
+    `industry_series`: output of `build_industry_series`'s `.frame`
+    (already possibly filtered to a training window / pandemic-excluded
+    by the caller). A feature column not actually present in `industry_
+    series` (e.g. EXTENDED_AGGREGATE_FEATURES on older data or a
+    synthetic test fixture that doesn't carry them) is silently dropped,
+    not an error."""
     feature_columns = [
         "industry_rate_lag1",
-        *_macro_feature_columns(category, include_pandemic_dummy),
+        *_aggregate_feature_columns(category, include_pandemic_dummy),
     ]
+    feature_columns = [c for c in feature_columns if c in industry_series.columns]
     data = industry_series.dropna(subset=["industry_rate", *feature_columns])
     x = sm.add_constant(data[feature_columns], has_constant="add")
     y = data["industry_rate"]
@@ -315,8 +396,9 @@ def forecast_aggregate_dynamic(
 
     feature_columns = [
         "industry_rate_lag1",
-        *_macro_feature_columns(category, include_pandemic_dummy),
+        *_aggregate_feature_columns(category, include_pandemic_dummy),
     ]
+    feature_columns = [c for c in feature_columns if c in industry_series.columns]
     predictions: dict[pd.Period, float] = {}
     quarter = forecast_start
     while quarter <= forecast_end:

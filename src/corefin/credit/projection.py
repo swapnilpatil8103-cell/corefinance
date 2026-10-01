@@ -303,6 +303,141 @@ def cumulative_loss_rate(annualized_nco_rate_path: pd.Series, n_quarters: int) -
     return float((window / 4.0).sum())
 
 
+# The 2007 financial crisis window, by the same (label, start, end)
+# shape backtest.VALIDATION_WINDOWS uses -- chosen because it's the
+# crisis this project's own full-sample training sample actually
+# contains (2001Q1 onward), so a full-sample fit genuinely has "seen"
+# it, unlike 2020-2021 (COVID), which the severely-adverse scenario the
+# Fed comparison uses isn't really modeling anyway.
+CRISIS_REPLAY_START = pd.Period("2007Q4", freq="Q")
+CRISIS_REPLAY_END = pd.Period("2010Q4", freq="Q")
+
+
+@dataclass(frozen=True)
+class CrisisReplayResult:
+    """`projected_9q_cumulative_loss_rate`: what the FULL-SAMPLE `family`
+    fit projects, over the first `FED_COMPARISON_QUARTERS` quarters of
+    [CRISIS_REPLAY_START, CRISIS_REPLAY_END], when given the crisis's own
+    REAL, REALIZED macro path (not a hypothetical scenario) --
+    `replay_crisis_window`'s whole point. `actual_9q_cumulative_loss_
+    rate`: the REAL, REALIZED industry NCO rate (Call-Report panel) over
+    the SAME 9 quarters. Both already in decimal-fraction units (not
+    percent)."""
+
+    category: str
+    family: str
+    projected_9q_cumulative_loss_rate: float
+    actual_9q_cumulative_loss_rate: float
+
+    @property
+    def gap(self) -> float:
+        """projected - actual -- negative means the full-sample model
+        UNDER-predicted its own training crisis even with perfect,
+        realized macro inputs: evidence of the model's own functional
+        form damping the macro signal, not a failure to generalize
+        out-of-sample (this is an IN-SAMPLE check by construction)."""
+        return self.projected_9q_cumulative_loss_rate - self.actual_9q_cumulative_loss_rate
+
+
+def replay_crisis_window(
+    category: str,
+    family: str,
+    category_train_dataset: pd.DataFrame,
+    long_history_frame: pd.DataFrame | None,
+    replay_start: pd.Period = CRISIS_REPLAY_START,
+    replay_end: pd.Period = CRISIS_REPLAY_END,
+    n_quarters: int = FED_COMPARISON_QUARTERS,
+) -> CrisisReplayResult | None:
+    """An IN-SAMPLE diagnostic, not a real forecast: fits `family` on the
+    FULL sample (`category_train_dataset`/`long_history_frame`, quarter <=
+    2025Q4 -- which INCLUDES [`replay_start`, `replay_end`], e.g. the
+    2007Q4-2010Q4 financial crisis -- exactly as `select_projection_model`/
+    `project_category_nco_rate` do for a real projection), then predicts
+    [`replay_start`, `replay_end`] using the REAL, REALIZED macro path and
+    (for panel_fe/gbm/anchored_to_aggregate) REAL historical bank rows
+    over that window -- NOT a synthetic future bank frame, since real
+    rows already exist for a past window. aggregate_ar/aggregate_long
+    still use `models.forecast_aggregate_dynamic`'s dynamic (recursive)
+    AR-term simulation, the SAME convention Stage 4's own out-of-time
+    backtest uses, so this is comparable to that backtest except for
+    being fit in-sample. Returns None (not an error) if `category_train_
+    dataset` has no real data covering the replay window at all (e.g.
+    auto/other_consumer, which start in 2011) -- the same "not applicable"
+    pattern backtest.run_category_backtests uses for a window with no
+    data to fit or score."""
+    industry_series_full = models.build_industry_series(
+        category_train_dataset, "winsorized_nco_rate"
+    ).frame
+    available_quarters = set(industry_series_full["quarter"])
+    replay_quarters = list(pd.period_range(replay_start, replay_end, freq="Q"))
+    seed_quarter = replay_start - 1
+    if seed_quarter not in available_quarters or not all(
+        q in available_quarters for q in replay_quarters[:n_quarters]
+    ):
+        return None
+
+    if family in ("aggregate_ar", "aggregate_long"):
+        source_frame = long_history_frame if family == "aggregate_long" else industry_series_full
+        result = models.fit_aggregate_model(source_frame, category, include_pandemic_dummy=True)
+        forecast = models.forecast_aggregate_dynamic(
+            result, source_frame, category, replay_start, replay_end, include_pandemic_dummy=True
+        )
+    elif family in ("panel_fe", "gbm", "anchored_to_aggregate"):
+        replay_bank = category_train_dataset[
+            (category_train_dataset["quarter"] >= replay_start)
+            & (category_train_dataset["quarter"] <= replay_end)
+        ]
+        if family == "panel_fe":
+            fit = models.fit_panel_fe_model(
+                category_train_dataset, category, "winsorized_nco_rate", include_pandemic_dummy=True
+            )
+            predicted_bank = models.predict_panel_fe(
+                fit, replay_bank, category, "winsorized_nco_rate", include_pandemic_dummy=True
+            )
+        elif family == "gbm":
+            gbm_model = models.fit_gbm_model(
+                category_train_dataset, category, "winsorized_nco_rate", include_pandemic_dummy=True
+            )
+            predicted_bank = models.predict_gbm(
+                gbm_model, replay_bank, category, include_pandemic_dummy=True
+            )
+        else:  # anchored_to_aggregate
+            long_result = models.fit_aggregate_model(
+                long_history_frame, category, include_pandemic_dummy=True
+            )
+            long_forecast = models.forecast_aggregate_dynamic(
+                long_result,
+                long_history_frame,
+                category,
+                replay_start,
+                replay_end,
+                include_pandemic_dummy=True,
+            )
+            long_train_matching_bank_period = long_history_frame[
+                long_history_frame["quarter"].isin(category_train_dataset["quarter"])
+            ]
+            relative_levels = models.compute_bank_relative_levels(
+                category_train_dataset, "winsorized_nco_rate", long_train_matching_bank_period
+            )
+            predicted_bank = models.forecast_anchored_to_aggregate(
+                relative_levels, long_forecast, replay_bank
+            )
+        forecast = models.aggregate_bank_predictions_to_industry_rate(replay_bank, predicted_bank)
+    else:
+        raise ValueError(f"unknown family {family!r}")
+
+    actual_series = industry_series_full.set_index("quarter")["industry_rate"]
+    actual_window = actual_series[
+        (actual_series.index >= replay_start) & (actual_series.index <= replay_end)
+    ]
+    return CrisisReplayResult(
+        category=category,
+        family=family,
+        projected_9q_cumulative_loss_rate=cumulative_loss_rate(forecast, n_quarters),
+        actual_9q_cumulative_loss_rate=cumulative_loss_rate(actual_window, n_quarters),
+    )
+
+
 def build_projection_macro_lag_frame(
     combined_macro_path: pd.DataFrame, projection_quarters: list[pd.Period]
 ) -> pd.DataFrame:
@@ -328,7 +463,9 @@ def build_projection_macro_lag_frame(
     for quarter in projection_quarters:
         lagged_quarter = quarter - models.LAG
         row = {"quarter": quarter, "pandemic": 0.0}
-        for variable in models.CORE_MACRO_FEATURES:
+        for variable in (*models.CORE_MACRO_FEATURES, *models.EXTENDED_AGGREGATE_FEATURES):
+            if variable not in combined_macro_path.columns:
+                continue
             row[models.feature_column(variable)] = combined_macro_path.loc[lagged_quarter, variable]
         rows.append(row)
     return pd.DataFrame(rows)

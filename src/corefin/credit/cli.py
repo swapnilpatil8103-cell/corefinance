@@ -262,6 +262,7 @@ def fetch_fed_history(
 
     history = macro.normalize_fed_historic(raw)
     history = macro.add_pct_change_features(history)
+    history = macro.add_extended_change_features(history)
     output.parent.mkdir(parents=True, exist_ok=True)
     history.reset_index().assign(quarter=lambda d: d["quarter"].astype(str)).to_parquet(
         output, index=False
@@ -411,16 +412,21 @@ def fetch_scenarios(
     quarter, then every scenario quarter from the next one on, with no
     truncation (this holds by construction now that both come from the
     same Fed file family; raises if it somehow doesn't). Adds QoQ/YoY
-    percent-change columns for the non-stationary level variables,
-    computed against the REAL levels leading into the jump-off quarter
-    (via macro.build_full_macro_path), not the scenario's own 13 rows in
-    isolation. Writes both to `output_dir`."""
+    percent-change columns for the non-stationary level variables, plus
+    the extended 4Q unemployment change / 8Q HPI+CRE cumulative change
+    features (macro.add_extended_change_features), computed against the
+    REAL levels leading into the jump-off quarter (via macro.
+    build_full_macro_path), not the scenario's own 13 rows in isolation.
+    Writes both to `output_dir`."""
     history = pd.read_parquet(macro_history_path)
     history["quarter"] = pd.PeriodIndex(history["quarter"].astype(str), freq="Q")
     history = history.set_index("quarter")
-    # levels only (drop this run's own QoQ/YoY columns) so build_full_macro_path's
-    # continuity check compares the same 16 raw variables the scenario has.
-    history_levels = history[[c for c in history.columns if "% change" not in c]]
+    # levels only (drop this run's own QoQ/YoY/extended change columns)
+    # so build_full_macro_path's continuity check compares the same 16
+    # raw variables the scenario has.
+    history_levels = history[
+        [c for c in history.columns if "% change" not in c and "Q change" not in c]
+    ]
 
     raw_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -437,6 +443,7 @@ def fetch_scenarios(
         normalized = macro.normalize_scenario(raw)
         full_path = macro.build_full_macro_path(history_levels, normalized)
         full_path_with_changes = macro.add_pct_change_features(full_path)
+        full_path_with_changes = macro.add_extended_change_features(full_path_with_changes)
         scenario_with_changes = full_path_with_changes.loc[normalized.index]
 
         path = output_dir / f"{scenario_name}.parquet"
@@ -1225,6 +1232,130 @@ def fed_comparison_cmd(
         "reflects modeling methodology and bank-population differences, not a "
         "different stress scenario."
     )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    table.to_csv(output, index=False)
+    typer.echo(f"\nwrote {output}")
+
+
+@app.command("crisis-replay")
+def crisis_replay_cmd(
+    panel_path: Path = typer.Option(
+        DEFAULT_MODELING_DATASET_PATH,
+        "--panel",
+        help="Training modeling dataset (quarter <= 2025Q4) -- the SAME full sample "
+        "`project` fits on.",
+    ),
+    macro_history_path: Path = typer.Option(
+        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-fed-history`."
+    ),
+    industry_history_path: Path = typer.Option(
+        DEFAULT_INDUSTRY_HISTORY_PATH,
+        "--industry-history",
+        help="Output of `fetch-industry-history` (optional -- aggregate_long/"
+        "anchored_to_aggregate are skipped as not-applicable without it).",
+    ),
+    model_selection_path: Path = typer.Option(
+        DEFAULT_PROJECTIONS_DIR / "model_selection.csv",
+        "--model-selection",
+        help="Output of `project` -- the selected model family per category.",
+    ),
+    output: Path = typer.Option(
+        DEFAULT_PROJECTIONS_DIR / "crisis_replay.csv", "--output", help="Where to write the table."
+    ),
+    categories: str | None = typer.Option(
+        None,
+        "--categories",
+        help="Comma-separated LoanCategory values to run (default: every category "
+        "backtest.MODELING_CATEGORIES lists).",
+    ),
+) -> None:
+    """Diagnostic for the Fed-comparison gap (`fed-comparison`): for each
+    category's SELECTED model family (read from `model_selection_path`,
+    `project`'s own output -- the SAME model actually used for the real
+    projection), `projection.replay_crisis_window` fits that family on the
+    FULL sample (which includes the 2007Q4-2010Q4 financial crisis) and
+    feeds it the crisis's own REAL, REALIZED macro path -- an IN-SAMPLE
+    check of whether the model reproduces its OWN training crisis's real
+    loss outcome, not an out-of-sample generalization test. Compares the
+    projected 9-quarter cumulative loss against the real Call-Report
+    industry loss over the same window. auto/other_consumer have no real
+    data before 2011 and are skipped as not-applicable, not an error. If
+    most categories under-predict here, that's evidence the Fed-
+    comparison gap is mostly this project's own models damping the macro
+    signal -- not just a different (larger, more concentrated) bank
+    population in the Fed's own DFAST sample."""
+    training = pd.read_parquet(panel_path)
+    training["quarter"] = pd.PeriodIndex(training["quarter"].astype(str), freq="Q")
+
+    macro_history = pd.read_parquet(macro_history_path)
+    macro_history["quarter"] = pd.PeriodIndex(macro_history["quarter"].astype(str), freq="Q")
+    macro_history = macro_history.set_index("quarter")
+    long_history_frames = _load_long_history_frames(industry_history_path, macro_history)
+
+    if not model_selection_path.exists():
+        typer.echo(f"no model selection at {model_selection_path} -- run project first", err=True)
+        raise typer.Exit(code=1)
+    model_selection = pd.read_csv(model_selection_path)
+    selected_family_by_category = (
+        model_selection[model_selection["selected"]].set_index("category")["model_family"].to_dict()
+    )
+
+    selected_categories = (
+        [LoanCategory(c.strip()) for c in categories.split(",")]
+        if categories
+        else list(backtest.MODELING_CATEGORIES)
+    )
+
+    rows = []
+    for category in selected_categories:
+        category_train = training[training["category"] == category]
+        if category_train.empty:
+            typer.echo(f"{category}: no training rows -- skipping", err=True)
+            continue
+        family = selected_family_by_category.get(str(category))
+        if family is None:
+            typer.echo(f"{category}: not in {model_selection_path} -- skipping", err=True)
+            continue
+
+        long_history_frame = long_history_frames.get((category, "nco_rate"))
+        result = projection.replay_crisis_window(
+            category, family, category_train, long_history_frame
+        )
+        if result is None:
+            typer.echo(
+                f"{category}: no real data covering {projection.CRISIS_REPLAY_START}-"
+                f"{projection.CRISIS_REPLAY_END} -- not applicable",
+                err=True,
+            )
+            continue
+        typer.echo(
+            f"{category} ({family}): projected 9Q={result.projected_9q_cumulative_loss_rate:.4%} "
+            f"actual 9Q={result.actual_9q_cumulative_loss_rate:.4%} gap={result.gap:+.4%}"
+        )
+        rows.append(
+            {
+                "category": str(category),
+                "selected_family": family,
+                "projected_9q_cumulative_loss_rate": result.projected_9q_cumulative_loss_rate,
+                "actual_9q_cumulative_loss_rate": result.actual_9q_cumulative_loss_rate,
+                "gap": result.gap,
+            }
+        )
+
+    table = pd.DataFrame(rows)
+    if not table.empty:
+        under_predicting = table[table["gap"] < 0]
+        verdict = (
+            "this points to model damping (functional form), not population "
+            "differences, as the main driver of the Fed-comparison gap."
+            if len(under_predicting) >= len(table) / 2
+            else "most categories do NOT under-predict in-sample, so the Fed-comparison "
+            "gap is more likely population/scope, not model damping."
+        )
+        typer.echo(
+            f"\n{len(under_predicting)}/{len(table)} categories under-predict their own "
+            f"training crisis in-sample -- {verdict}"
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(output, index=False)
     typer.echo(f"\nwrote {output}")

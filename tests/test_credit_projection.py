@@ -519,3 +519,62 @@ def test_build_cecl_projection_end_to_end_with_a_projected_path():
     result = projection.build_cecl_projection(realized_rate, forecast, _CATEGORY, starting_balance)
     assert len(result) == len(scenario) + 1  # + the jump-off row
     assert result["allowance_required"].notna().all()
+
+
+# ------------------------------------------------------------ crisis replay ---
+
+
+def test_replay_crisis_window_returns_none_without_crisis_era_data():
+    macro_history, _ = _synthetic_macro_history_and_scenario()
+    category_train_dataset = _synthetic_category_train_dataset(macro_history)
+    # Only quarters from 2011Q1 on -- no real data at all for the
+    # 2007Q4-2010Q4 replay window (the real auto/other_consumer situation).
+    cutoff = pd.Period("2011Q1", "Q")
+    post_2011 = category_train_dataset[category_train_dataset["quarter"] >= cutoff]
+    result = projection.replay_crisis_window(_CATEGORY, "aggregate_ar", post_2011, None)
+    assert result is None
+
+
+@pytest.mark.parametrize(
+    "family", ["aggregate_ar", "aggregate_long", "panel_fe", "gbm", "anchored_to_aggregate"]
+)
+def test_replay_crisis_window_computes_projected_and_actual_cumulative_loss(family):
+    macro_history, _ = _synthetic_macro_history_and_scenario()
+    category_train_dataset = _synthetic_category_train_dataset(macro_history)
+    from corefin.credit import industry_history
+
+    long_history_frame = industry_history.build_long_industry_frame(
+        models.build_industry_series(category_train_dataset, "winsorized_nco_rate").frame.set_index(
+            "quarter"
+        )["industry_rate"],
+        macro_history,
+    )
+    result = projection.replay_crisis_window(
+        _CATEGORY, family, category_train_dataset, long_history_frame
+    )
+    assert result is not None
+    assert result.category == _CATEGORY
+    assert result.family == family
+    assert result.projected_9q_cumulative_loss_rate >= 0.0
+    assert result.actual_9q_cumulative_loss_rate >= 0.0
+    assert result.gap == pytest.approx(
+        result.projected_9q_cumulative_loss_rate - result.actual_9q_cumulative_loss_rate
+    )
+
+
+def test_replay_crisis_window_actual_loss_matches_the_real_call_report_series():
+    macro_history, _ = _synthetic_macro_history_and_scenario()
+    category_train_dataset = _synthetic_category_train_dataset(macro_history)
+    result = projection.replay_crisis_window(
+        _CATEGORY, "aggregate_ar", category_train_dataset, None
+    )
+    assert result is not None
+    actual_series = models.build_industry_series(
+        category_train_dataset, "winsorized_nco_rate"
+    ).frame.set_index("quarter")["industry_rate"]
+    window = actual_series[
+        (actual_series.index >= projection.CRISIS_REPLAY_START)
+        & (actual_series.index <= projection.CRISIS_REPLAY_END)
+    ]
+    expected_actual = projection.cumulative_loss_rate(window, projection.FED_COMPARISON_QUARTERS)
+    assert result.actual_9q_cumulative_loss_rate == pytest.approx(expected_actual)

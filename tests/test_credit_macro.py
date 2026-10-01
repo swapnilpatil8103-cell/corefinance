@@ -530,6 +530,46 @@ def test_add_pct_change_features_on_full_path_uses_real_prior_history_for_scenar
     )
 
 
+def test_add_extended_change_features_computes_4q_unemployment_and_8q_price_changes():
+    quarters = pd.period_range("2023Q1", periods=9, freq="Q")
+    levels = pd.DataFrame(
+        {
+            "Unemployment rate": [4.0, 4.1, 4.3, 4.6, 5.0, 5.2, 5.5, 5.9, 6.4],
+            "House Price Index": [100.0, 101, 102, 103, 104, 106, 108, 110, 112],
+            "Commercial Real Estate Price Index": [200.0, 199, 198, 196, 194, 190, 188, 186, 184],
+        },
+        index=quarters,
+    )
+    result = macro.add_extended_change_features(levels)
+    # 4Q change: last value (6.4) minus the value 4 quarters earlier (5.0).
+    assert result["Unemployment rate 4Q change"].iloc[-1] == pytest.approx(6.4 - 5.0)
+    # 8Q change: last value (112.0) vs. the FIRST value (100.0), 8 quarters earlier.
+    expected_hpi = (112.0 / 100.0 - 1) * 100
+    assert result["House Price Index 8Q change"].iloc[-1] == pytest.approx(expected_hpi)
+    expected_cre = (184.0 / 200.0 - 1) * 100
+    assert result["Commercial Real Estate Price Index 8Q change"].iloc[-1] == pytest.approx(
+        expected_cre
+    )
+    # fewer than 4/8 quarters of history -> NaN, not an invented value
+    assert pd.isna(result["Unemployment rate 4Q change"].iloc[2])
+    assert pd.isna(result["House Price Index 8Q change"].iloc[6])
+
+
+def test_add_extended_change_features_keeps_the_raw_level_columns():
+    levels = pd.DataFrame(
+        {"Unemployment rate": [4.0, 4.5]}, index=pd.PeriodIndex(["2025Q3", "2025Q4"], freq="Q")
+    )
+    result = macro.add_extended_change_features(levels)
+    assert result["Unemployment rate"].tolist() == [4.0, 4.5]
+
+
+def test_add_extended_change_features_skips_variables_not_present():
+    levels = pd.DataFrame({"Unemployment rate": [4.5]}, index=pd.PeriodIndex(["2025Q4"], freq="Q"))
+    result = macro.add_extended_change_features(levels)
+    assert "House Price Index 8Q change" not in result.columns
+    assert "Commercial Real Estate Price Index 8Q change" not in result.columns
+
+
 # --------------------------------------------------- train/holdout split ---
 
 

@@ -851,6 +851,90 @@ still get 2020-2021 and 2026-holdout backtests.)
   windows above exist to measure how well a model generalizes to a
   crisis it never saw, which is a harder and more honest test than the
   full-sample fit Stage 5 actually projects with.
+- **Crisis replay test (`corefin credit crisis-replay`): most full-sample
+  models still under-predict their own training crisis, even in-sample.**
+  Each category's SELECTED model is fit on the full sample (which
+  includes 2007Q4-2010Q4) and then fed the crisis's own REAL, realized
+  macro path — not a hypothetical scenario — and the resulting 9-quarter
+  cumulative loss is compared against the real Call Report industry loss
+  over the same window. 5 of 7 applicable categories (auto/other_consumer
+  have no real data before 2011 and are skipped) under-predict:
+
+  | Category | Model | Projected 9Q (in-sample) | Actual 9Q | Gap |
+  | --- | --- | ---: | ---: | ---: |
+  | commercial_and_industrial | anchored_to_aggregate | 5.43% | 3.90% | +1.53pp |
+  | cre_construction | anchored_to_aggregate | 7.61% | 7.83% | -0.22pp |
+  | cre_multifamily | panel_fe | 0.74% | 1.19% | -0.44pp |
+  | cre_nonfarm_nonresidential | anchored_to_aggregate | 1.81% | 0.96% | +0.85pp |
+  | residential_mortgage | aggregate_ar | 1.99% | 2.81% | -0.81pp |
+  | home_equity | gbm | 3.15% | 4.63% | -1.48pp |
+  | credit_card | aggregate_ar | 14.78% | 17.30% | -2.53pp |
+
+  Since this is an IN-SAMPLE check (the model has already seen the
+  crisis in training), a model that still under-predicts it isn't a
+  generalization failure — it's the model's own functional form damping
+  the macro signal. credit_card and home_equity show the clearest
+  damping (over a point low even in-sample); C&I and CRE-nonfarm, by
+  contrast, slightly OVER-predict in-sample.
+- **Fed DFAST 2026 comparison (`corefin credit fed-comparison`): the gap
+  is mostly NOT explained by in-sample model damping.** Comparing this
+  project's own severely-adverse 9-quarter cumulative loss against the
+  Fed's own published DFAST 2026 results (32 participating banks,
+  published 2026-06-24, same severely-adverse scenario and same 2025Q4
+  jump-off):
+
+  | Category | Ours | Fed DFAST 2026 | Gap |
+  | --- | ---: | ---: | ---: |
+  | residential_mortgage | 1.58% | 1.5% | +0.08pp |
+  | home_equity | 2.60% | 3.2% | -0.60pp |
+  | credit_card | 15.35% | 17.1% | -1.75pp |
+  | commercial_and_industrial | 2.61% | 9.0% | **-6.39pp** |
+  | CRE (combined) | 1.77% | 8.8% | **-7.03pp** |
+  | auto + other_consumer (combined) | 2.50% | 7.3% | **-4.80pp** |
+
+  Residential mortgage, home equity and credit card land within about a
+  point of the Fed's own figures — consistent with the small in-sample
+  damping found above. But C&I, CRE and consumer are 4.8-7.0 points
+  lower than the Fed's, a gap an order of magnitude larger than anything
+  the crisis replay shows for those same categories (C&I and CRE-nonfarm
+  didn't even under-predict in-sample). Put together, these two
+  diagnostics point to DIFFERENT explanations for different categories:
+  mortgage/home-equity/credit-card's gap is mostly this project's own
+  models being somewhat too conservative; C&I/CRE/consumer's much larger
+  gap is mostly population and scenario-severity differences — the Fed's
+  32 largest banks carry concentrated C&I/CRE/consumer risk their own
+  confidential supervisory models calibrate for severity, which an
+  industry-wide statistical model (diluted by thousands of smaller,
+  historically milder-loss community banks) doesn't fully capture. This
+  project does NOT apply a fudge multiplier to close either gap — see
+  the next bullet for the one structured feature addition that WAS tried
+  to narrow it, and why it was discarded.
+- **Tried: extending the aggregate/anchored models with a 4-quarter
+  unemployment change and 8-quarter cumulative HPI/CRE price changes
+  (`models.EXTENDED_AGGREGATE_FEATURES`) — discarded.** The idea: the
+  existing features are a rate LEVEL (unemployment) and 1-year price
+  changes only, which might be too short-horizon to capture a sustained
+  downturn's cumulative damage. Tested by actually refitting every
+  aggregate_ar/aggregate_long/anchored_to_aggregate backtest and crisis
+  replay with the 3 extra features on. Result: the in-sample crisis
+  replay DID improve on average (mean |gap| across the 7 applicable
+  categories: 1.12 points → 0.84 points), but out-of-time backtest RMSE
+  got WORSE in 35 of 44 (category, window, family) cells, often badly
+  (credit_card's 2020-2021 aggregate_ar RMSE nearly quadrupled, 0.0178 →
+  0.0672; commercial_and_industrial's nearly sextupled, 0.0033 → 0.0184),
+  and it introduced a NEW wrong-signed, statistically significant
+  coefficient that wasn't there before (cre_construction's aggregate_ar
+  unemployment coefficient). This is a textbook overfitting signature:
+  3 extra regressors improve the in-sample crisis fit almost by
+  construction, while hurting genuine out-of-time generalization,
+  especially for the short 2020-2021 training window (COVID's shock has
+  no precedent a smooth multi-quarter change feature can represent). Per
+  this project's own rule — don't keep a change that improves one
+  diagnostic by breaking backtests or signs — this was reverted
+  (`models.USE_EXTENDED_AGGREGATE_FEATURES = False`); the code is kept,
+  tested and documented in case a better-regularized version is worth
+  revisiting later, but it is off by default and the real Fed-comparison
+  gap above stands undocumented-away.
 
 ## Testing conventions
 

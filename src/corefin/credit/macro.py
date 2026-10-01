@@ -264,6 +264,45 @@ def add_pct_change_features(
     return result
 
 
+# The 3 EXTENDED features for the aggregate/anchored model families only
+# (models.EXTENDED_AGGREGATE_FEATURES/models.USE_EXTENDED_AGGREGATE_
+# FEATURES) -- a single, structured addition on top of the existing QoQ/
+# YoY change features above, not a broader search: a 4-quarter (1-year)
+# CHANGE in the unemployment RATE (a level difference, in percentage
+# POINTS -- the natural "how much has this moved" convention for a rate
+# that's already stationary-ish, unlike a %-of-level change, which is
+# unstable near small values and isn't how unemployment moves are
+# conventionally described), and an 8-quarter (2-year) CUMULATIVE percent
+# change in the House Price Index and Commercial Real Estate Price Index
+# levels -- on top of the 1-year (YoY) change `add_pct_change_features`
+# already computes, capturing a longer price-momentum/reversal window a
+# single-year change can miss.
+_UNEMPLOYMENT_VARIABLE = "Unemployment rate"
+_EXTENDED_CUMULATIVE_CHANGE_VARIABLES = ("House Price Index", "Commercial Real Estate Price Index")
+EXTENDED_CHANGE_QUARTERS = 8
+
+
+def add_extended_change_features(levels: pd.DataFrame) -> pd.DataFrame:
+    """Returns a COPY of `levels` with "Unemployment rate 4Q change"
+    (level[t] - level[t-4], in percentage points) and f"{variable} 8Q
+    change" (cumulative (level[t]/level[t-8] - 1) * 100) for each of
+    `_EXTENDED_CUMULATIVE_CHANGE_VARIABLES`. Silently skips any variable
+    not present in `levels.columns`, the same convention `add_pct_change_
+    features` uses."""
+    result = levels.copy()
+    if _UNEMPLOYMENT_VARIABLE in levels.columns:
+        unemployment = levels[_UNEMPLOYMENT_VARIABLE]
+        result[f"{_UNEMPLOYMENT_VARIABLE} 4Q change"] = unemployment - unemployment.shift(4)
+    for variable in _EXTENDED_CUMULATIVE_CHANGE_VARIABLES:
+        if variable not in levels.columns:
+            continue
+        level = levels[variable]
+        result[f"{variable} {EXTENDED_CHANGE_QUARTERS}Q change"] = (
+            level / level.shift(EXTENDED_CHANGE_QUARTERS) - 1.0
+        ) * 100.0
+    return result
+
+
 def split_dataset_by_quarter(
     dataset: pd.DataFrame, cutoff: pd.Period, quarter_column: str = "quarter"
 ) -> tuple[pd.DataFrame, pd.DataFrame]:

@@ -134,6 +134,66 @@ def test_fit_aggregate_model_excludes_stock_index_for_a_non_ci_category():
     assert models.feature_column("Unemployment rate") in result.params.index
 
 
+def test_fit_aggregate_model_uses_extended_features_when_present(monkeypatch):
+    # USE_EXTENDED_AGGREGATE_FEATURES defaults to False (tried on real
+    # data, discarded -- see models.py's module-level comment); this
+    # test locks in the MECHANISM still working correctly when it's on.
+    monkeypatch.setattr(models, "USE_EXTENDED_AGGREGATE_FEATURES", True)
+    dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=20)
+    series = models.build_industry_series(dataset, "winsorized_nco_rate").frame
+    rng = np.random.default_rng(1)
+    series[models.feature_column(models.UNEMPLOYMENT_4Q_CHANGE_FEATURE)] = rng.normal(
+        0, 0.3, size=len(series)
+    )
+    series[models.feature_column(models.HPI_8Q_CHANGE_FEATURE)] = rng.normal(
+        0, 0.5, size=len(series)
+    )
+    series[models.feature_column(models.CRE_8Q_CHANGE_FEATURE)] = rng.normal(
+        0, 0.5, size=len(series)
+    )
+    result = models.fit_aggregate_model(
+        series, "residential_mortgage", include_pandemic_dummy=False
+    )
+    for feature in models.EXTENDED_AGGREGATE_FEATURES:
+        assert models.feature_column(feature) in result.params.index
+
+
+def test_fit_aggregate_model_omits_extended_features_when_absent_from_the_data():
+    # No extended columns on this frame at all -- silently dropped, not
+    # an error, so older data / synthetic fixtures without them still work.
+    dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=20)
+    series = models.build_industry_series(dataset, "winsorized_nco_rate").frame
+    for feature in models.EXTENDED_AGGREGATE_FEATURES:
+        assert models.feature_column(feature) not in series.columns
+    result = models.fit_aggregate_model(
+        series, "residential_mortgage", include_pandemic_dummy=False
+    )
+    for feature in models.EXTENDED_AGGREGATE_FEATURES:
+        assert models.feature_column(feature) not in result.params.index
+
+
+def test_fit_panel_fe_model_never_uses_extended_aggregate_features(monkeypatch):
+    # The extended features are for the aggregate/anchored families only
+    # -- panel_fe keeps using _macro_feature_columns regardless of the
+    # flag or the data having them (flag forced True here specifically
+    # to prove that, not just that it's off by default).
+    monkeypatch.setattr(models, "USE_EXTENDED_AGGREGATE_FEATURES", True)
+    dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=40)
+    rng = np.random.default_rng(2)
+    for feature in models.EXTENDED_AGGREGATE_FEATURES:
+        dataset[models.feature_column(feature)] = rng.normal(0, 0.3, size=len(dataset))
+    fit = models.fit_panel_fe_model(
+        dataset, "commercial_and_industrial", "winsorized_nco_rate", include_pandemic_dummy=False
+    )
+    for feature in models.EXTENDED_AGGREGATE_FEATURES:
+        assert models.feature_column(feature) not in fit.result.params.index
+
+
+def test_extended_aggregate_features_all_have_an_expected_sign():
+    for feature in models.EXTENDED_AGGREGATE_FEATURES:
+        assert feature in models.EXPECTED_COEFFICIENT_SIGNS
+
+
 def test_fit_panel_fe_model_excludes_stock_index_for_a_non_ci_category():
     dataset = _synthetic_bank_dataset(n_quarters=40, n_banks=40)
     fit = models.fit_panel_fe_model(
