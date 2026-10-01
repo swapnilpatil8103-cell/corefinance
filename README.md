@@ -985,6 +985,70 @@ still get 2020-2021 and 2026-holdout backtests.)
   revisiting later, but it is off by default and the real Fed-comparison
   gap above stands undocumented-away.
 
+### Stage 6: Monte Carlo loss distributions
+
+Stage 5 (and the diagnostics above) each produce ONE deterministic
+number per category/scenario. `corefin credit monte-carlo`
+(`credit/monte_carlo.py`) turns that into a DISTRIBUTION, combining two
+sources of uncertainty Stage 5 is silent about:
+
+1. **Macro path uncertainty** — each of `--n-draws` draws perturbs the
+   Fed scenario's own macro feature columns with an independent,
+   per-quarter shock drawn from that variable's OWN real historical
+   quarter-over-quarter standard deviation (`estimate_macro_shock_std`,
+   computed from the Fed's own historic actuals table, not assumed).
+2. **Model residual uncertainty** — the SAME full-sample fit Stage 5
+   projects with has its own residual standard error; added as
+   independent noise to each projected quarter.
+
+Each category's model is fit ONCE (refitting GBM/panel_fe a thousand
+times would be far too slow) and reused across every draw — only the
+cheap forecast/predict step reruns per draw, on that draw's own
+perturbed macro path. Real output (500 draws per category/scenario,
+`--random-state 0`):
+
+| Category | Model | Scenario | Mean | p5 | p50 | p95 |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| commercial_and_industrial | anchored_to_aggregate | severely_adverse | 3.51% | 3.02% | 3.51% | 4.01% |
+| cre_construction | anchored_to_aggregate | severely_adverse | 6.63% | 6.18% | 6.62% | 7.11% |
+| cre_multifamily | panel_fe | severely_adverse | 1.18% | 0.31% | 1.16% | 2.04% |
+| cre_nonfarm_nonresidential | anchored_to_aggregate | severely_adverse | 2.40% | 1.98% | 2.39% | 2.82% |
+| residential_mortgage | aggregate_ar | severely_adverse | 2.81% | 2.65% | 2.81% | 2.97% |
+| home_equity | gbm | severely_adverse | 3.79% | 2.79% | 3.75% | 4.88% |
+| credit_card | aggregate_ar | severely_adverse | 23.66% | 22.45% | 23.64% | 24.90% |
+| auto | gbm | severely_adverse | 2.48% | 1.03% | 2.47% | 4.01% |
+| other_consumer | panel_fe | severely_adverse | 5.15% | 3.12% | 5.13% | 7.26% |
+
+(these are cumulative loss rates over the FULL 13-quarter scenario
+horizon, not the 9-quarter DFAST window the Fed comparison uses; the
+baseline scenario's own distribution is in the same CSV.) Two things
+worth noting in the real numbers: `auto`'s baseline (2.45%) and
+severely-adverse (2.48%) means are nearly identical — `auto` selects
+`gbm` (Stage 5's sign-filtered model selection excludes aggregate_ar/
+aggregate_long/anchored_to_aggregate for it, all three having a wrong-
+signed, significant unemployment coefficient), and gbm's severely-
+adverse response is nearly flat; here that shows up as two almost
+fully-overlapping distributions rather than just two close point
+estimates. And every category's p5-p95 band is WIDE
+relative to its mean (e.g. home_equity's severely-adverse band spans
+2.79%-4.88% around a 3.79% mean) — a reminder that Stage 5's single
+point projection is one draw from a real distribution, not a precise
+forecast.
+
+**Known limitations of this first build, stated plainly, not hidden:**
+macro shocks are independent across BOTH variables and quarters (real
+unemployment/HPI/CRE moves are correlated with each other and
+persistent quarter to quarter; a more sophisticated version would draw
+from an estimated covariance matrix and/or an AR(1) shock process);
+residual noise is added independently to each projected quarter rather
+than propagated through the dynamic AR recursion (a real simulation of
+aggregate_ar/aggregate_long/anchored_to_aggregate's own process would
+feed each quarter's noisy outcome into the next quarter's AR term,
+compounding the uncertainty); and the per-draw cost (rebuilding the
+bank-level synthetic future frame every draw) makes 1,000+ draws on the
+largest categories noticeably slow -- a real performance characteristic
+of this first build, not optimized away.
+
 ## Testing conventions
 
 - `pytest.mark.slow` is excluded by default (`addopts = "-m 'not slow'"` in
