@@ -7,7 +7,7 @@ from unittest import mock
 import pandas as pd
 import pytest
 
-from corefin.credit.sources import fdic, fed_scenarios, ffiec, fred
+from corefin.credit.sources import fdic, fed_scenarios, fed_stress_test_results, ffiec, fred
 
 
 def _fake_response(json_payload=None, text=None, status: int = 200):
@@ -89,6 +89,30 @@ def test_fred_series_mapping_flags_imperfect_matches_with_a_note():
     for variable, mapping in fred.FED_SCENARIO_VARIABLE_TO_FRED.items():
         if not mapping.is_exact_match:
             assert mapping.note, f"{variable} is flagged as inexact but has no explanatory note"
+
+
+# ------------------------------------------------------- Fed DFAST results ---
+
+
+def test_dfast_loss_rates_cover_every_loan_category_and_the_two_combined_buckets():
+    expected_keys = {
+        "total_loans",
+        "residential_mortgage",
+        "home_equity",
+        "commercial_and_industrial",
+        "cre_combined",
+        "auto_and_other_consumer_combined",
+        "credit_card",
+        "other_loans",
+    }
+    assert expected_keys == set(fed_stress_test_results.DFAST_2026_SEVERELY_ADVERSE_LOSS_RATES)
+
+
+def test_dfast_loss_rates_are_plausible_percentages_with_a_note_for_combined_buckets():
+    for key, entry in fed_stress_test_results.DFAST_2026_SEVERELY_ADVERSE_LOSS_RATES.items():
+        assert 0.0 <= entry.severely_adverse_9q_loss_rate_percent <= 100.0
+        if key in ("cre_combined", "auto_and_other_consumer_combined", "other_loans"):
+            assert entry.note, f"{key} is a combined/unmapped bucket but has no explanatory note"
 
 
 # ---------------------------------------------------------------- FDIC ----

@@ -13,7 +13,7 @@ from corefin.credit import backtest, charts, industry_history, macro, models, pr
 from corefin.credit.panel import build_industry_nco_rate_report, build_panel, flag_chargeoff_gaps
 from corefin.credit.schema import LoanCategory
 from corefin.credit.sources import fed_scenarios as fed_scenarios_source
-from corefin.credit.sources import ffiec, ffiec_parse, fred
+from corefin.credit.sources import fed_stress_test_results, ffiec, ffiec_parse, fred
 
 app = typer.Typer(add_completion=False, help="Credit-Loss Forecasting Engine data pipeline.")
 
@@ -1110,3 +1110,121 @@ def project_cmd(
             f"skipping calibration check -- {credit_panel_path} or {allowance_path} not found",
             err=True,
         )
+
+
+@app.command("fed-comparison")
+def fed_comparison_cmd(
+    projection_table_path: Path = typer.Option(
+        DEFAULT_PROJECTIONS_DIR / "projection_table.csv",
+        "--projection-table",
+        help="Output of `project`.",
+    ),
+    credit_panel_path: Path = typer.Option(
+        DEFAULT_PANEL_PATH,
+        "--credit-panel",
+        help="Parquet panel from `build` -- balances to combine this project's CRE/"
+        "auto+other_consumer categories onto the Fed's own combined buckets.",
+    ),
+    output: Path = typer.Option(
+        DEFAULT_PROJECTIONS_DIR / "fed_comparison.csv",
+        "--output",
+        help="Where to write the comparison table.",
+    ),
+) -> None:
+    """Compares this project's own severely-adverse 9-quarter cumulative
+    loss rates (`projection.FED_COMPARISON_QUARTERS`, already written to
+    projection_table.csv's cumulative_9q_loss_rate column by `project`)
+    against the Fed's own PUBLISHED DFAST 2026 results (credit/sources/
+    fed_stress_test_results.py -- every figure there verified LIVE
+    against the Fed's own site, with the exact source URLs cited; NOT
+    from training-data memory). The Fed publishes one combined CRE figure
+    and one combined "other consumer" (auto + other consumer) figure --
+    the same two splits this project's own FRED long-history series
+    can't make either (fred.INDUSTRY_CHARGEOFF_DELINQUENCY_SERIES) -- so
+    this command balance-weights this project's own CRE/auto+other_
+    consumer categories together (using `credit_panel_path`'s 2025Q4
+    balances) before comparing on the same footing. Prints and writes a
+    table with both figures, the gap in percentage points, and a written
+    scope note: the Fed's ~32 largest bank holding companies scored with
+    the Fed's own CONFIDENTIAL supervisory models, vs. this project's
+    full industry-wide Call Report panel scored with this project's own
+    simple, documented statistical models -- both under the SAME
+    severely-adverse scenario and the SAME 2025Q4 jump-off quarter, so
+    the gap reflects modeling/population differences, not a different
+    stress scenario."""
+    if not projection_table_path.exists():
+        typer.echo(f"no projection table at {projection_table_path} -- run project first", err=True)
+        raise typer.Exit(code=1)
+    projections = pd.read_csv(projection_table_path)
+    severely_adverse = projections[projections["scenario"] == "severely_adverse"]
+    our_9q_loss = severely_adverse.groupby("category")["cumulative_9q_loss_rate"].first()
+    our_9q_loss_percent = our_9q_loss * 100
+
+    credit_panel = pd.read_parquet(credit_panel_path)
+    credit_panel["quarter"] = pd.PeriodIndex(credit_panel["quarter"].astype(str), freq="Q")
+    jump_off_quarter = pd.Period(fed_stress_test_results.DFAST_RESULTS_JUMP_OFF_QUARTER, freq="Q")
+    balance_by_category = credit_panel[credit_panel["quarter"] == jump_off_quarter].groupby(
+        "category"
+    )["average_balance"].sum()
+
+    def _balance_weighted_average(categories: list[str]) -> float | None:
+        available = [
+            c
+            for c in categories
+            if c in our_9q_loss_percent.index and c in balance_by_category.index
+        ]
+        if not available:
+            return None
+        weights = balance_by_category.loc[available]
+        return float((our_9q_loss_percent.loc[available] * weights).sum() / weights.sum())
+
+    our_values: dict[str, float | None] = dict(our_9q_loss_percent)
+    our_values["cre_combined"] = _balance_weighted_average(
+        ["cre_construction", "cre_multifamily", "cre_nonfarm_nonresidential"]
+    )
+    our_values["auto_and_other_consumer_combined"] = _balance_weighted_average(
+        ["auto", "other_consumer"]
+    )
+
+    rows = []
+    fed_rates = fed_stress_test_results.DFAST_2026_SEVERELY_ADVERSE_LOSS_RATES
+    for category, fed_entry in fed_rates.items():
+        our_rate = our_values.get(category)
+        rows.append(
+            {
+                "category": category,
+                "our_9q_severely_adverse_loss_rate_pct": our_rate,
+                "fed_dfast_2026_9q_severely_adverse_loss_rate_pct": (
+                    fed_entry.severely_adverse_9q_loss_rate_percent
+                ),
+                "gap_pct_points": (
+                    our_rate - fed_entry.severely_adverse_9q_loss_rate_percent
+                    if our_rate is not None
+                    else None
+                ),
+                "note": fed_entry.note,
+            }
+        )
+
+    table = pd.DataFrame(rows)
+    typer.echo(table.drop(columns="note").to_string(index=False))
+    typer.echo(
+        f"\nFed source: DFAST {fed_stress_test_results.DFAST_RESULTS_VINTAGE}, "
+        f"{fed_stress_test_results.DFAST_PARTICIPATING_BANKS} participating banks, "
+        f"published {fed_stress_test_results.DFAST_RESULTS_PUBLISHED_DATE} "
+        f"(jump-off {fed_stress_test_results.DFAST_RESULTS_JUMP_OFF_QUARTER}, the same "
+        "quarter this project's own projection starts from).\n"
+        "Scope differences: the Fed's DFAST results cover only the "
+        f"{fed_stress_test_results.DFAST_PARTICIPATING_BANKS} largest U.S. bank holding "
+        "companies (>$100B assets), scored under the Fed's own CONFIDENTIAL supervisory "
+        "models; this project's own figures cover the FULL industry-wide Call Report "
+        "panel (thousands of banks of every size), scored with this project's simple, "
+        "documented statistical models (aggregate AR / bank panel FE / GBM / FRED-"
+        "anchored -- see projection.select_projection_model). Both use the SAME Fed "
+        "severely-adverse macro scenario and the SAME jump-off quarter, so the gap "
+        "reflects modeling methodology and bank-population differences, not a "
+        "different stress scenario."
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    table.to_csv(output, index=False)
+    typer.echo(f"\nwrote {output}")
