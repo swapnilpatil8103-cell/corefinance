@@ -33,7 +33,8 @@ DEFAULT_MODELS_DIR = Path("data/processed/models")
 DEFAULT_INDUSTRY_HISTORY_RAW_DIR = Path("data/raw/fred_industry")
 DEFAULT_INDUSTRY_HISTORY_PATH = Path("data/processed/industry_history_fred.parquet")
 DEFAULT_PROJECTIONS_DIR = Path("data/processed/projections")
-FALLBACK_MODEL_FAMILY = "aggregate_ar"
+DEFAULT_ALLOWANCE_ROLLFORWARD_PATH = Path("data/processed/allowance_rollforward.parquet")
+FALLBACK_MODEL_FAMILY = projection.FALLBACK_MODEL_FAMILY
 
 
 def _quarter_range(start: str, end: str) -> list[pd.Period]:
@@ -849,20 +850,23 @@ def fit_models(
         typer.echo(f"wrote {grid_path}")
 
 
-def _determine_best_nco_model(backtest_table: pd.DataFrame, category: str) -> str:
-    """The NCO-rate model family Stage 4's own backtest found best for
-    `category`, per the user's explicit Stage 5 choice ("best backtested
-    model per category"). Tries the primary 2007-2010/main window first;
-    falls back to 2020-2021/main for a category with no data that far
-    back (e.g. AUTO, which starts in 2011); falls back to
-    FALLBACK_MODEL_FAMILY (the simplest, always-available family) if
-    neither window has a row for this category at all."""
-    for window in ("2007-2010", "2020-2021"):
-        summary = backtest.build_backtest_summary(backtest_table, window=window, covid_spec="main")
-        row = summary[(summary["category"] == category) & (summary["dependent"] == "nco_rate")]
-        if not row.empty:
-            return row.iloc[0]["best_model"]
-    return FALLBACK_MODEL_FAMILY
+def _format_coefficients_for_report(candidate: projection.CandidateModel) -> str:
+    """A compact "feature=value (classification)" string per core macro
+    feature for the model-selection report -- "no coefficients (family)"
+    for gbm, which has none."""
+    if candidate.coefficients is None:
+        return f"no coefficients ({candidate.family})"
+    classification = candidate.sign_classification or {}
+    parts = []
+    for feature in projection.CORE_SIGN_CHECK_FEATURES:
+        column = models.feature_column(feature)
+        if column not in candidate.coefficients:
+            continue
+        parts.append(
+            f"{feature}={candidate.coefficients[column]:.5f} "
+            f"({classification.get(column, 'n/a')})"
+        )
+    return "; ".join(parts)
 
 
 @app.command("project")
@@ -889,6 +893,18 @@ def project_cmd(
         "--models-dir",
         help="Output directory of `fit-models` (backtest_table.csv).",
     ),
+    credit_panel_path: Path = typer.Option(
+        DEFAULT_PANEL_PATH,
+        "--credit-panel",
+        help="Parquet panel from `build` -- used only for the real (Call-Report-wide) "
+        "total loan balance in the jump-off allowance calibration check.",
+    ),
+    allowance_path: Path = typer.Option(
+        DEFAULT_ALLOWANCE_ROLLFORWARD_PATH,
+        "--allowance-rollforward",
+        help="Output of panel.compute_bank_allowance_rollforward (bank-TOTAL, not "
+        "per-category) -- used for the real total allowance in the calibration check.",
+    ),
     output_dir: Path = typer.Option(
         DEFAULT_PROJECTIONS_DIR, "--output-dir", help="Where to write the projection tables/charts."
     ),
@@ -899,21 +915,25 @@ def project_cmd(
         "backtest.MODELING_CATEGORIES lists).",
     ),
 ) -> None:
-    """Stage 5: for every loan category, fits the model Stage 4's own
-    backtest found best (`_determine_best_nco_model`) on the FULL sample
-    through 2025Q4, projects the NCO rate forward under both Fed
+    """Stage 5: for every loan category, selects the projection model
+    (`projection.select_projection_model` -- best-backtest RMSE among the
+    full-sample-clean candidates, excluding raw aggregate_long for
+    `projection.PROXY_CATEGORIES_REQUIRING_ANCHOR`), fits it on the FULL
+    sample through 2025Q4, projects the NCO rate forward under both Fed
     scenarios (baseline, severely_adverse), and builds the simplified
     CECL allowance/provision roll-forward (credit/projection.py) from
     each projected path. Writes projection_table.csv (one row per
-    category/scenario/quarter: the projected NCO rate, lifetime expected
-    loss rate, required allowance, net charge-off and provision expense)
-    and one NCO-rate chart per category (both scenarios plus history)."""
+    category/scenario/quarter), model_selection.csv (the selected family
+    and every candidate's core-coefficient sign classification per
+    category), calibration_report.csv (the jump-off allowance ratio vs.
+    the real industry ratio), and one NCO-rate chart per category."""
     training = pd.read_parquet(panel_path)
     training["quarter"] = pd.PeriodIndex(training["quarter"].astype(str), freq="Q")
 
     macro_history = pd.read_parquet(macro_history_path)
     macro_history["quarter"] = pd.PeriodIndex(macro_history["quarter"].astype(str), freq="Q")
     macro_history = macro_history.set_index("quarter")
+    jump_off_quarter = macro_history.index.max()
 
     backtest_table_path = models_dir / "backtest_table.csv"
     if not backtest_table_path.exists():
@@ -940,6 +960,9 @@ def project_cmd(
     )
 
     projection_rows: list[dict] = []
+    selection_rows: list[dict] = []
+    jump_off_allowance_by_category: dict[str, float] = {}
+    starting_balance_by_category: dict[str, float] = {}
     chart_dir = output_dir / "charts"
     chart_dir.mkdir(parents=True, exist_ok=True)
 
@@ -949,16 +972,36 @@ def project_cmd(
             typer.echo(f"{category}: no training rows -- skipping", err=True)
             continue
 
-        best_model = _determine_best_nco_model(backtest_table, category)
         long_history_frame = long_history_frames.get((category, "nco_rate"))
+        selection = projection.select_projection_model(
+            category, category_train, long_history_frame, backtest_table
+        )
+        best_model = selection.selected_family
         if best_model in projection.FAMILIES_REQUIRING_LONG_HISTORY and long_history_frame is None:
             typer.echo(
-                f"{category}: best model {best_model} needs long-history data that "
+                f"{category}: selected model {best_model} needs long-history data that "
                 "isn't cached -- falling back to aggregate_ar",
                 err=True,
             )
             best_model = FALLBACK_MODEL_FAMILY
-        typer.echo(f"=== {category}: projecting with {best_model} ===")
+        clean_note = "" if selection.is_clean else " (NO CLEAN CANDIDATE -- best RMSE regardless)"
+        typer.echo(f"=== {category}: projecting with {best_model}{clean_note} ===")
+        for family, candidate in selection.candidates.items():
+            selection_rows.append(
+                {
+                    "category": category,
+                    "selected": family == selection.selected_family,
+                    "model_family": family,
+                    "rmse": candidate.rmse,
+                    "clean": candidate.clean,
+                    "coefficients": _format_coefficients_for_report(candidate),
+                }
+            )
+            typer.echo(
+                f"    {'*' if family == selection.selected_family else ' '} {family}: "
+                f"rmse={candidate.rmse} clean={candidate.clean} -- "
+                f"{_format_coefficients_for_report(candidate)}"
+            )
 
         realized_series = models.build_industry_series(category_train, "winsorized_nco_rate").frame
         realized_rate = realized_series.set_index("quarter")["industry_rate"]
@@ -966,6 +1009,7 @@ def project_cmd(
         starting_balance = category_train[category_train["quarter"] == last_quarter][
             "average_balance"
         ].sum()
+        starting_balance_by_category[str(category)] = starting_balance
 
         scenario_forecasts: dict[str, pd.Series] = {}
         for scenario_name, scenario in scenarios.items():
@@ -975,6 +1019,10 @@ def project_cmd(
             scenario_forecasts[scenario_name] = forecast
             cecl = projection.build_cecl_projection(
                 realized_rate, forecast, category, starting_balance
+            )
+            jump_off_allowance_by_category[str(category)] = cecl.iloc[0]["allowance_required"]
+            nine_quarter_loss = projection.cumulative_loss_rate(
+                forecast, projection.FED_COMPARISON_QUARTERS
             )
             for quarter, row in cecl.iterrows():
                 projection_rows.append(
@@ -988,6 +1036,7 @@ def project_cmd(
                         "allowance_required": row["allowance_required"],
                         "net_charge_off": row["net_charge_off"],
                         "provision_expense": row["provision_expense"],
+                        "cumulative_9q_loss_rate": nine_quarter_loss,
                     }
                 )
 
@@ -1005,3 +1054,59 @@ def project_cmd(
     table_path = output_dir / "projection_table.csv"
     pd.DataFrame(projection_rows).to_csv(table_path, index=False)
     typer.echo(f"wrote {table_path}")
+
+    selection_path = output_dir / "model_selection.csv"
+    pd.DataFrame(selection_rows).to_csv(selection_path, index=False)
+    typer.echo(f"wrote {selection_path}")
+
+    if credit_panel_path.exists() and allowance_path.exists():
+        credit_panel = pd.read_parquet(credit_panel_path)
+        credit_panel["quarter"] = pd.PeriodIndex(credit_panel["quarter"].astype(str), freq="Q")
+        real_loans_quarter = credit_panel[
+            (credit_panel["quarter"] == jump_off_quarter)
+            & (credit_panel["category"].isin(starting_balance_by_category.keys()))
+        ]
+        real_total_loans = real_loans_quarter["average_balance"].sum()
+
+        allowance_rollforward = pd.read_parquet(allowance_path)
+        real_total_allowance = allowance_rollforward[
+            allowance_rollforward["quarter"] == jump_off_quarter
+        ]["allowance_balance"].sum()
+
+        calibration = projection.compute_calibration_gap(
+            jump_off_allowance_by_category,
+            starting_balance_by_category,
+            real_total_allowance,
+            real_total_loans,
+        )
+        typer.echo(
+            f"\ncalibration check at {jump_off_quarter} (jump-off allowance as % of loans):\n"
+            f"  this engine: {calibration.model_total_allowance:,.0f} / "
+            f"{calibration.model_total_loans:,.0f} = {calibration.model_allowance_ratio:.4%}\n"
+            f"  real industry (Call Report panel): {calibration.real_total_allowance:,.0f} / "
+            f"{calibration.real_total_loans:,.0f} = {calibration.real_allowance_ratio:.4%}\n"
+            f"  gap: {calibration.gap:+.4%} (note: the real allowance figure is each bank's "
+            "TOTAL allowance across ALL loan types, not just these categories -- see "
+            "CalibrationCheck's docstring)"
+        )
+        calibration_path = output_dir / "calibration_report.csv"
+        pd.DataFrame(
+            [
+                {
+                    "jump_off_quarter": str(jump_off_quarter),
+                    "model_total_allowance": calibration.model_total_allowance,
+                    "model_total_loans": calibration.model_total_loans,
+                    "model_allowance_ratio": calibration.model_allowance_ratio,
+                    "real_total_allowance": calibration.real_total_allowance,
+                    "real_total_loans": calibration.real_total_loans,
+                    "real_allowance_ratio": calibration.real_allowance_ratio,
+                    "gap": calibration.gap,
+                }
+            ]
+        ).to_csv(calibration_path, index=False)
+        typer.echo(f"wrote {calibration_path}")
+    else:
+        typer.echo(
+            f"skipping calibration check -- {credit_panel_path} or {allowance_path} not found",
+            err=True,
+        )
