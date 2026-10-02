@@ -578,3 +578,183 @@ def test_replay_crisis_window_actual_loss_matches_the_real_call_report_series():
     ]
     expected_actual = projection.cumulative_loss_rate(window, projection.FED_COMPARISON_QUARTERS)
     assert result.actual_9q_cumulative_loss_rate == pytest.approx(expected_actual)
+
+
+def test_replay_crisis_window_bank_level_families_use_the_static_population_not_the_replay_window():
+    # Regression test for a real bug: replay_crisis_window used to use
+    # REAL historical bank rows from the replay window itself for its
+    # bank-level families (panel_fe/gbm/anchored_to_aggregate) -- a
+    # population that can differ hugely from today's (confirmed on real
+    # data: a ~1.75x difference in balance-weighted average relative
+    # risk for commercial_and_industrial), silently confounding what is
+    # supposed to be a population-CONTROLLED macro-only check. Fixed to
+    # use the same static "last actual quarter" population project_
+    # category_nco_rate projects with. This test inflates the replay
+    # window's own balances by 1000x (a population change real data
+    # would never produce) and confirms the projected number barely
+    # moves (a generous 10% relative tolerance -- inflated rows are
+    # still part of the TRAINING sample for panel_fe's own fit, via
+    # log_balance/demeaning, so a SMALL indirect shift is legitimate;
+    # the bug this guards against was a >50% shift, caught by a wide
+    # margin) -- proof the replay window's own population no longer
+    # drives the bank-level PREDICTION step directly.
+    macro_history, _ = _synthetic_macro_history_and_scenario()
+    category_train_dataset = _synthetic_category_train_dataset(macro_history)
+
+    result_before = projection.replay_crisis_window(
+        _CATEGORY, "panel_fe", category_train_dataset, None
+    )
+    assert result_before is not None
+
+    inflated = category_train_dataset.copy()
+    in_replay_window = (inflated["quarter"] >= projection.CRISIS_REPLAY_START) & (
+        inflated["quarter"] <= projection.CRISIS_REPLAY_END
+    )
+    inflated.loc[in_replay_window, "average_balance"] *= 1000.0
+
+    result_after = projection.replay_crisis_window(_CATEGORY, "panel_fe", inflated, None)
+    assert result_after is not None
+    assert result_after.projected_9q_cumulative_loss_rate == pytest.approx(
+        result_before.projected_9q_cumulative_loss_rate, rel=0.1
+    )
+
+
+def _truly_lagged_macro_history_and_dataset(n_quarters=30, n_banks=6, seed=11):
+    """Unlike `_synthetic_macro_history_and_scenario`/`_synthetic_
+    category_train_dataset` (whose "_lag1" columns are deliberately
+    CONTEMPORANEOUS, not actually lagged -- a simplification harmless
+    for the sign/magnitude checks those fixtures otherwise serve), this
+    builds a dataset where every "_lag1" column is a TRUE one-quarter
+    lag of `macro_history`, matching real production semantics exactly
+    -- needed for a trustworthy same-input-same-output comparison
+    between replay_crisis_window and project_category_nco_rate."""
+    rng = np.random.default_rng(seed)
+    quarters = _quarters("2001Q1", n_quarters)
+
+    def _series(seed_offset):
+        r = np.random.default_rng(20 + seed_offset)
+        return 5.0 + np.cumsum(r.normal(0, 0.3, size=n_quarters))
+
+    macro_history = pd.DataFrame(
+        {
+            "Unemployment rate": _series(1),
+            "House Price Index YoY % change": _series(2),
+            "Commercial Real Estate Price Index YoY % change": _series(3),
+            "Dow Jones Total Stock Market Index YoY % change": _series(4),
+        },
+        index=quarters,
+    )
+
+    rows = []
+    for bank_idx in range(n_banks):
+        base_balance = rng.uniform(5_000.0, 50_000.0)
+        for q_idx, quarter in enumerate(quarters):
+            if q_idx == 0:
+                continue  # no quarter before the first to lag from
+            lagged_quarter = quarters[q_idx - 1]
+            balance = base_balance * (1.0 + rng.normal(0, 0.02))
+            true_nco = max(
+                0.01
+                + 0.0015 * macro_history.loc[lagged_quarter, "Unemployment rate"]
+                - 0.001 * macro_history.loc[lagged_quarter, "House Price Index YoY % change"]
+                + rng.normal(0, 0.0004),
+                -0.05,
+            )
+            rows.append(
+                {
+                    "bank_id": bank_idx,
+                    "quarter": quarter,
+                    "category": _CATEGORY,
+                    "average_balance": balance,
+                    "winsorized_nco_rate": true_nco,
+                    **{
+                        models.feature_column(variable): macro_history.loc[lagged_quarter, variable]
+                        for variable in macro_history.columns
+                    },
+                }
+            )
+    return macro_history, pd.DataFrame(rows)
+
+
+def test_aggregate_forecast_construction_agrees_direct_access_vs_lag_frame_concat():
+    """The decisive test the user's own review asked for, at the level
+    where it's actually decidable: project_category_nco_rate and
+    replay_crisis_window differ in how they FIT (replay always fits on
+    the full category_train_dataset; projection fits on data truncated
+    to macro_history's own extent, which only equals the full sample in
+    real use) -- so comparing them end-to-end on a contrived historical
+    "scenario" conflates that documented difference with the thing
+    actually worth checking: given the SAME fitted coefficients, does
+    reading pre-existing REAL lag columns directly (replay's own
+    approach) ever give a different answer than building a fresh lag
+    frame and concatenating it (projection's own approach, via
+    build_projection_macro_lag_frame)? Fit ONCE on `_truly_lagged_macro_
+    history_and_dataset`'s real data, then forecast the SAME window two
+    ways and assert they match exactly -- this is the actual mechanism
+    both real functions share, and must never silently diverge."""
+    macro_history, category_train_dataset = _truly_lagged_macro_history_and_dataset()
+    industry_series = models.build_industry_series(
+        category_train_dataset, "winsorized_nco_rate"
+    ).frame
+    result = models.fit_aggregate_model(industry_series, _CATEGORY, include_pandemic_dummy=True)
+
+    forecast_start = pd.Period("2006Q1", freq="Q")
+    forecast_end = pd.Period("2008Q1", freq="Q")
+    forecast_quarters = list(pd.period_range(forecast_start, forecast_end, freq="Q"))
+
+    # (a) replay-style: forecast directly on industry_series, which
+    # already has real rows (and real lag columns) for this window.
+    forecast_direct = models.forecast_aggregate_dynamic(
+        result,
+        industry_series,
+        _CATEGORY,
+        forecast_start,
+        forecast_end,
+        include_pandemic_dummy=True,
+    )
+
+    # (b) projection-style: rebuild the SAME quarters' lag columns from
+    # macro_history via build_projection_macro_lag_frame, concatenated
+    # onto the (truncated, non-overlapping) history -- exactly what
+    # project_category_nco_rate does for a genuine future scenario.
+    before = industry_series[industry_series["quarter"] < forecast_start]
+    macro_lag_frame = projection.build_projection_macro_lag_frame(macro_history, forecast_quarters)
+    extended = pd.concat([before, macro_lag_frame], ignore_index=True, sort=False)
+    forecast_rebuilt = models.forecast_aggregate_dynamic(
+        result, extended, _CATEGORY, forecast_start, forecast_end, include_pandemic_dummy=True
+    )
+
+    pd.testing.assert_series_equal(forecast_direct, forecast_rebuilt, check_names=False)
+
+
+def test_synthetic_future_bank_frame_construction_matches_real_rows_for_the_same_quarter():
+    """The bank-level analogue of the test above: given the SAME static
+    population (`last_actual_bank_quarter`) and the SAME real macro lag
+    values for a quarter, `build_synthetic_future_bank_frame` must
+    reproduce exactly the real feature values that quarter's own real
+    rows would carry -- the construction mechanism project_category_
+    nco_rate and (after the fix above) replay_crisis_window both share."""
+    macro_history, category_train_dataset = _truly_lagged_macro_history_and_dataset()
+    last_quarter = category_train_dataset["quarter"].max()
+    last_actual_bank_quarter = category_train_dataset[
+        category_train_dataset["quarter"] == last_quarter
+    ]
+
+    some_other_quarter = pd.Period("2006Q2", freq="Q")
+    real_rows_that_quarter = category_train_dataset[
+        category_train_dataset["quarter"] == some_other_quarter
+    ].sort_values("bank_id")
+
+    lag_columns = [c for c in category_train_dataset.columns if c.endswith("_lag1")]
+    macro_lag_frame = (
+        category_train_dataset[category_train_dataset["quarter"] == some_other_quarter]
+        .groupby("quarter", as_index=False)[lag_columns]
+        .first()
+    )
+    synthetic = projection.build_synthetic_future_bank_frame(
+        last_actual_bank_quarter, macro_lag_frame
+    ).sort_values("bank_id")
+
+    for column in lag_columns:
+        assert synthetic[column].tolist() == pytest.approx(real_rows_that_quarter[column].tolist())
+    assert (synthetic["quarter"] == some_other_quarter).all()

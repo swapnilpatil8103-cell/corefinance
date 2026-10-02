@@ -852,36 +852,43 @@ still get 2020-2021 and 2026-holdout backtests.)
   crisis it never saw, which is a harder and more honest test than the
   full-sample fit Stage 5 actually projects with.
 - **Crisis replay test (`corefin credit crisis-replay`): most full-sample
-  models still under-predict their own training crisis, even in-sample.**
+  models under-predict their own training crisis, even in-sample.**
   Each category's SELECTED model is fit on the full sample (which
   includes 2007Q4-2010Q4) and then fed the crisis's own REAL, realized
   macro path — not a hypothetical scenario — and the resulting 9-quarter
-  cumulative loss is compared against the real Call Report industry loss
-  over the same window. 5 of 7 applicable categories (auto/other_consumer
-  have no real data before 2011 and are skipped) under-predict:
+  cumulative loss is compared against the real Call Report industry
+  loss over the same window. For the bank-level families (panel_fe/gbm/
+  anchored_to_aggregate), the bank-level step uses the SAME static
+  "last actual quarter" population the real projection uses, not real
+  historical bank rows from the replay window (see the bug writeup two
+  bullets down — this was the fix, not the original behavior). 6 of 7
+  applicable categories (auto/other_consumer have no real data before
+  2011 and are skipped) under-predict:
 
   | Category | Model | Projected 9Q (in-sample) | Actual 9Q | Gap |
   | --- | --- | ---: | ---: | ---: |
-  | commercial_and_industrial | anchored_to_aggregate | 5.43% | 3.90% | +1.53pp |
-  | cre_construction | anchored_to_aggregate | 7.61% | 7.83% | -0.22pp |
-  | cre_multifamily | panel_fe | 0.74% | 1.19% | -0.44pp |
-  | cre_nonfarm_nonresidential | anchored_to_aggregate | 1.81% | 0.96% | +0.85pp |
+  | commercial_and_industrial | anchored_to_aggregate | 2.34% | 3.90% | -1.55pp |
+  | cre_construction | anchored_to_aggregate | 3.43% | 7.83% | -4.41pp |
+  | cre_multifamily | panel_fe | 0.67% | 1.19% | -0.51pp |
+  | cre_nonfarm_nonresidential | anchored_to_aggregate | 1.24% | 0.96% | +0.28pp |
   | residential_mortgage | aggregate_ar | 1.99% | 2.81% | -0.81pp |
-  | home_equity | gbm | 3.15% | 4.63% | -1.48pp |
+  | home_equity | gbm | 2.12% | 4.63% | -2.51pp |
   | credit_card | aggregate_ar | 14.78% | 17.30% | -2.53pp |
 
   Since this is an IN-SAMPLE check (the model has already seen the
   crisis in training), a model that still under-predicts it isn't a
-  generalization failure — it's the model's own functional form damping
-  the macro signal. credit_card and home_equity show the clearest
-  damping (over a point low even in-sample); C&I and CRE-nonfarm, by
-  contrast, slightly OVER-predict in-sample.
-- **Fed DFAST 2026 comparison (`corefin credit fed-comparison`): the gap
-  is mostly NOT explained by in-sample model damping.** Comparing this
-  project's own severely-adverse 9-quarter cumulative loss against the
-  Fed's own published DFAST 2026 results (32 participating banks,
-  published 2026-06-24, same severely-adverse scenario and same 2025Q4
-  jump-off):
+  generalization failure — it's evidence that TODAY's bank population
+  (lower average relative risk than 2007-2010's, see two bullets down),
+  under 2007-2010-level stress, would plausibly fare better than the
+  real 2007-2010 population did — a genuinely useful, if sobering,
+  finding about population composition, not just "the model is wrong."
+  cre_construction and home_equity show the largest gaps; cre_nonfarm_
+  nonresidential is the only category that over-predicts.
+- **Fed DFAST 2026 comparison (`corefin credit fed-comparison`):**
+  Comparing this project's own severely-adverse 9-quarter cumulative
+  loss against the Fed's own published DFAST 2026 results (32
+  participating banks, published 2026-06-24, same severely-adverse
+  scenario and same 2025Q4 jump-off):
 
   | Category | Ours | Fed DFAST 2026 | Gap |
   | --- | ---: | ---: | ---: |
@@ -893,71 +900,92 @@ still get 2020-2021 and 2026-holdout backtests.)
   | auto + other_consumer (combined) | 2.50% | 7.3% | **-4.80pp** |
 
   Residential mortgage, home equity and credit card land within about a
-  point of the Fed's own figures — consistent with the small in-sample
-  damping found above. But C&I, CRE and consumer are 4.8-7.0 points
-  lower than the Fed's, a gap an order of magnitude larger than anything
-  the crisis replay shows for those same categories (C&I and CRE-nonfarm
-  didn't even under-predict in-sample) — an inconsistency investigated
-  directly below, not just asserted. This project does NOT apply a
-  fudge multiplier to close either gap — see two bullets down for the
-  one structured feature addition that WAS tried to narrow it, and why
-  it was discarded.
-- **Decomposing the inconsistency (`corefin credit seed-decomposition`):
-  it's the macro path's SHAPE, not the starting point, and NOT mainly
-  population.** The same selected model gives a much higher 9-quarter
-  loss on the real 2007Q4-2010Q4 macro path than on the Fed's severely
-  adverse scenario (e.g. C&I 5.43% vs. 2.61%; cre_construction 7.61% vs.
-  4.18%) even though both are dynamic AR-term models (aggregate_ar/
-  anchored_to_aggregate) whose forecast depends on BOTH the macro path
-  AND the level it's seeded from. Swapping ONLY the seed between the two
-  paths (same macro inputs, same fitted coefficients, just the AR term's
-  starting level exchanged) barely moves either number — at most 0.25
-  points of a multi-point gap, for every one of C&I, cre_construction,
-  cre_nonfarm_nonresidential and credit_card, at both the 9- and
-  13-quarter horizon:
+  point of the Fed's own figures. C&I, CRE and consumer are 4.8-7.0
+  points lower than the Fed's — see the next two bullets for what this
+  gap actually is (and isn't), and further down for a structured
+  feature addition that was tried to narrow it and discarded. This
+  project does NOT apply a fudge multiplier to close either gap.
+- **A real bug, found and fixed: the crisis replay was confounding a
+  POPULATION effect with the macro-path comparison it was supposed to
+  isolate.** A rigorous review of this project's own prior "macro path
+  shape" explanation for the Fed-comparison gap didn't hold up: computed
+  directly over the 9-quarter window, the Fed's severely-adverse path is
+  HARSHER than the real 2007Q4-2010Q4 crisis on every core driver (mean
+  unemployment 8.8% vs. 7.2%; HPI YoY -13.2% vs. -11.7%; CRE YoY -16.3%
+  vs. -12.9%) — yet the same models projected roughly HALF the loss on
+  the harsher Fed path. That pointed at the two code paths feeding the
+  models different inputs, not at the macro shape, so this was dumped
+  and tested directly: `replay_crisis_window` (the crisis replay) used
+  to pull REAL bank rows from the replay window itself for its
+  bank-level families (panel_fe/gbm/anchored_to_aggregate), while
+  `project_category_nco_rate` (the real projection) always uses a
+  static population held at the category's LAST ACTUAL quarter. Checked
+  directly against real data: the 2007-2010 bank population's balance-
+  weighted average "relative risk" (anchored_to_aggregate's own per-bank
+  scalar) is **~1.75x** today's (1.39 vs. 0.79 for commercial_and_
+  industrial) — large enough, on its own, to roughly explain the
+  apparent crisis-replay-vs-Fed-comparison gap for every anchored_to_
+  aggregate category, independent of any macro difference. Confirmed by
+  holding the macro path fixed and swapping ONLY the bank population:
 
-  | Category | Replay natural | Replay swapped-seed | Scenario natural | Scenario swapped-seed |
-  | --- | ---: | ---: | ---: | ---: |
-  | commercial_and_industrial | 5.43% | 5.68% | 2.61% | 2.50% |
-  | cre_construction | 7.61% | 7.66% | 4.18% | 4.16% |
-  | cre_nonfarm_nonresidential | 1.81% | 1.82% | 1.51% | 1.50% |
-  | credit_card | 14.78% | 14.57% | 15.35% | 15.56% |
+  | Category | Family | Real 2007-2010 population | Static today's population |
+  | --- | --- | ---: | ---: |
+  | commercial_and_industrial | anchored_to_aggregate | 5.45% | 2.35% |
+  | cre_construction | anchored_to_aggregate | 7.69% | 3.46% |
+  | cre_nonfarm_nonresidential | anchored_to_aggregate | 1.83% | 1.25% |
+  | cre_multifamily | panel_fe | 0.74% | 0.67% |
+  | home_equity | gbm | 3.15% | 2.12% |
 
-  So the starting point is NOT the explanation. Looking at the macro
-  paths and the peak quarter instead tells the real story — the real
-  crisis is a slower-building but far more PERSISTENT downturn, while
-  the Fed's severely-adverse scenario is a sharper but shorter V:
+  The effect is large for anchored_to_aggregate (a forecast built
+  directly from a per-bank multiplicative scalar, extremely sensitive to
+  which banks dominate the weighting) and smaller for panel_fe/gbm
+  (predictions driven by more than a single scalar). credit_card/
+  residential_mortgage (aggregate_ar) have no bank-level step at all, so
+  no population effect was possible there — consistent with their
+  already-small gaps. **Fixed**: `replay_crisis_window` (and the
+  seed-decomposition diagnostic, which shares its mechanics) now use the
+  same static population `project_category_nco_rate` does, making the
+  crisis replay a genuine, population-controlled test of the macro path
+  alone — its own stated purpose all along. A regression test (`test_
+  replay_crisis_window_bank_level_families_use_the_static_population_
+  not_the_replay_window`) locks this in, along with two tests proving
+  the two code paths' underlying construction mechanics (direct access
+  to real historical rows vs. building a fresh lag frame and
+  concatenating it) are mathematically equivalent given equivalent
+  inputs, so they can never again silently diverge.
+- **With the population confound removed, the seed-decomposition
+  (`corefin credit seed-decomposition`) result is now a clean, small,
+  single-direction gap — exactly what the drivers predict.** Re-running
+  the decomposition after the fix: the starting-point seed swap still
+  barely moves either number (confirming that part of the original
+  analysis), and now the replay-vs-scenario gap for all four categories
+  is SMALL and in the SAME direction — the Fed's harsher macro path
+  producing modestly MORE loss than the real crisis's, matching the
+  driver-mean comparison above exactly, with nothing large left
+  unexplained:
 
-  - **Unemployment**: the real path climbs more slowly but stays at or
-    above 9% for 6 STRAIGHT quarters late in the window (quarters 8-13
-    of 13: 9.3/9.6/9.9/9.8/9.6/9.5); the Fed's path peaks slightly
-    HIGHER (10.0% vs. 9.9%) and EARLIER (quarter 8 vs. 10), then
-    recovers noticeably faster, down to 8.4% by the end.
-  - **HPI/CRE YoY % change**: both paths bottom out at a comparably deep
-    trough, but the Fed's path recovers sharply in its back half — HPI
-    turns from -13.6% (quarter 9) to +6.5% (quarter 13), CRE from -24%
-    to +4.0% — while the real path's recovery is far more muted and
-    delayed (HPI is still -2.1% YoY, CRE barely positive, at quarter
-    13).
-  - **Peak timing and magnitude** confirm it: C&I's real-crisis peak
-    (3.61% annualized) lands at quarter 8 of 13 and is **2.4x** the Fed
-    scenario's peak (1.53%, at quarter 6); cre_construction's real peak
-    (5.65%, quarter 10) is **1.9x** the Fed's (2.96%, quarter 9).
-    credit_card's two peaks, by contrast, land at the SAME quarter (10)
-    and are nearly IDENTICAL in size (8.71% vs. 8.92%) — exactly the
-    category with almost no Fed-comparison gap.
+  | Category | Replay (real crisis macro) | Scenario (Fed macro) | Gap |
+  | --- | ---: | ---: | ---: |
+  | commercial_and_industrial | 2.34% | 2.61% | +0.27pp |
+  | cre_construction | 3.43% | 4.18% | +0.75pp |
+  | cre_nonfarm_nonresidential | 1.24% | 1.51% | +0.27pp |
+  | credit_card | 14.78% | 15.35% | +0.58pp |
 
-  Conclusion: for C&I/CRE, the Fed's own severely-adverse scenario is
-  simply a MILDER, SHORTER-DURATION shock than the real 2007-2010 crisis
-  was, when run through the SAME models this project selected — a real,
-  demonstrated macro-path-shape effect, not a starting-point artifact.
-  This does NOT rule out some additional population/scenario-calibration
-  effect on top of it (the Fed's 32 largest banks may still carry more
-  concentrated C&I/CRE risk their own models capture), but the
-  decomposition shows the DOMINANT, demonstrable driver is the shape and
-  persistence of the macro path itself, not which banks are in the
-  sample — the "mostly population" explanation in an earlier version of
-  this section was asserted, not demonstrated, and is corrected here.
+  So the earlier "macro path shape" explanation in a previous version of
+  this section was itself a symptom of the population bug (the in-sample
+  replay number was inflated by the 2007-2010 population's higher
+  average risk, making the Fed-comparison gap look far bigger and more
+  mysterious than it really was) — not a wrong idea exactly, but built on
+  a confounded measurement. The REMAINING Fed-comparison gap for C&I/CRE/
+  consumer (still 4.8-7.0 points, since fed-comparison's own methodology
+  was never affected by this bug) is therefore NOT explained by this
+  decomposition at all once population is held constant like-for-like;
+  it most likely reflects the Fed's own ~32 largest banks carrying more
+  concentrated C&I/CRE/consumer risk than this project's full industry-
+  wide panel averages to, consistent with the ~1.75x population-risk
+  difference found above being a real, structural feature of how the
+  bank population has changed since 2007-2010 — not fully disentangled
+  from a residual scenario-severity difference, and not claimed to be.
 - **Tried: extending the aggregate/anchored models with a 4-quarter
   unemployment change and 8-quarter cumulative HPI/CRE price changes
   (`models.EXTENDED_AGGREGATE_FEATURES`) — discarded.** The idea: the
@@ -967,8 +995,12 @@ still get 2020-2021 and 2026-holdout backtests.)
   aggregate_ar/aggregate_long/anchored_to_aggregate backtest and crisis
   replay with the 3 extra features on. Result: the in-sample crisis
   replay DID improve on average (mean |gap| across the 7 applicable
-  categories: 1.12 points → 0.84 points), but out-of-time backtest RMSE
-  got WORSE in 35 of 44 (category, window, family) cells, often badly
+  categories: 1.12 points → 0.84 points — measured BEFORE the replay
+  population-confound fix below, so these two specific numbers are
+  stale; the backtest finding that actually drove the decision is not
+  affected by that bug and stands as reported), but out-of-time
+  backtest RMSE got WORSE in 35 of 44 (category, window, family) cells,
+  often badly
   (credit_card's 2020-2021 aggregate_ar RMSE nearly quadrupled, 0.0178 →
   0.0672; commercial_and_industrial's nearly sextupled, 0.0033 → 0.0184),
   and it introduced a NEW wrong-signed, statistically significant

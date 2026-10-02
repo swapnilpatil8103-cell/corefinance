@@ -353,18 +353,40 @@ def replay_crisis_window(
     2025Q4 -- which INCLUDES [`replay_start`, `replay_end`], e.g. the
     2007Q4-2010Q4 financial crisis -- exactly as `select_projection_model`/
     `project_category_nco_rate` do for a real projection), then predicts
-    [`replay_start`, `replay_end`] using the REAL, REALIZED macro path and
-    (for panel_fe/gbm/anchored_to_aggregate) REAL historical bank rows
-    over that window -- NOT a synthetic future bank frame, since real
-    rows already exist for a past window. aggregate_ar/aggregate_long
-    still use `models.forecast_aggregate_dynamic`'s dynamic (recursive)
-    AR-term simulation, the SAME convention Stage 4's own out-of-time
-    backtest uses, so this is comparable to that backtest except for
-    being fit in-sample. Returns None (not an error) if `category_train_
-    dataset` has no real data covering the replay window at all (e.g.
-    auto/other_consumer, which start in 2011) -- the same "not applicable"
-    pattern backtest.run_category_backtests uses for a window with no
-    data to fit or score."""
+    [`replay_start`, `replay_end`] using the REAL, REALIZED macro path.
+
+    For panel_fe/gbm/anchored_to_aggregate, the bank-level step uses the
+    SAME STATIC "last actual quarter" bank population `project_category_
+    nco_rate` projects with (`build_synthetic_future_bank_frame`, with
+    REAL macro values for the replay quarters overwritten in) -- NOT real
+    historical bank rows from the replay window itself. This is
+    deliberate, not an oversight: this function's whole point is to
+    isolate the MACRO PATH's effect on the model, holding everything else
+    -- including which banks are being averaged over -- fixed at what the
+    real projection already uses. Using the replay window's OWN real bank
+    population instead would silently reintroduce a POPULATION effect
+    into what is supposed to be a population-controlled macro check --
+    a real confound this project's own review caught: anchored_to_
+    aggregate's forecast is a balance-weighted average of a FIXED per-
+    bank relative-risk multiplier, so swapping in the 2007-2010 bank
+    population (whose balance-weighted average relative risk is ~1.75x
+    today's, confirmed directly against real data) materially changes
+    the number independent of any macro difference -- enough, on its
+    own, to explain most of the apparent crisis-replay-vs-Fed-comparison
+    gap for the anchored_to_aggregate categories. panel_fe/gbm show the
+    same effect, smaller in magnitude since their predictions depend on
+    more than a single per-bank scalar.
+
+    aggregate_ar/aggregate_long have no bank-level step at all (no
+    population to control for) and still use `models.forecast_aggregate_
+    dynamic`'s dynamic (recursive) AR-term simulation, the SAME
+    convention Stage 4's own out-of-time backtest uses, so this is
+    comparable to that backtest except for being fit in-sample. Returns
+    None (not an error) if `category_train_dataset` has no real data
+    covering the replay window at all (e.g. auto/other_consumer, which
+    start in 2011) -- the same "not applicable" pattern backtest.
+    run_category_backtests uses for a window with no data to fit or
+    score."""
     industry_series_full = models.build_industry_series(
         category_train_dataset, "winsorized_nco_rate"
     ).frame
@@ -383,10 +405,19 @@ def replay_crisis_window(
             result, source_frame, category, replay_start, replay_end, include_pandemic_dummy=True
         )
     elif family in ("panel_fe", "gbm", "anchored_to_aggregate"):
-        replay_bank = category_train_dataset[
-            (category_train_dataset["quarter"] >= replay_start)
-            & (category_train_dataset["quarter"] <= replay_end)
+        last_quarter = category_train_dataset["quarter"].max()
+        last_actual_bank_quarter = category_train_dataset[
+            category_train_dataset["quarter"] == last_quarter
         ]
+        lag_columns = [c for c in category_train_dataset.columns if c.endswith(f"_lag{models.LAG}")]
+        replay_macro_lag_frame = (
+            category_train_dataset[category_train_dataset["quarter"].isin(replay_quarters)]
+            .groupby("quarter", as_index=False)[lag_columns]
+            .first()
+        )
+        replay_bank = build_synthetic_future_bank_frame(
+            last_actual_bank_quarter, replay_macro_lag_frame
+        )
         if family == "panel_fe":
             fit = models.fit_panel_fe_model(
                 category_train_dataset, category, "winsorized_nco_rate", include_pandemic_dummy=True
@@ -540,6 +571,16 @@ def project_category_nco_rate(
     industry_series_full = models.build_industry_series(
         category_train_dataset, "winsorized_nco_rate"
     ).frame
+    # Same overlap-prevention as long_history_frame's own truncation
+    # above: industry_series_full never actually reaches past
+    # jump_off_quarter in real use (category_train_dataset's own real
+    # quarters stop there), so this is a no-op in production, but
+    # defends against the same quarter-duplication corruption
+    # (forecast_aggregate_dynamic's `.loc[quarter]` returning multiple
+    # rows instead of one) if `scenario` ever overlaps real historical
+    # quarters -- e.g. a diagnostic feeding a past window through this
+    # function instead of a genuine future scenario.
+    industry_series_full = industry_series_full[industry_series_full["quarter"] <= jump_off_quarter]
 
     if best_model_family in ("aggregate_ar", "aggregate_long"):
         source_frame = (

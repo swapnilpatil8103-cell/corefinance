@@ -140,10 +140,26 @@ def replay_with_seed(
     relative_levels = models.compute_bank_relative_levels(
         category_train_dataset, "winsorized_nco_rate", long_train_matching_bank_period
     )
-    replay_bank = category_train_dataset[
-        (category_train_dataset["quarter"] >= replay_start)
-        & (category_train_dataset["quarter"] <= replay_end)
+    # SAME static "last actual quarter" bank population projection.
+    # replay_crisis_window uses -- NOT real historical bank rows from the
+    # replay window (see that function's docstring: using the real
+    # 2007-2010 population here would reintroduce a POPULATION effect
+    # into what this decomposition needs to be a population-controlled
+    # macro-only comparison).
+    replay_quarters = list(pd.period_range(replay_start, replay_end, freq="Q"))
+    last_quarter = category_train_dataset["quarter"].max()
+    last_actual_bank_quarter = category_train_dataset[
+        category_train_dataset["quarter"] == last_quarter
     ]
+    lag_columns = [c for c in category_train_dataset.columns if c.endswith(f"_lag{models.LAG}")]
+    replay_macro_lag_frame = (
+        category_train_dataset[category_train_dataset["quarter"].isin(replay_quarters)]
+        .groupby("quarter", as_index=False)[lag_columns]
+        .first()
+    )
+    replay_bank = projection.build_synthetic_future_bank_frame(
+        last_actual_bank_quarter, replay_macro_lag_frame
+    )
     predicted_bank = models.forecast_anchored_to_aggregate(
         relative_levels, long_forecast, replay_bank
     )
