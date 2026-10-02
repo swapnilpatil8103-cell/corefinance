@@ -1118,6 +1118,79 @@ knowing about (and, for cre_construction specifically, cuts in the
 direction a skeptic would expect), but it is NOT the dominant driver of
 that gap either; (a) remains the default for every real projection.
 
+### Stage 7: `CreditLossProjection` -- the typed output, single-bank mode, Excel export
+
+`credit/__init__.py` names this engine "Project #7" and its deliverable
+to a downstream consumer ("Project #2", a Bank M&A CET1 & Accretion
+Simulator) as `CreditLossProjection`. Stage 7 builds that typed
+interface and the two capabilities it needs to be useful outside this
+engine's own CSVs: a single-bank mode, and an Excel export. This
+subsection is the project's own capstone summary.
+
+**Question.** How much credit loss should a US bank (or the industry as
+a whole) expect to reserve against, by loan category, under the Fed's
+baseline and severely-adverse macro scenarios, over the next 13
+quarters -- and how much does that number actually move if the
+population of banks, the model family, or the macro path's shape
+changes?
+
+**Data.** Real FFIEC Call Report bulk data (2001Q1-2025Q4, ~3.7M
+bank-quarter-category rows after filtering), the Fed's own historic
+macro actuals and baseline/severely-adverse scenario paths (2026
+vintage), and FRED's industry-wide charge-off/delinquency series
+(back to 1991Q1 for most categories) — every MDRM item code, FRED
+series ID, and Fed scenario URL verified live against the real source,
+never assumed (`schema.py`, `sources/fred.py`, `sources/fed_scenarios.py`,
+`sources/fed_stress_test_results.py`'s own docstrings carry the
+verification trail, including several self-corrected wrong guesses).
+
+**Models.** Five families (aggregate AR, aggregate fit on FRED's longer
+history, a bank-panel fixed-effects model, gradient boosting, and a
+bank-relative-level anchor to the long-history aggregate), backtested
+out-of-time against the 2008 and COVID crises (Stage 4), selected per
+category by the best backtest RMSE among the candidates with no
+wrong-signed, statistically significant core macro coefficient on the
+FULL-SAMPLE fit (Stage 5's `select_projection_model`) — not just the
+single lowest-RMSE family outright.
+
+**Validation.** Three real, documented checks beyond the required
+backtest windows: an in-sample crisis replay (does the full-sample model
+reproduce the real 2007-2010 outcome when fed the real macro path?), a
+comparison against the Fed's own published DFAST 2026 results, and a
+decomposition of the gap between those two into a starting-point effect
+(small), a macro-path-shape effect, and a bank-population effect
+(found, mid-project, to be a real confounding bug in the first version
+of the crisis replay — fixed, with regression tests locking in that the
+two code paths can never again silently diverge on identical input).
+Stage 6 adds Monte Carlo loss distributions (macro-path and model-
+residual uncertainty) on top of Stage 5's single deterministic path.
+
+**Results.** Severely-adverse, 9-quarter cumulative loss rates range
+from 1.5% (residential mortgage) to 17.1% (the Fed's own credit-card
+figure; this project's own: 15.4%) across categories. This project's
+own figures land within ~1 point of the Fed's for residential mortgage,
+home equity, and credit card; commercial real estate and C&I run 4.8-7.0
+points lower than the Fed's ~32-largest-bank figures, a real,
+investigated, NOT-closed gap (see the bullets above) that this project
+does not paper over with a fudge multiplier. The jump-off (2025Q4)
+allowance-to-loan ratio this engine's own simplified CECL methodology
+produces (1.90%) sits within a point of the real industry ratio computed
+directly from the Call Report panel (2.58%).
+
+**Limitations.** Documented plainly throughout rather than fixed with a
+shortcut: simplified CECL (a fixed per-category weighted-average-life
+window standing in for real loan-level vintage curves this project has
+no data to build); a static balance sheet (no balance-growth forecast);
+NPL ratio held flat at its jump-off level in `CreditLossProjection`
+rather than separately modeled (Stage 5 only ever selected a model for
+NCO rate); survivorship bias in `anchored_to_aggregate`'s bank
+population; Monte Carlo's macro shocks assumed independent (not
+correlated) across variables and quarters; and the unresolved ~5-7 point
+Fed-comparison gap for CRE/C&I/consumer, most likely driven by the Fed's
+own largest banks carrying more concentrated risk than this project's
+full industry-wide panel averages to, but not fully disentangled from a
+residual scenario-severity difference.
+
 ## Testing conventions
 
 - `pytest.mark.slow` is excluded by default (`addopts = "-m 'not slow'"` in
