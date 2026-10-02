@@ -22,25 +22,25 @@ def _make_zip(name: str, content: str) -> bytes:
 def test_parse_y9c_bulk_zip_reads_caret_separated_items():
     content = (
         "RSSD9001^RSSD9017^BHCK2170^BHCAP793\n"
-        "1085013^SEACOAST BANKING CORPORATION OF FLORIDA^20842331^11.5390\n"
-        "1085509^CAPITAL CITY BANK GROUP, INC.^4385765^13.2000\n"
+        "9000001^FIRST FICTIONAL BANCORP, INC.^20842331^11.5390\n"
+        "9000002^SAMPLE COMMUNITY BANKSHARES, INC.^4385765^13.2000\n"
     )
     zip_bytes = _make_zip("BHCF20251231.txt", content)
     result = fr_y9c.parse_y9c_bulk_zip(zip_bytes, pd.Period("2025Q4", freq="Q"))
 
     assert len(result) == 2
-    assert set(result["rssd_id"]) == {"1085013", "1085509"}
-    row = result[result["rssd_id"] == "1085013"].iloc[0]
+    assert set(result["rssd_id"]) == {"9000001", "9000002"}
+    row = result[result["rssd_id"] == "9000001"].iloc[0]
     assert row["BHCK2170"] == pytest.approx(20842331.0)
     assert row["BHCAP793"] == pytest.approx(11.5390)
     assert row["quarter"] == pd.Period("2025Q4", freq="Q")
 
 
 def test_parse_y9c_bulk_zip_coerces_non_numeric_cells_to_nan():
-    content = "RSSD9001^BHCK2170\n1085013^\n1085509^4385765\n"
+    content = "RSSD9001^BHCK2170\n9000001^\n9000002^4385765\n"
     zip_bytes = _make_zip("BHCF20251231.txt", content)
     result = fr_y9c.parse_y9c_bulk_zip(zip_bytes, pd.Period("2025Q4", freq="Q"))
-    assert result.loc[result["rssd_id"] == "1085013", "BHCK2170"].isna().iloc[0]
+    assert result.loc[result["rssd_id"] == "9000001", "BHCK2170"].isna().iloc[0]
 
 
 def test_parse_y9c_bulk_zip_raises_when_zip_has_more_than_one_file():
@@ -61,10 +61,10 @@ def test_parse_y9c_bulk_zip_raises_when_rssd_column_missing():
 def test_find_holding_company_by_name_is_case_insensitive():
     content = (
         "RSSD9001^RSSD9017^BHCK2170\n"
-        "1085013^SEACOAST BANKING CORPORATION OF FLORIDA^20842331\n"
-        "1085509^CAPITAL CITY BANK GROUP, INC.^4385765\n"
+        "9000001^FIRST FICTIONAL BANCORP, INC.^20842331\n"
+        "9000002^SAMPLE COMMUNITY BANKSHARES, INC.^4385765\n"
     )
     zip_bytes = _make_zip("BHCF20251231.txt", content)
     result = fr_y9c.parse_y9c_bulk_zip(zip_bytes, pd.Period("2025Q4", freq="Q"))
-    matches = fr_y9c.find_holding_company_by_name(result, "seacoast")
-    assert matches["rssd_id"].tolist() == ["1085013"]
+    matches = fr_y9c.find_holding_company_by_name(result, "fictional")
+    assert matches["rssd_id"].tolist() == ["9000001"]

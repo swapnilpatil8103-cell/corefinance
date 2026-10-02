@@ -69,6 +69,72 @@ All other item codes below (total assets, other assets, total deposits,
 net income, pretax income, taxes, goodwill, RWA, leverage/total/tier-1
 risk-based capital ratios) were independently re-verified via the same
 live MDRM search and match what was originally proposed.
+
+THE CET1 BRIDGE (replacing a single calibrated plug): the acquirer's
+jump-off CET1 capital computed as equity minus goodwill minus other
+intangibles is $1,855mm, but reported CET1 is $1,631mm -- a -$224mm gap.
+Rather than absorb that into one unexplained constant, every RC-R Part I
+adjustment/deduction line item was looked up via live MDRM search and
+pulled from the real 2025Q4 Y-9C data, and the full build reconciles to
+the dollar (verified against both example banks, numbers in $thousands
+as reported):
+
+  Acquirer HC (RSSD 1085013):
+    Total equity capital (BHCK3210)                        3,055,683
+    LESS: Perpetual preferred stock, w/ surplus (BHCK3283)   -343,125
+    = CET1 before adjustments and deductions (BHCAP840)     2,712,558
+    LESS: Goodwill, net of assoc. DTLs (BHCAP841)          -1,034,735
+    LESS: Other intangibles, net of assoc. DTLs (BHCAP842)   -120,699
+    LESS: DTAs from NOL/credit carryforwards, net (BHCAP843)    -2,654
+    LESS: Net unrealized gain/(loss) on AFS debt securities
+          in AOCI (BHCAP844, a loss here, so subtracting it
+          ADDS it back -- the AOCI opt-out mechanism)           77,195  (-(-77,195))
+    LESS: Accumulated net gains/(losses) on cash-flow
+          hedges in AOCI (BHCAP846)                               -230
+    LESS: All other CET1 deductions/additions (BHCAP850)             0
+    = Common equity tier 1 capital (BHCAP859, reported)      1,631,436
+
+  Target HC (RSSD 1085509) -- reconciles to within $1mm, as expected:
+    Total equity capital (BHCK3210)                           552,851
+    LESS: Preferred stock (BHCK3283 = 0 -- no preferred stock)       0
+    = CET1 before adjustments (BHCAP840)                       552,851
+    LESS: Goodwill, net of assoc. DTLs (BHCAP841)               -85,924
+    LESS: Other intangibles, net of DTLs (BHCAP842 = 0)               0
+    LESS: AOCI -- AFS unrealized loss (BHCAP844, add-back)        9,530
+    LESS: AOCI -- cash-flow hedges (BHCAP846)                    -2,676
+    LESS: AOCI -- defined-benefit pension (BHCAP847)             -9,441
+    = Common equity tier 1 capital (BHCAP859, reported)          464,340
+
+The single biggest driver of the acquirer's gap is its $343mm of
+perpetual preferred stock (Tier 1, not CET1 -- a capital-structure
+feature the target doesn't have at all, BHCK3283=0) and its much larger
+goodwill/intangible base; the AOCI items partly offset (both banks are
+sitting on AFS unrealized losses from the current rate environment, and
+being AOCI-opt-out banks, those losses get added BACK to CET1 rather
+than depressing it further).
+
+WHICH ITEMS CHANGE IN A MERGER (relevant for `corefin.ma`'s Stage 3):
+  - Preferred stock: unchanged by default (acquirer's own preferred
+    continues; a deal assumption, not modeled here, would be needed if
+    the target's preferred -- none in this example deal -- were redeemed
+    or assumed).
+  - Goodwill/other-intangibles net of DTL: CHANGE SUBSTANTIALLY -- the
+    target's EXISTING goodwill/intangibles are written off at close
+    (standard purchase accounting) and replaced by newly-created deal
+    goodwill (consideration paid less fair value of net assets acquired)
+    and a new core deposit intangible, each with their own DTL netting.
+    This is the single largest CET1 impact of the deal itself.
+  - DTA NOL/credit-carryforward deduction: potentially affected by IRC
+    Section 382 ownership-change limitations in a taxable acquisition --
+    flagged as a real nuance, not quantitatively modeled here.
+  - AOCI items (AFS/cash-flow-hedge/pension/HTM): the ACQUIRER's own
+    pre-existing AOCI items carry forward unchanged at close. The
+    TARGET's AFS securities, however, get marked to fair value as part
+    of purchase accounting -- which re-bases their cost basis to fair
+    value, so the target's own pre-existing AFS AOCI balance resets to
+    zero at close (there is no more "unrealized" gain/loss versus the
+    old cost basis once the securities are revalued).
+  - All other CET1 deductions: unchanged by default.
 """
 
 from __future__ import annotations
@@ -114,6 +180,12 @@ HC_TOTAL_LIABILITIES_ITEM = "BHCK2948"
 HC_TOTAL_EQUITY_CAPITAL_ITEM = "BHCK3210"
 HC_GOODWILL_ITEM = "BHCK3163"
 HC_OTHER_INTANGIBLES_ITEM = "BHCKJF76"
+HC_NET_INTEREST_INCOME_ITEMS = ("BHCK4107", "BHCK4073")  # total interest income, total
+# interest expense, same pairing as bank-level NET_INTEREST_INCOME_ITEMS -- confirmed present
+# and internally consistent (interest income - interest expense = net income delta check) for
+# both example banks' real 2025Q4 holding companies.
+HC_NONINTEREST_INCOME_ITEM = "BHCK4079"
+HC_NONINTEREST_EXPENSE_ITEM = "BHCK4093"
 HC_NET_INCOME_ITEM = "BHCK4340"
 HC_PRETAX_INCOME_ITEM = "BHCK4301"
 HC_APPLICABLE_INCOME_TAXES_ITEM = "BHCK4302"
@@ -125,6 +197,41 @@ HC_RWA_ITEM = "BHCAA223"  # "Risk-weighted assets (net of allowances and other d
 HC_TIER1_LEVERAGE_RATIO_ITEM = "BHCA7204"  # "Tier 1 leverage capital ratio"
 HC_TOTAL_RISK_BASED_CAPITAL_RATIO_ITEM = "BHCA7205"  # "Total risk-based capital ratio"
 HC_TIER1_RISK_BASED_CAPITAL_RATIO_ITEM = "BHCA7206"  # "Tier 1 risk-based capital ratio"
+
+# RC-R Part I CET1 bridge items -- see module docstring's "THE CET1 BRIDGE" section for the
+# full worked reconciliation against real data. BHCAPxxx percentage/dollar items share the
+# same "%"-stripping handled by ffiec_parse.parse_bulk_zip; the Y-9C bulk file's own ratio
+# items (BHCAP793 etc.) are plain numeric strings already (see sources/fr_y9c.py docstring).
+HC_PREFERRED_STOCK_ITEM = "BHCK3283"  # "Perpetual preferred stock (including related surplus)"
+# -- part of total equity capital but excluded from CET1 (Additional Tier 1 instead).
+HC_CET1_BEFORE_ADJUSTMENTS_ITEM = "BHCAP840"  # "Common equity tier 1 capital before
+# adjustments and deductions" = total equity capital LESS preferred stock.
+HC_GOODWILL_NET_OF_DTL_ITEM = "BHCAP841"  # "Goodwill net of associated deferred tax
+# liabilities (DTLs)" -- the actual CET1 deduction; may differ from gross HC_GOODWILL_ITEM.
+HC_OTHER_INTANGIBLES_NET_OF_DTL_ITEM = "BHCAP842"  # "Intangible assets (other than goodwill
+# and MSAs), net of associated DTLs."
+HC_DTA_NOL_DEDUCTION_ITEM = "BHCAP843"  # "DTAs that arise from net operating loss and tax
+# credit carryforwards, net of any related valuation allowances and net of DTLs."
+HC_AOCI_AFS_ITEM = "BHCAP844"  # "LESS: net unrealized gains (losses) on AFS debt securities"
+# -- signed (gain positive, loss negative); for an AOCI opt-out bank, SUBTRACTING this raw
+# signed value is exactly the opt-out mechanism (a loss, stored negative, gets added back).
+HC_AOCI_CASH_FLOW_HEDGE_ITEM = "BHCAP846"  # "Accumulated net gains (losses) on cash-flow
+# hedges" -- same signed convention as HC_AOCI_AFS_ITEM.
+HC_AOCI_PENSION_ITEM = "BHCAP847"  # "LESS: amounts recorded in AOCI attributed to defined
+# benefit postretirement plans..." -- same signed convention.
+HC_AOCI_HTM_ITEM = "BHCAP848"  # "LESS: net unrealized gains (losses) on HTM securities that
+# are included in AOCI" -- same signed convention (rare to be nonzero; HTM is carried at
+# amortized cost, so this only applies to certain reclassified/transferred securities).
+HC_OTHER_CET1_DEDUCTIONS_ITEM = "BHCAP850"  # "LESS: all other deductions from (additions to)
+# common equity tier 1 capital before threshold-based deductions" -- the schedule's own
+# explicit small catch-all; kept here as the LAST, genuinely-residual item, not a stand-in
+# for the items above.
+
+# Balance-sheet sourcing items (HC level, FR Y-9C), confirmed via live MDRM search.
+HC_CASH_NONINTEREST_ITEM = "BHCK0081"  # "Noninterest-bearing balances and currency and coin"
+HC_CASH_INTEREST_BEARING_ITEM = "BHCK0395"  # "Interest-bearing balances in U.S. offices"
+HC_SECURITIES_AFS_ITEM = "BHCK1773"  # "Available-for-sale debt securities" (fair value)
+HC_SECURITIES_HTM_ITEM = "BHCK1754"  # "Held-to-maturity securities, total"
 
 # Bank-level equivalents of the RC-R Part I capital items, same MDRM item numbers under the
 # RCOA (domestic) prefix -- confirmed populated for both example banks (FFIEC 041/051
@@ -211,10 +318,19 @@ class BankConfig(BaseModel):
 class BankOpeningBalance(BaseModel):
     """ONE bank's jump-off (last-actual-quarter) balance-sheet and
     reported-capital inputs -- everything `balance_sheet.project_balance_sheet`
-    and `capital.calibrate_risk_weights` need beyond the credit engine's
-    own `CreditLossProjection` (which supplies loan balances/allowance).
-    Dollar fields are $mm; `reported_cet1_ratio` is a decimal fraction
-    (0.1382, not 13.82)."""
+    and `capital.calibrate_risk_weights`/`capital.compute_cet1_capital` need
+    beyond the credit engine's own `CreditLossProjection` (which supplies
+    loan balances/allowance). Dollar fields are $mm; `reported_cet1_ratio`
+    is a decimal fraction (0.1382, not 13.82).
+
+    `goodwill_mm`/`other_intangibles_mm` are GROSS carrying values (drive
+    the balance sheet's total assets and are excluded from RWA). The
+    `*_net_of_dtl_mm`/AOCI/preferred-stock fields below are the SEPARATE,
+    explicit RC-R Part I CET1 bridge inputs `capital.compute_cet1_capital`
+    uses instead of a single plug -- see schema.py's module docstring
+    ("THE CET1 BRIDGE") for the full worked reconciliation. They may
+    differ from the gross balance-sheet figures (e.g. other intangibles
+    net of DTL is typically smaller than the gross carrying value)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -241,6 +357,19 @@ class BankOpeningBalance(BaseModel):
     net_interest_income_jumpoff_mm: float
     noninterest_income_jumpoff_mm: float = Field(ge=0.0)
     noninterest_expense_jumpoff_mm: float = Field(ge=0.0)
+
+    # Explicit RC-R Part I CET1 bridge -- see "THE CET1 BRIDGE" in the module docstring.
+    # Default 0.0 for items that are genuinely zero/rare for most banks (preferred stock, the
+    # smaller AOCI sub-items) rather than forcing every caller to supply nine fields.
+    preferred_stock_mm: float = Field(default=0.0, ge=0.0)
+    goodwill_net_of_dtl_mm: float = Field(ge=0.0)
+    other_intangibles_net_of_dtl_mm: float = Field(default=0.0, ge=0.0)
+    dta_nol_deduction_mm: float = Field(default=0.0, ge=0.0)
+    aoci_afs_unrealized_mm: float = Field(default=0.0)  # signed: gain positive, loss negative
+    aoci_cash_flow_hedge_mm: float = Field(default=0.0)  # signed, same convention
+    aoci_pension_mm: float = Field(default=0.0)  # signed, same convention
+    aoci_htm_mm: float = Field(default=0.0)  # signed, same convention
+    other_cet1_deductions_mm: float = Field(default=0.0)
 
     reported_cet1_capital_mm: float = Field(gt=0.0)
     reported_cet1_ratio: float = Field(gt=0.0, lt=1.0)

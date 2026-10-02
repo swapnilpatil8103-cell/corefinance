@@ -2,18 +2,21 @@
 capital, risk-weighted assets (bottom-up, simplified, calibrated), the
 CET1 ratio, and the Tier 1 leverage ratio.
 
-CET1 CAPITAL: `equity_mm - goodwill_mm - other_intangibles_mm`, plus a
-single calibrated constant (`other_cet1_adjustments_mm`) solved once at
-the jump-off quarter so the computed figure matches the bank's own
-reported CET1 capital (`BankOpeningBalance.reported_cet1_capital_mm`)
-exactly at period 0 -- the real regulatory CET1 build-up also includes
-AOCI (excluded here by the AOCI-opt-out assumption -- `corefin.bank`
-doesn't model unrealized AFS mark-to-market in `equity_mm` at all, so
-there is nothing to add back) plus smaller items this simplified model
-doesn't carry (DTAs subject to threshold deductions, MSRs, minority
-interest, etc.); rather than silently ignore that gap, it is captured
-once, explicitly, as a flat ongoing adjustment -- the same "calibrate
-once at jump-off, hold flat" approach used for RWA below.
+CET1 CAPITAL: built from the EXPLICIT RC-R Part I bridge (equity minus
+preferred stock minus goodwill-net-of-DTL minus other-intangibles-net-of-
+DTL minus the DTA NOL deduction minus each AOCI sub-item minus other
+deductions) -- see `corefin.bank.schema`'s module docstring, "THE CET1
+BRIDGE," for the full worked reconciliation against real 2025Q4 data for
+both example banks (both reconcile to the dollar). A SMALL residual
+(`unexplained_cet1_residual_mm`) is still solved once at jump-off and
+held flat, the same "calibrate once, hold flat" approach used for RWA
+below -- real banks can have additional threshold-based deductions (DTAs/
+MSRs/significant-investments over the 10%/15% CET1 thresholds, minority
+interest, insufficient-AT1/T2-coverage deductions) this bridge doesn't
+itemize; for both example banks that residual is near zero (the bridge
+above already explains the full reported figure), and
+`model.check_cet1_bridge_reconciles` flags it if it is not small relative
+to reported CET1 capital for a given bank.
 
 RWA: bottom-up over `corefin.bank.schema.AssetRiskCategory` buckets using
 `BankConfig.risk_weights`, computed on NET balances (loans net of
@@ -65,7 +68,7 @@ class CapitalResult:
     rwa_mm: np.ndarray
     average_assets_mm: np.ndarray  # leverage-ratio denominator
     rwa_calibration_factor: float
-    other_cet1_adjustments_mm: float
+    unexplained_cet1_residual_mm: float
 
     def __post_init__(self) -> None:
         n = self.timeline.n_periods
@@ -118,14 +121,35 @@ def calibrate_rwa(
 def compute_cet1_capital(
     balance_sheet: BalanceSheet, opening: BankOpeningBalance
 ) -> tuple[np.ndarray, float]:
-    """Returns (cet1_capital_mm array, other_cet1_adjustments_mm). The
+    """Builds CET1 capital via the explicit RC-R Part I bridge (see this
+    module's docstring and `corefin.bank.schema`'s "THE CET1 BRIDGE").
+    Every bridge input (`BankOpeningBalance`'s preferred stock/net-of-DTL/
+    AOCI/other-deductions fields) is a SCALAR, jump-off value -- Stage 2
+    holds all of them static across the projection (no deal-driven
+    goodwill/intangible step-up or AOCI remark yet; that is
+    `corefin.ma`'s Stage 3 concern, per schema.py's "WHICH ITEMS CHANGE IN
+    A MERGER"), so only `balance_sheet.equity_mm` varies by period.
+
+    Returns (cet1_capital_mm array, unexplained_cet1_residual_mm). The
     jump-off (period 0) entry of the returned array equals
-    `opening.reported_cet1_capital_mm` exactly by construction."""
-    formula_capital = (
-        balance_sheet.equity_mm - balance_sheet.goodwill_mm - balance_sheet.other_intangibles_mm
+    `opening.reported_cet1_capital_mm` exactly by construction -- the
+    residual is solved once at jump-off (same as `calibrate_rwa`) to
+    absorb whatever this bridge doesn't itemize (see
+    `model.check_cet1_bridge_reconciles` for a materiality check)."""
+    cet1_before_adjustments_mm = balance_sheet.equity_mm - opening.preferred_stock_mm
+    deductions_mm = (
+        opening.goodwill_net_of_dtl_mm
+        + opening.other_intangibles_net_of_dtl_mm
+        + opening.dta_nol_deduction_mm
+        + opening.aoci_afs_unrealized_mm
+        + opening.aoci_cash_flow_hedge_mm
+        + opening.aoci_pension_mm
+        + opening.aoci_htm_mm
+        + opening.other_cet1_deductions_mm
     )
-    other_cet1_adjustments_mm = opening.reported_cet1_capital_mm - formula_capital[0]
-    return formula_capital + other_cet1_adjustments_mm, other_cet1_adjustments_mm
+    formula_capital = cet1_before_adjustments_mm - deductions_mm
+    unexplained_cet1_residual_mm = opening.reported_cet1_capital_mm - formula_capital[0]
+    return formula_capital + unexplained_cet1_residual_mm, unexplained_cet1_residual_mm
 
 
 def compute_capital(
@@ -134,7 +158,7 @@ def compute_capital(
     config: BankConfig,
     timeline: Timeline,
 ) -> CapitalResult:
-    cet1_capital_mm, other_cet1_adjustments_mm = compute_cet1_capital(balance_sheet, opening)
+    cet1_capital_mm, unexplained_cet1_residual_mm = compute_cet1_capital(balance_sheet, opening)
     rwa_mm, rwa_calibration_factor = calibrate_rwa(balance_sheet, opening, config)
     return CapitalResult(
         timeline=timeline,
@@ -142,5 +166,5 @@ def compute_capital(
         rwa_mm=rwa_mm,
         average_assets_mm=balance_sheet.total_assets_mm,
         rwa_calibration_factor=rwa_calibration_factor,
-        other_cet1_adjustments_mm=other_cet1_adjustments_mm,
+        unexplained_cet1_residual_mm=unexplained_cet1_residual_mm,
     )

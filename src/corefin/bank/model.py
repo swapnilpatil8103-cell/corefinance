@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from corefin.bank.balance_sheet import BalanceSheet, project_balance_sheet
 from corefin.bank.capital import CapitalResult, compute_capital
 from corefin.bank.income_statement import IncomeStatement, compute_income_statement
@@ -17,6 +19,7 @@ from corefin.timeline import Timeline
 
 BALANCE_SHEET_TOLERANCE_MM = 1e-6
 CAPITAL_ROLLFORWARD_TOLERANCE_MM = 1e-6
+CET1_BRIDGE_MATERIALITY_THRESHOLD = 0.02  # unexplained_cet1_residual_mm / reported CET1
 
 
 @dataclass(frozen=True)
@@ -80,25 +83,41 @@ def check_capital_rollforward(
 ) -> CheckResult:
     """CET1 capital's period-over-period change must equal that period's
     (net income - dividends) -- true by construction in this standalone
-    model (goodwill/other intangibles are static and the
-    `other_cet1_adjustments_mm` calibration constant doesn't change), but
-    checked explicitly so a wiring bug anywhere in the pipeline would be
-    caught, and so the SAME check still means something once `corefin.ma`
-    injects a goodwill/intangible change at deal close."""
+    model (every input to `capital.compute_cet1_capital`'s bridge besides
+    `balance_sheet.equity_mm` is a static, jump-off-only value -- see
+    schema.py's "WHICH ITEMS CHANGE IN A MERGER"), but checked explicitly
+    so a wiring bug anywhere in the pipeline would be caught, and so the
+    SAME check still means something once `corefin.ma` injects a bridge-
+    item change (new deal goodwill, a reset target AOCI, etc.) at deal
+    close."""
     cet1 = result.capital.cet1_capital_mm
-    goodwill = result.balance_sheet.goodwill_mm
-    other_intangibles = result.balance_sheet.other_intangibles_mm
     net_income = result.income_statement.net_income_mm
     dividends = result.income_statement.dividends_mm
 
     actual_delta = cet1[1:] - cet1[:-1]
-    expected_delta = (
-        (net_income[1:] - dividends[1:])
-        - (goodwill[1:] - goodwill[:-1])
-        - (other_intangibles[1:] - other_intangibles[:-1])
-    )
+    expected_delta = net_income[1:] - dividends[1:]
     residual = actual_delta - expected_delta
     return check_close_to_zero("capital_rollforward_ties", residual.reshape(1, -1), tolerance)
+
+
+def check_cet1_bridge_reconciles(
+    result: BankModelResult, threshold: float = CET1_BRIDGE_MATERIALITY_THRESHOLD
+) -> CheckResult:
+    """Flags when `capital.compute_cet1_capital`'s explicit RC-R Part I
+    bridge (preferred stock, goodwill/other-intangibles net of DTL, the
+    DTA NOL deduction, each AOCI sub-item, other deductions) does NOT
+    explain reported CET1 capital to within `threshold` (default 2%) --
+    i.e. `unexplained_cet1_residual_mm` is large relative to the bank's
+    own reported CET1 capital, meaning this bank likely has a material
+    RC-R Part I item (threshold-based deductions, minority interest, an
+    insufficient-AT1/T2-coverage adjustment) the bridge doesn't itemize.
+    Both example banks pass this with room to spare -- the bridge already
+    explains their reported CET1 capital to the dollar."""
+    residual_pct = (
+        abs(result.capital.unexplained_cet1_residual_mm) / result.opening.reported_cet1_capital_mm
+    )
+    residual_array = np.array([[residual_pct]])
+    return check_close_to_zero("cet1_bridge_reconciles", residual_array, threshold)
 
 
 @dataclass(frozen=True)

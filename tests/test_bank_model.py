@@ -12,6 +12,7 @@ from corefin.bank.model import (
     BankModelResult,
     check_balance_sheet_balances,
     check_capital_rollforward,
+    check_cet1_bridge_reconciles,
     reconcile_levels,
     run_bank_model,
 )
@@ -70,6 +71,7 @@ def _synthetic_opening(**overrides) -> BankOpeningBalance:
         net_interest_income_jumpoff_mm=40.0,
         noninterest_income_jumpoff_mm=10.0,
         noninterest_expense_jumpoff_mm=30.0,
+        goodwill_net_of_dtl_mm=50.0,
         reported_cet1_capital_mm=790.0,
         reported_cet1_ratio=0.12,
         reported_rwa_mm=6583.33,
@@ -133,6 +135,34 @@ def test_jumpoff_cet1_ratio_matches_reported_for_a_full_model_run():
 
     result = run_bank_model(opening, credit_projection, config, timeline)
     assert result.capital.cet1_ratio[0] == pytest.approx(opening.reported_cet1_ratio, abs=1e-6)
+
+
+def test_cet1_bridge_reconciles_when_explicit_items_already_explain_reported_capital():
+    # goodwill_net_of_dtl_mm=50.0 (the synthetic fixture's only nonzero bridge item) already
+    # equals equity(850) - reported_cet1_capital_mm(790) = 60... not quite, so there IS a small
+    # residual here, but it should still be well under the default 2% materiality threshold.
+    timeline = _timeline()
+    opening = _synthetic_opening()
+    credit_projection = _synthetic_credit_projection(timeline, seed=4)
+    config = BankConfig()
+
+    result = run_bank_model(opening, credit_projection, config, timeline)
+    check = check_cet1_bridge_reconciles(result)
+    assert check.passed, check.describe()
+
+
+def test_cet1_bridge_flags_a_large_unexplained_residual():
+    # A reported CET1 capital wildly inconsistent with the bridge inputs (e.g. a data error, or
+    # a bank with a material RC-R Part I item this bridge doesn't itemize) must fail the
+    # materiality check rather than silently absorb an oversized residual.
+    timeline = _timeline()
+    opening = _synthetic_opening(reported_cet1_capital_mm=1.0)
+    credit_projection = _synthetic_credit_projection(timeline, seed=5)
+    config = BankConfig()
+
+    result = run_bank_model(opening, credit_projection, config, timeline)
+    check = check_cet1_bridge_reconciles(result)
+    assert not check.passed
 
 
 def test_model_is_reproducible_across_repeated_runs():

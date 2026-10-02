@@ -55,6 +55,7 @@ def _synthetic_opening(**overrides) -> BankOpeningBalance:
         net_interest_income_jumpoff_mm=40.0,
         noninterest_income_jumpoff_mm=10.0,
         noninterest_expense_jumpoff_mm=30.0,
+        goodwill_net_of_dtl_mm=50.0,
         reported_cet1_capital_mm=790.0,
         reported_cet1_ratio=0.12,
         reported_rwa_mm=6583.33,
