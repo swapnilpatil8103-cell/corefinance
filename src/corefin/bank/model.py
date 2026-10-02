@@ -53,12 +53,14 @@ def run_bank_model(
         provision_expense_total_mm=provision_expense_total_mm,
         config=config,
         timeline=timeline,
+        preferred_dividends_jumpoff_mm=opening.preferred_dividends_jumpoff_mm,
     )
     balance_sheet = project_balance_sheet(
         opening=opening,
         credit_projection=credit_projection,
         net_income_mm=income_statement.net_income_mm,
-        dividends_mm=income_statement.dividends_mm,
+        dividends_mm=income_statement.total_dividends_mm,  # common + preferred -- see
+        # IncomeStatement.total_dividends_mm's own docstring
         config=config,
         timeline=timeline,
     )
@@ -92,10 +94,11 @@ def check_capital_rollforward(
     close."""
     cet1 = result.capital.cet1_capital_mm
     net_income = result.income_statement.net_income_mm
-    dividends = result.income_statement.dividends_mm
+    total_dividends = result.income_statement.total_dividends_mm  # common + preferred -- see
+    # IncomeStatement.total_dividends_mm's own docstring
 
     actual_delta = cet1[1:] - cet1[:-1]
-    expected_delta = net_income[1:] - dividends[1:]
+    expected_delta = net_income[1:] - total_dividends[1:]
     residual = actual_delta - expected_delta
     return check_close_to_zero("capital_rollforward_ties", residual.reshape(1, -1), tolerance)
 

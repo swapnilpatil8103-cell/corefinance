@@ -88,6 +88,66 @@ def test_compute_income_statement_growth_applied_from_period_zero():
     assert result.net_interest_income_mm[2] == pytest.approx(121.0)
 
 
+def test_preferred_dividends_reduce_net_income_available_to_common_not_net_income():
+    timeline = _timeline()
+    n = timeline.n_periods
+    provision_mm = np.zeros(n)
+    config = BankConfig(tax_rate=0.25)
+
+    result = compute_income_statement(
+        net_interest_income_jumpoff_mm=40.0,
+        noninterest_income_jumpoff_mm=10.0,
+        noninterest_expense_jumpoff_mm=30.0,
+        provision_expense_total_mm=provision_mm,
+        config=config,
+        timeline=timeline,
+        preferred_dividends_jumpoff_mm=3.0,
+    )
+    assert np.allclose(result.preferred_dividends_mm, 3.0)
+    assert np.allclose(result.net_income_available_to_common_mm, result.net_income_mm - 3.0)
+    # net_income_mm itself is unaffected by preferred dividends -- they're a distribution,
+    # not an expense.
+    assert np.allclose(result.net_income_mm, result.pretax_income_mm * 0.75)
+
+
+def test_preferred_dividends_stay_static_even_with_balance_sheet_growth():
+    timeline = _timeline(n_periods=3)
+    provision_mm = np.zeros(3)
+    config = BankConfig(balance_sheet_growth_rate=0.10)
+
+    result = compute_income_statement(
+        net_interest_income_jumpoff_mm=100.0,
+        noninterest_income_jumpoff_mm=0.0,
+        noninterest_expense_jumpoff_mm=0.0,
+        provision_expense_total_mm=provision_mm,
+        config=config,
+        timeline=timeline,
+        preferred_dividends_jumpoff_mm=5.0,
+    )
+    # unlike net_interest_income_mm (which grows 10%/period), preferred dividends stay flat
+    assert np.allclose(result.preferred_dividends_mm, 5.0)
+
+
+def test_total_dividends_mm_sums_common_and_preferred():
+    timeline = _timeline()
+    n = timeline.n_periods
+    provision_mm = np.zeros(n)
+    config = BankConfig(dividend_payout_ratio=0.5)
+
+    result = compute_income_statement(
+        net_interest_income_jumpoff_mm=40.0,
+        noninterest_income_jumpoff_mm=10.0,
+        noninterest_expense_jumpoff_mm=30.0,
+        provision_expense_total_mm=provision_mm,
+        config=config,
+        timeline=timeline,
+        preferred_dividends_jumpoff_mm=4.0,
+    )
+    assert np.allclose(result.total_dividends_mm, result.dividends_mm + 4.0)
+    # common dividend payout applies to earnings AVAILABLE TO COMMON, not total net income
+    assert np.allclose(result.dividends_mm, result.net_income_available_to_common_mm * 0.5)
+
+
 def test_income_statement_rejects_wrong_shape_array():
     from corefin.bank.income_statement import IncomeStatement
 
@@ -103,5 +163,7 @@ def test_income_statement_rejects_wrong_shape_array():
             pretax_income_mm=np.zeros(n),
             tax_expense_mm=np.zeros(n),
             net_income_mm=np.zeros(n),
+            preferred_dividends_mm=np.zeros(n),
+            net_income_available_to_common_mm=np.zeros(n),
             dividends_mm=np.zeros(n),
         )

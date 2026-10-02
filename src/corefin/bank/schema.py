@@ -135,6 +135,23 @@ WHICH ITEMS CHANGE IN A MERGER (relevant for `corefin.ma`'s Stage 3):
     zero at close (there is no more "unrealized" gain/loss versus the
     old cost basis once the securities are revalued).
   - All other CET1 deductions: unchanged by default.
+
+YTD-VS-QUARTERLY (a real bug caught while adding preferred dividends for
+Stage 3): every Call Report/Y-9C Schedule RI income-statement item
+(interest income/expense, noninterest income/expense, preferred
+dividends, pretax/net income) is reported CALENDAR-YEAR-TO-DATE as of
+the report date -- the same convention `corefin.credit.schema`'s module
+docstring documents for RIAD charge-off/recovery items. For a 2025Q4
+jump-off, the raw BHCK4107/4073/4079/4093/4598 figures ARE the full
+calendar year, not one quarter. `sources.real_data.build_opening_balance_from_real_data`
+divides each by 4 to approximate a single quarter's run-rate (a
+simplification -- the precise figure would difference Q4 YTD minus Q3
+YTD, the same `ytd_to_quarterly` approach `credit.panel` uses for
+charge-offs/recoveries, but that needs a Q3 bulk file this project
+doesn't otherwise require); `BankOpeningBalance`'s own `*_jumpoff_mm`
+fields are documented as being this already-quarterly figure, so a
+caller building one by hand (not through `real_data.py`) must apply the
+same conversion.
 """
 
 from __future__ import annotations
@@ -232,6 +249,11 @@ HC_CASH_NONINTEREST_ITEM = "BHCK0081"  # "Noninterest-bearing balances and curre
 HC_CASH_INTEREST_BEARING_ITEM = "BHCK0395"  # "Interest-bearing balances in U.S. offices"
 HC_SECURITIES_AFS_ITEM = "BHCK1773"  # "Available-for-sale debt securities" (fair value)
 HC_SECURITIES_HTM_ITEM = "BHCK1754"  # "Held-to-maturity securities, total"
+
+HC_PREFERRED_DIVIDENDS_ITEM = "BHCK4598"  # "LESS: cash dividends declared on perpetual
+# preferred stock" -- Schedule RI, same YTD convention as the other income-statement items
+# above (see "YTD-VS-QUARTERLY" in this module's docstring). EPS/net income available to
+# common = net income minus this -- see income_statement.py's net_income_available_to_common_mm.
 
 # Bank-level equivalents of the RC-R Part I capital items, same MDRM item numbers under the
 # RCOA (domestic) prefix -- confirmed populated for both example banks (FFIEC 041/051
@@ -353,10 +375,15 @@ class BankOpeningBalance(BaseModel):
 
     # Jump-off quarter's own $ income-statement figures -- held flat (optionally grown by
     # BankConfig.balance_sheet_growth_rate) across the projection horizon by
-    # income_statement.compute_income_statement; see that module's docstring.
+    # income_statement.compute_income_statement; see that module's docstring. Already
+    # QUARTERLY (not the raw YTD figure the report itself shows) -- see "YTD-VS-QUARTERLY".
     net_interest_income_jumpoff_mm: float
     noninterest_income_jumpoff_mm: float = Field(ge=0.0)
     noninterest_expense_jumpoff_mm: float = Field(ge=0.0)
+    # Fixed coupon on preferred stock -- held STATIC (never grown by
+    # balance_sheet_growth_rate, unlike the three fields above), since it scales with the
+    # static preferred_stock_mm face amount below, not with balance-sheet/earning-asset size.
+    preferred_dividends_jumpoff_mm: float = Field(default=0.0, ge=0.0)
 
     # Explicit RC-R Part I CET1 bridge -- see "THE CET1 BRIDGE" in the module docstring.
     # Default 0.0 for items that are genuinely zero/rare for most banks (preferred stock, the

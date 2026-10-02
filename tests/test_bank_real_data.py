@@ -29,10 +29,11 @@ def _synthetic_y9c_row(**overrides) -> pd.Series:
         "BHCK3210": 500_000.0,  # total equity capital
         "BHCK2170": 4_200_000.0,  # total assets
         "BHCK2948": 3_700_000.0,  # total liabilities
-        "BHCK4107": 200_000.0,  # total interest income
-        "BHCK4073": 60_000.0,  # total interest expense
-        "BHCK4079": 25_000.0,  # noninterest income
-        "BHCK4093": 90_000.0,  # noninterest expense
+        "BHCK4107": 200_000.0,  # total interest income, YTD (full year as of Q4)
+        "BHCK4073": 60_000.0,  # total interest expense, YTD
+        "BHCK4079": 25_000.0,  # noninterest income, YTD
+        "BHCK4093": 90_000.0,  # noninterest expense, YTD
+        "BHCK4598": 8_000.0,  # preferred dividends declared, YTD
         "BHCK3283": 30_000.0,  # preferred stock
         "BHCAP841": 75_000.0,  # goodwill net of DTL
         "BHCAP842": 15_000.0,  # other intangibles net of DTL
@@ -163,9 +164,12 @@ def test_build_opening_balance_income_statement_sourced_from_y9c():
         y9c_row=y9c_row,
         bank_level_net_loans_mm=3000.0,
     )
-    assert opening.net_interest_income_jumpoff_mm == pytest.approx(140.0)  # 200,000-60,000
-    assert opening.noninterest_income_jumpoff_mm == pytest.approx(25.0)
-    assert opening.noninterest_expense_jumpoff_mm == pytest.approx(90.0)
+    # YTD (full year as of Q4), divided by 4 to approximate one quarter's run-rate -- see
+    # schema.py's "YTD-VS-QUARTERLY".
+    assert opening.net_interest_income_jumpoff_mm == pytest.approx(35.0)  # (200,000-60,000)/4
+    assert opening.noninterest_income_jumpoff_mm == pytest.approx(6.25)  # 25,000/4
+    assert opening.noninterest_expense_jumpoff_mm == pytest.approx(22.5)  # 90,000/4
+    assert opening.preferred_dividends_jumpoff_mm == pytest.approx(2.0)  # 8,000/4
 
 
 def test_build_opening_balance_name_is_fictitious_not_a_real_bank():
