@@ -10,6 +10,7 @@ import pandas as pd
 import typer
 
 from corefin.credit import (
+    anchoring_sensitivity,
     backtest,
     charts,
     industry_history,
@@ -1652,3 +1653,118 @@ def seed_decomposition_cmd(
     macro_table_path = output_dir / "seed_decomposition_macro_table.csv"
     macro_table.to_csv(macro_table_path, index=False)
     typer.echo(f"wrote {macro_table_path}")
+
+
+# Categories whose selected family is (or could be) anchored_to_aggregate
+# -- the only ones this sensitivity applies to. cre_construction/cre_
+# nonfarm_nonresidential compare against the Fed's own COMBINED CRE
+# figure (same limitation fed-comparison already documents).
+_ANCHORING_SENSITIVITY_FED_KEY = {
+    "commercial_and_industrial": "commercial_and_industrial",
+    "cre_construction": "cre_combined",
+    "cre_multifamily": "cre_combined",
+    "cre_nonfarm_nonresidential": "cre_combined",
+}
+
+
+@app.command("anchoring-sensitivity")
+def anchoring_sensitivity_cmd(
+    panel_path: Path = typer.Option(
+        DEFAULT_MODELING_DATASET_PATH,
+        "--panel",
+        help="Training modeling dataset (quarter <= 2025Q4) -- the SAME full sample "
+        "`project` fits on.",
+    ),
+    macro_history_path: Path = typer.Option(
+        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-fed-history`."
+    ),
+    industry_history_path: Path = typer.Option(
+        DEFAULT_INDUSTRY_HISTORY_PATH,
+        "--industry-history",
+        help="Output of `fetch-industry-history` (required -- every category this "
+        "applies to needs a long-history frame).",
+    ),
+    scenario_dir: Path = typer.Option(
+        DEFAULT_SCENARIO_DIR, "--scenario-dir", help="Output directory of `fetch-scenarios`."
+    ),
+    output: Path = typer.Option(
+        DEFAULT_PROJECTIONS_DIR / "anchoring_sensitivity.csv",
+        "--output",
+        help="Where to write the comparison table.",
+    ),
+    categories: str = typer.Option(
+        "commercial_and_industrial,cre_construction,cre_nonfarm_nonresidential",
+        "--categories",
+        help="Comma-separated LoanCategory values -- must have a long-history frame.",
+    ),
+) -> None:
+    """Survivorship-bias sensitivity for anchored_to_aggregate
+    (anchoring_sensitivity.py): reports the severely-adverse 9-quarter
+    cumulative loss rate AND the Fed-comparison gap under 3 anchoring
+    variants -- (a) `full_sample_survivors`, the PRODUCTION default
+    (today's survivors' own full-sample relative levels); (b) `industry_
+    average` (every bank's relative level forced to 1.0, i.e. the raw
+    aggregate_long forecast with no bank-specific differentiation at
+    all); (c) `crisis_era_survivors` (today's survivors' relative levels
+    computed ONLY from the 2007Q4-2010Q4 crisis window, for whichever of
+    them were present then). Variant (a) remains the default for every
+    REAL projection -- this command only reports the sensitivity, it
+    does not change what `project` selects or outputs."""
+    training = pd.read_parquet(panel_path)
+    training["quarter"] = pd.PeriodIndex(training["quarter"].astype(str), freq="Q")
+
+    macro_history = pd.read_parquet(macro_history_path)
+    macro_history["quarter"] = pd.PeriodIndex(macro_history["quarter"].astype(str), freq="Q")
+    macro_history = macro_history.set_index("quarter")
+    long_history_frames = _load_long_history_frames(industry_history_path, macro_history)
+
+    scenario_path = scenario_dir / "severely_adverse.parquet"
+    if not scenario_path.exists():
+        typer.echo(f"no cached scenario at {scenario_path} -- run fetch-scenarios first", err=True)
+        raise typer.Exit(code=1)
+    scenario = pd.read_parquet(scenario_path)
+    scenario["quarter"] = pd.PeriodIndex(scenario["quarter"].astype(str), freq="Q")
+    scenario = scenario.set_index("quarter")
+
+    rows = []
+    for category_str in categories.split(","):
+        category = LoanCategory(category_str.strip())
+        category_train = training[training["category"] == category]
+        long_history_frame = long_history_frames.get((category, "nco_rate"))
+        if long_history_frame is None:
+            typer.echo(f"{category}: no long-history frame available -- skipping", err=True)
+            continue
+
+        variants = anchoring_sensitivity.compute_anchoring_variants(
+            category, category_train, macro_history, scenario, long_history_frame
+        )
+        fed_key = _ANCHORING_SENSITIVITY_FED_KEY.get(str(category))
+        fed_entry = fed_stress_test_results.DFAST_2026_SEVERELY_ADVERSE_LOSS_RATES.get(fed_key)
+        for variant_name in anchoring_sensitivity.ANCHORING_VARIANTS:
+            nine_q_percent = (
+                projection.cumulative_loss_rate(
+                    variants[variant_name], projection.FED_COMPARISON_QUARTERS
+                )
+                * 100
+            )
+            fed_percent = (
+                fed_entry.severely_adverse_9q_loss_rate_percent if fed_entry is not None else None
+            )
+            gap = (nine_q_percent - fed_percent) if fed_percent is not None else None
+            typer.echo(
+                f"{category} / {variant_name}: 9Q={nine_q_percent:.4f}% "
+                f"fed={fed_percent}% gap={gap}"
+            )
+            rows.append(
+                {
+                    "category": str(category),
+                    "variant": variant_name,
+                    "severely_adverse_9q_loss_rate_percent": nine_q_percent,
+                    "fed_dfast_2026_9q_loss_rate_percent": fed_percent,
+                    "gap_pct_points": gap,
+                }
+            )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(output, index=False)
+    typer.echo(f"\nwrote {output}")

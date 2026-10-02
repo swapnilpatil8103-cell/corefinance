@@ -1081,6 +1081,43 @@ bank-level synthetic future frame every draw) makes 1,000+ draws on the
 largest categories noticeably slow -- a real performance characteristic
 of this first build, not optimized away.
 
+### Survivorship bias in `anchored_to_aggregate` (`corefin credit anchoring-sensitivity`)
+
+`anchored_to_aggregate`'s per-bank anchoring factor (`models.
+compute_bank_relative_levels`) is computed from TODAY's SURVIVING banks'
+own full-sample (2001Q1-2025Q4) history — a bank that failed or was
+acquired during 2008-2010 never contributes to it, even though it
+existed and had its own (plausibly worse) loss experience then, since
+the factor is only ever applied to banks present in the static,
+held-at-2025Q4 projection population. Checked with 3 variants under the
+severely-adverse scenario — (a) the production default (today's
+survivors' full-sample relative levels), (b) every bank's factor forced
+to 1.0 (mathematically identical to the raw aggregate_long forecast,
+since a balance-weighted average of a constant is that constant), and
+(c) today's survivors' relative levels computed ONLY from the
+2007Q4-2010Q4 crisis window:
+
+| Category | (a) full-sample survivors | (b) industry average | (c) crisis-era survivors |
+| --- | ---: | ---: | ---: |
+| commercial_and_industrial | 2.61% (Fed gap -6.39pp) | 3.31% (-5.69pp) | 2.57% (-6.43pp) |
+| cre_construction | 4.18% (-4.62pp) | 3.40% (-5.40pp) | 4.51% (-4.29pp) |
+| cre_nonfarm_nonresidential | 1.51% (-7.29pp) | 3.40% (-5.40pp) | 0.89% (-7.91pp) |
+
+No single, uniform direction: removing bank-specific differentiation
+(b) makes C&I's loss HIGHER and cre_construction's LOWER than the
+default — i.e. C&I's surviving banks are, on average, SAFER than the
+industry (relative level < 1.0), while cre_construction's survivors are
+RISKIER than the industry (> 1.0). The crisis-era-only factor (c) also
+cuts both ways: higher than the default for cre_construction (today's
+survivors were, if anything, RISKIER during 2007-2010 than their
+full-sample average suggests — survivorship bias UNDERSTATING risk for
+this category) but lower for cre_nonfarm_nonresidential (the opposite).
+None of the three variants closes more than ~1 point of any category's
+multi-point Fed-comparison gap — survivorship bias is real and worth
+knowing about (and, for cre_construction specifically, cuts in the
+direction a skeptic would expect), but it is NOT the dominant driver of
+that gap either; (a) remains the default for every real projection.
+
 ## Testing conventions
 
 - `pytest.mark.slow` is excluded by default (`addopts = "-m 'not slow'"` in
