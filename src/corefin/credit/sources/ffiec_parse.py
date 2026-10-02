@@ -71,9 +71,7 @@ def _read_schedule_part(zf: zipfile.ZipFile, name: str) -> tuple[pd.DataFrame, i
 
     with zf.open(name) as fh:
         text = TextIOWrapper(fh, encoding="latin1")
-        df = pd.read_csv(
-            text, sep="\t", dtype=str, on_bad_lines=_count_bad_line, engine="pyarrow"
-        )
+        df = pd.read_csv(text, sep="\t", dtype=str, on_bad_lines=_count_bad_line, engine="pyarrow")
     df = df.iloc[1:].reset_index(drop=True)  # drop the per-column description row
     return df, bad_line_count
 
@@ -101,7 +99,12 @@ def _read_schedule(zf: zipfile.ZipFile, name_contains: str) -> tuple[pd.DataFram
     return combined, total_bad_lines
 
 
-def parse_bulk_zip(zip_bytes: bytes, quarter: pd.Period) -> tuple[pd.DataFrame, dict[str, int]]:
+def parse_bulk_zip(
+    zip_bytes: bytes,
+    quarter: pd.Period,
+    extra_schedules: dict[str, str] | None = None,
+    extra_item_prefixes: tuple[str, ...] = (),
+) -> tuple[pd.DataFrame, dict[str, int]]:
     """Returns (item_frame, bad_row_counts).
 
     item_frame: one row per bank ("bank_id", "quarter", plus every
@@ -116,12 +119,27 @@ def parse_bulk_zip(zip_bytes: bytes, quarter: pd.Period) -> tuple[pd.DataFrame, 
     bad_row_counts: {schedule_label: n_rows_skipped} for every schedule
     present in this ZIP (0 for schedules with no skipped rows) -- see
     BAD_ROW_WARNING_THRESHOLD. A schedule absent from the ZIP entirely is
-    absent from this dict too (not the same as 0 skipped rows)."""
+    absent from this dict too (not the same as 0 skipped rows).
+
+    extra_schedules/extra_item_prefixes: purely additive extension points
+    (both default to "nothing extra," so every existing caller's behavior
+    is unchanged) -- `corefin.bank.sources.capital_parse` uses these to
+    also read Schedule RC-M (goodwill/other intangibles, RCFD/RCON-
+    prefixed, already covered by the default item prefixes), Schedule RI
+    (interest income/expense, net/pretax income, taxes -- also RIAD-
+    prefixed), and Schedule RC-R Part I (regulatory capital ratios, which
+    use the RCOA/RCFA prefixes NOT in the default `_ITEM_PREFIXES`, hence
+    `extra_item_prefixes`). `extra_schedules` maps a label to the same
+    kind of "Schedule XXX " `name_contains` substring as
+    `_SCHEDULE_NAME_CONTAINS`."""
     zf = zipfile.ZipFile(BytesIO(zip_bytes))
+
+    schedules_to_read = {**_SCHEDULE_NAME_CONTAINS, **(extra_schedules or {})}
+    item_prefixes = _ITEM_PREFIXES + extra_item_prefixes
 
     schedules: dict[str, pd.DataFrame | None] = {}
     bad_row_counts: dict[str, int] = {}
-    for label, name_contains in _SCHEDULE_NAME_CONTAINS.items():
+    for label, name_contains in schedules_to_read.items():
         schedule, bad_lines = _read_schedule(zf, name_contains)
         schedules[label] = schedule
         if schedule is not None:
@@ -130,7 +148,7 @@ def parse_bulk_zip(zip_bytes: bytes, quarter: pd.Period) -> tuple[pd.DataFrame, 
     present = [s for s in schedules.values() if s is not None]
     if not present:
         raise ValueError(
-            "none of the expected schedule files (RC/RCCI/RCCII/RCN/RIBI/RIBII/RIE) "
+            f"none of the expected schedule files ({'/'.join(schedules_to_read)}) "
             "were found in the ZIP"
         )
 
@@ -142,8 +160,14 @@ def parse_bulk_zip(zip_bytes: bytes, quarter: pd.Period) -> tuple[pd.DataFrame, 
         overlap = [c for c in schedule.columns if c != "bank_id" and c in merged.columns]
         merged = merged.merge(schedule.drop(columns=overlap), on="bank_id", how="outer")
 
-    item_columns = [c for c in merged.columns if c.startswith(_ITEM_PREFIXES)]
-    numeric_items = merged[item_columns].apply(pd.to_numeric, errors="coerce")
+    item_columns = [c for c in merged.columns if c.startswith(item_prefixes)]
+    # Confirmed against real Schedule RC-R Part I data: percentage-type items (e.g. the CET1
+    # ratio, RCOAP793) are reported with a literal trailing "%" ("13.8212%"), which
+    # pd.to_numeric would otherwise silently coerce to NaN. Stripping "%" first is a no-op for
+    # every non-percentage item (dollar amounts, counts), so this doesn't change behavior for
+    # any column that worked before.
+    stripped = merged[item_columns].apply(lambda s: s.str.rstrip("%"))
+    numeric_items = stripped.apply(pd.to_numeric, errors="coerce")
     bank_id_col = merged[["bank_id"]].astype(str)
     quarter_col = pd.DataFrame({"quarter": [quarter] * len(merged)})
     result = pd.concat([bank_id_col, quarter_col, numeric_items], axis=1).copy()

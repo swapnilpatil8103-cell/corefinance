@@ -157,3 +157,38 @@ def test_parse_bulk_zip_counts_bad_rows_per_schedule_independently():
 def test_bad_row_warning_threshold_is_a_small_positive_number():
     # sanity check on the exported constant the CLI warns against
     assert 0 < ffiec_parse.BAD_ROW_WARNING_THRESHOLD < 100
+
+
+def test_parse_bulk_zip_strips_trailing_percent_sign_before_numeric_coercion():
+    # Confirmed against a real Schedule RC-R Part I file: percentage-type items (e.g. the CET1
+    # ratio) are reported with a literal trailing "%" ("13.8212%"), which must be stripped
+    # before numeric coercion or the whole column silently becomes NaN.
+    rcci = '"IDRSSD"\tRCON1766\n\tdesc\n37\t13.82%\n242\t100\n'
+    zip_bytes = _make_zip({"FFIEC CDR Call Schedule RCCI 12312021.txt": rcci})
+    result, _ = ffiec_parse.parse_bulk_zip(zip_bytes, pd.Period("2021Q4", freq="Q"))
+    assert result.loc[result["bank_id"] == "37", "RCON1766"].iloc[0] == pytest.approx(13.82)
+    assert result.loc[result["bank_id"] == "242", "RCON1766"].iloc[0] == pytest.approx(100.0)
+
+
+def test_parse_bulk_zip_extra_schedules_and_item_prefixes_are_additive():
+    # Default call (no extra_schedules/extra_item_prefixes) must behave exactly as before --
+    # an RCOA-prefixed column in a non-default schedule should NOT appear.
+    rcci = '"IDRSSD"\tRCON1766\n\tdesc\n37\t100\n'
+    rcri = '"IDRSSD"\tRCOAP793\n\tdesc\n37\t13.82%\n'
+    zip_bytes = _make_zip(
+        {
+            "FFIEC CDR Call Schedule RCCI 12312021.txt": rcci,
+            "FFIEC CDR Call Schedule RCRI 12312021.txt": rcri,
+        }
+    )
+    default_result, _ = ffiec_parse.parse_bulk_zip(zip_bytes, pd.Period("2021Q4", freq="Q"))
+    assert "RCOAP793" not in default_result.columns
+
+    extended_result, bad_rows = ffiec_parse.parse_bulk_zip(
+        zip_bytes,
+        pd.Period("2021Q4", freq="Q"),
+        extra_schedules={"RCRI": "Schedule RCRI "},
+        extra_item_prefixes=("RCOA",),
+    )
+    assert extended_result["RCOAP793"].iloc[0] == pytest.approx(13.82)
+    assert bad_rows["RCRI"] == 0
