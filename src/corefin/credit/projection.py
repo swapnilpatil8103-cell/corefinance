@@ -658,6 +658,108 @@ def project_category_nco_rate(
     raise ValueError(f"unknown model family {best_model_family!r}")
 
 
+def project_single_bank_nco_rate(
+    category: str,
+    best_model_family: str,
+    bank_id: str,
+    category_train_dataset: pd.DataFrame,
+    macro_history: pd.DataFrame,
+    scenario: pd.DataFrame,
+    long_history_frame: pd.DataFrame | None,
+) -> pd.Series:
+    """Like `project_category_nco_rate`, but for ONE bank (`bank_id`,
+    e.g. its RSSD ID -- `category_train_dataset`'s own "bank_id" column)
+    instead of the whole industry. Fits the SAME full-sample model on the
+    SAME full category_train_dataset (so coefficients match the industry
+    projection exactly) -- only the OUTPUT differs:
+    - panel_fe/gbm: that bank's OWN predicted rate (no balance-weighted
+      aggregation needed -- it's already bank-level).
+    - anchored_to_aggregate: that bank's OWN relative level times the
+      long-history aggregate's forecast -- raises if `bank_id` has no
+      estimable relative level (never seen in training, the same
+      limitation `forecast_anchored_to_aggregate` documents for any
+      unseen bank).
+    - aggregate_ar/aggregate_long: these have no bank-specific
+      differentiation at all (no bank-level step in the model); this
+      bank's own projected rate is simply ASSUMED to track the industry-
+      wide forecast exactly -- a documented simplification, not a
+      per-bank adjustment these family types are capable of making.
+    Returns a quarter-indexed Series covering `scenario`'s own quarters."""
+    if best_model_family in ("aggregate_ar", "aggregate_long"):
+        return project_category_nco_rate(
+            category,
+            best_model_family,
+            category_train_dataset,
+            macro_history,
+            scenario,
+            long_history_frame,
+        )
+
+    jump_off_quarter = macro_history.index.max()
+    if long_history_frame is not None:
+        long_history_frame = long_history_frame[long_history_frame["quarter"] <= jump_off_quarter]
+
+    full_macro_path = macro.build_full_macro_path(macro_history, scenario)
+    projection_quarters = list(scenario.index)
+    macro_lag_frame = build_projection_macro_lag_frame(full_macro_path, projection_quarters)
+
+    last_quarter = category_train_dataset["quarter"].max()
+    last_actual_bank_row = category_train_dataset[
+        (category_train_dataset["quarter"] == last_quarter)
+        & (category_train_dataset["bank_id"] == bank_id)
+    ]
+    if last_actual_bank_row.empty:
+        raise ValueError(f"bank_id {bank_id!r} has no row at the jump-off quarter {last_quarter}")
+    synthetic_future_bank = build_synthetic_future_bank_frame(
+        last_actual_bank_row, macro_lag_frame
+    )
+
+    if best_model_family == "panel_fe":
+        fit = models.fit_panel_fe_model(
+            category_train_dataset, category, "winsorized_nco_rate", include_pandemic_dummy=True
+        )
+        predicted_bank = models.predict_panel_fe(
+            fit, synthetic_future_bank, category, "winsorized_nco_rate", include_pandemic_dummy=True
+        )
+        return predicted_bank.set_axis(synthetic_future_bank.loc[predicted_bank.index, "quarter"])
+
+    if best_model_family == "gbm":
+        gbm_model = models.fit_gbm_model(
+            category_train_dataset, category, "winsorized_nco_rate", include_pandemic_dummy=True
+        )
+        predicted_bank = models.predict_gbm(
+            gbm_model, synthetic_future_bank, category, include_pandemic_dummy=True
+        )
+        return predicted_bank.set_axis(synthetic_future_bank.loc[predicted_bank.index, "quarter"])
+
+    if best_model_family == "anchored_to_aggregate":
+        long_extended = pd.concat(
+            [long_history_frame, macro_lag_frame], ignore_index=True, sort=False
+        )
+        long_result = models.fit_aggregate_model(
+            long_history_frame, category, include_pandemic_dummy=True
+        )
+        long_forecast = models.forecast_aggregate_dynamic(
+            long_result,
+            long_extended,
+            category,
+            projection_quarters[0],
+            projection_quarters[-1],
+            include_pandemic_dummy=True,
+        )
+        long_train_matching_bank_period = long_history_frame[
+            long_history_frame["quarter"].isin(category_train_dataset["quarter"])
+        ]
+        relative_levels = models.compute_bank_relative_levels(
+            category_train_dataset, "winsorized_nco_rate", long_train_matching_bank_period
+        )
+        if bank_id not in relative_levels.index:
+            raise ValueError(f"bank_id {bank_id!r} has no estimable relative level")
+        return (relative_levels.loc[bank_id] * long_forecast).rename(None)
+
+    raise ValueError(f"unknown model family {best_model_family!r}")
+
+
 # The 3 "core" macro features model selection checks for a wrong-signed,
 # statistically significant full-sample coefficient -- deliberately NOT
 # the stock index: CATEGORY_MACRO_FEATURES already drops it everywhere

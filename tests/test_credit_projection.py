@@ -318,6 +318,95 @@ def test_project_category_nco_rate_raises_without_long_history_when_required():
         )
 
 
+# ---------------------------------------------------- single-bank projection ---
+
+
+@pytest.mark.parametrize("family", ["aggregate_ar", "panel_fe", "gbm", "anchored_to_aggregate"])
+def test_project_single_bank_nco_rate_covers_every_scenario_quarter(family):
+    macro_history, scenario = _synthetic_macro_history_and_scenario()
+    category_train_dataset = _synthetic_category_train_dataset(macro_history)
+    from corefin.credit import industry_history
+
+    long_history_frame = industry_history.build_long_industry_frame(
+        models.build_industry_series(category_train_dataset, "winsorized_nco_rate").frame.set_index(
+            "quarter"
+        )["industry_rate"],
+        macro_history,
+    )
+    bank_id = category_train_dataset["bank_id"].iloc[0]
+    forecast = projection.project_single_bank_nco_rate(
+        _CATEGORY,
+        family,
+        bank_id,
+        category_train_dataset,
+        macro_history,
+        scenario,
+        long_history_frame,
+    )
+    assert list(forecast.index) == list(scenario.index)
+    assert forecast.notna().all()
+
+
+def test_project_single_bank_nco_rate_aggregate_families_match_the_industry_forecast():
+    # aggregate_ar/aggregate_long have no bank-specific step at all --
+    # a single bank's "own" forecast is just the industry forecast.
+    macro_history, scenario = _synthetic_macro_history_and_scenario()
+    category_train_dataset = _synthetic_category_train_dataset(macro_history)
+    bank_id = category_train_dataset["bank_id"].iloc[0]
+
+    industry_forecast = projection.project_category_nco_rate(
+        _CATEGORY, "aggregate_ar", category_train_dataset, macro_history, scenario, None
+    )
+    bank_forecast = projection.project_single_bank_nco_rate(
+        _CATEGORY, "aggregate_ar", bank_id, category_train_dataset, macro_history, scenario, None
+    )
+    pd.testing.assert_series_equal(bank_forecast, industry_forecast, check_names=False)
+
+
+def test_project_single_bank_nco_rate_anchored_uses_that_banks_own_relative_level():
+    macro_history, scenario = _synthetic_macro_history_and_scenario()
+    category_train_dataset = _synthetic_category_train_dataset(macro_history)
+    from corefin.credit import industry_history
+
+    long_history_frame = industry_history.build_long_industry_frame(
+        models.build_industry_series(category_train_dataset, "winsorized_nco_rate").frame.set_index(
+            "quarter"
+        )["industry_rate"],
+        macro_history,
+    )
+    bank_ids = category_train_dataset["bank_id"].unique()
+    forecasts = {
+        bank_id: projection.project_single_bank_nco_rate(
+            _CATEGORY,
+            "anchored_to_aggregate",
+            bank_id,
+            category_train_dataset,
+            macro_history,
+            scenario,
+            long_history_frame,
+        )
+        for bank_id in bank_ids[:2]
+    }
+    # different banks have different relative levels -- their own
+    # projected paths must differ (not all collapsed to one industry number).
+    assert not forecasts[bank_ids[0]].equals(forecasts[bank_ids[1]])
+
+
+def test_project_single_bank_nco_rate_raises_for_unknown_bank():
+    macro_history, scenario = _synthetic_macro_history_and_scenario()
+    category_train_dataset = _synthetic_category_train_dataset(macro_history)
+    with pytest.raises(ValueError, match="no row at the jump-off quarter"):
+        projection.project_single_bank_nco_rate(
+            _CATEGORY,
+            "panel_fe",
+            "nonexistent-bank",
+            category_train_dataset,
+            macro_history,
+            scenario,
+            None,
+        )
+
+
 # ------------------------------------------------------------ calibration ---
 
 

@@ -13,7 +13,9 @@ from corefin.credit import (
     anchoring_sensitivity,
     backtest,
     charts,
+    excel_export,
     industry_history,
+    interface,
     macro,
     models,
     monte_carlo,
@@ -1768,3 +1770,128 @@ def anchoring_sensitivity_cmd(
     output.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(output, index=False)
     typer.echo(f"\nwrote {output}")
+
+
+@app.command("build-projection")
+def build_projection_cmd(
+    panel_path: Path = typer.Option(
+        DEFAULT_MODELING_DATASET_PATH,
+        "--panel",
+        help="Training modeling dataset (quarter <= 2025Q4) -- the SAME full sample "
+        "`project` fits on.",
+    ),
+    macro_history_path: Path = typer.Option(
+        DEFAULT_MACRO_HISTORY_PATH, "--macro-history", help="Output of `fetch-fed-history`."
+    ),
+    industry_history_path: Path = typer.Option(
+        DEFAULT_INDUSTRY_HISTORY_PATH,
+        "--industry-history",
+        help="Output of `fetch-industry-history` (optional -- categories whose "
+        "selected model needs it are skipped if absent).",
+    ),
+    scenario_dir: Path = typer.Option(
+        DEFAULT_SCENARIO_DIR, "--scenario-dir", help="Output directory of `fetch-scenarios`."
+    ),
+    scenario_name: str = typer.Option(
+        "severely_adverse", "--scenario", help="'baseline' or 'severely_adverse'."
+    ),
+    model_selection_path: Path = typer.Option(
+        DEFAULT_PROJECTIONS_DIR / "model_selection.csv",
+        "--model-selection",
+        help="Output of `project` -- the selected model family per category.",
+    ),
+    bank_id: str | None = typer.Option(
+        None,
+        "--bank-id",
+        help="A single bank's RSSD ID (credit_panel.parquet's own bank_id) to "
+        "project instead of the industry-wide aggregate, using that bank's own "
+        "balance and relative level (projection.project_single_bank_nco_rate). "
+        "Default: industry-wide.",
+    ),
+    n_monte_carlo_draws: int = typer.Option(
+        monte_carlo.DEFAULT_N_DRAWS,
+        "--n-monte-carlo-draws",
+        help="Draws per category for the Monte Carlo percentile bands (skipped "
+        "entirely in single-bank mode).",
+    ),
+    excel_output: Path | None = typer.Option(
+        None,
+        "--excel",
+        help="If given, also export the result to this .xlsx path "
+        "(credit/excel_export.py).",
+    ),
+    categories: str | None = typer.Option(
+        None,
+        "--categories",
+        help="Comma-separated LoanCategory values (default: every category "
+        "backtest.MODELING_CATEGORIES lists).",
+    ),
+) -> None:
+    """Stage 7: builds one `interface.CreditLossProjection` -- the
+    engine's typed, `timeline.Timeline`-aligned output (per category AND
+    total NCOs/provisions/allowance/NPLs/balances in $mm, plus Stage 6's
+    Monte Carlo percentiles) -- for `--scenario`, optionally for a single
+    bank (`--bank-id`) instead of the industry-wide aggregate, and
+    optionally exports it to Excel (`--excel`)."""
+    training = pd.read_parquet(panel_path)
+    training["quarter"] = pd.PeriodIndex(training["quarter"].astype(str), freq="Q")
+
+    macro_history = pd.read_parquet(macro_history_path)
+    macro_history["quarter"] = pd.PeriodIndex(macro_history["quarter"].astype(str), freq="Q")
+    macro_history = macro_history.set_index("quarter")
+    long_history_frames = _load_long_history_frames(industry_history_path, macro_history)
+
+    scenario_path = scenario_dir / f"{scenario_name}.parquet"
+    if not scenario_path.exists():
+        typer.echo(f"no cached scenario at {scenario_path} -- run fetch-scenarios first", err=True)
+        raise typer.Exit(code=1)
+    scenario = pd.read_parquet(scenario_path)
+    scenario["quarter"] = pd.PeriodIndex(scenario["quarter"].astype(str), freq="Q")
+    scenario = scenario.set_index("quarter")
+
+    if not model_selection_path.exists():
+        typer.echo(f"no model selection at {model_selection_path} -- run project first", err=True)
+        raise typer.Exit(code=1)
+    model_selection = pd.read_csv(model_selection_path)
+    selected_family_by_category = (
+        model_selection[model_selection["selected"]].set_index("category")["model_family"].to_dict()
+    )
+
+    selected_categories = (
+        [str(LoanCategory(c.strip())) for c in categories.split(",")]
+        if categories
+        else [str(c) for c in backtest.MODELING_CATEGORIES]
+    )
+    missing = [c for c in selected_categories if c not in selected_family_by_category]
+    for category in missing:
+        typer.echo(f"{category}: not in {model_selection_path} -- skipping", err=True)
+    selected_categories = [c for c in selected_categories if c not in missing]
+
+    result = interface.build_credit_loss_projection(
+        selected_categories,
+        selected_family_by_category,
+        training,
+        macro_history,
+        scenario,
+        scenario_name,
+        long_history_frames,
+        bank_id=bank_id,
+        n_monte_carlo_draws=n_monte_carlo_draws,
+    )
+
+    typer.echo(
+        f"CreditLossProjection: {result.scenario_name}, "
+        f"{'bank ' + result.bank_identifier if result.bank_identifier else 'industry-wide'}, "
+        f"{len(result.categories)} categories, {result.timeline.n_periods} periods "
+        f"({result.timeline.year_labels[0]}-{result.timeline.year_labels[-1]})"
+    )
+    typer.echo(
+        f"  jump-off total balance: ${result.balance_total_mm[0]:,.1f}mm; "
+        f"ending total allowance: ${result.allowance_total_mm[-1]:,.1f}mm; "
+        f"ending total NPL: ${result.npl_total_mm[-1]:,.1f}mm"
+    )
+
+    if excel_output is not None:
+        excel_output.parent.mkdir(parents=True, exist_ok=True)
+        excel_export.export_credit_loss_projection_to_excel(str(excel_output), result)
+        typer.echo(f"wrote {excel_output}")
