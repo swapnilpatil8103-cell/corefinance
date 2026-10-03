@@ -2,7 +2,12 @@
 Stage 3 integrity checks: the pro forma balance sheet balances; goodwill
 equals consideration minus fair value of net assets acquired exactly;
 PCD has no net effect on loans/equity at close; the pro forma CET1
-bridge reconciles to the balance-sheet-derived CET1 figure."""
+bridge reconciles to the balance-sheet-derived CET1 figure.
+
+Takes each bank's full Stage 2 `BankModelResult` (not a pile of
+individually-passed floats) -- opening balance, calibrated capital, and
+the jump-off `BalanceSheet` (for the target's per-category loan mix, used
+by `corefin.ma.capital`'s RWA blend) all come from there."""
 
 from __future__ import annotations
 
@@ -10,14 +15,25 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from corefin.bank.schema import BankOpeningBalance
+from corefin.bank.capital import compute_tier2_capital_mm
+from corefin.bank.model import BankModelResult
+from corefin.bank.schema import BankConfig, BankOpeningBalance
 from corefin.checks.framework import CheckResult, check_close_to_zero
+from corefin.ma.accretion import (
+    EpsAccretionResult,
+    TbvEarnbackResult,
+    compute_acquirer_irr,
+    compute_eps_accretion_dilution,
+    compute_tbv_dilution_and_earnback,
+)
+from corefin.ma.capital import ProFormaCapitalRatios, compute_pro_forma_capital_ratios
 from corefin.ma.pro_forma import (
     ProFormaBalanceSheet,
     ProFormaCet1Bridge,
     compute_pro_forma_balance_sheet,
     compute_pro_forma_cet1_bridge,
 )
+from corefin.ma.projection import ProFormaProjection, compute_pro_forma_projection
 from corefin.ma.purchase_accounting import (
     FairValueMarks,
     SourcesAndUses,
@@ -37,32 +53,41 @@ class DealResult:
     sources_and_uses: SourcesAndUses
     pro_forma_balance_sheet: ProFormaBalanceSheet
     pro_forma_cet1_bridge: ProFormaCet1Bridge
+    pro_forma_capital_ratios: ProFormaCapitalRatios
+    pro_forma_projection: ProFormaProjection
+    eps_accretion: EpsAccretionResult
+    tbv_earnback: TbvEarnbackResult
+    acquirer_irr: float
 
 
 def run_deal_model(
-    acquirer: BankOpeningBalance,
-    target: BankOpeningBalance,
-    acquirer_cet1_mm: float,
-    target_cet1_mm: float,
-    acquirer_net_loans_mm: float,
-    acquirer_cash_mm: float,
-    target_cash_mm: float,
-    target_gross_loans_mm: float,
-    target_existing_allowance_mm: float,
+    acquirer_result: BankModelResult,
+    target_result: BankModelResult,
+    acquirer_bank_config: BankConfig,
+    target_bank_config: BankConfig,
     config: DealConfig,
 ) -> DealResult:
-    """`acquirer_cet1_mm`/`target_cet1_mm`: each bank's own jump-off CET1
-    capital from `corefin.bank.capital.compute_cet1_capital` (Stage 2).
-    `acquirer_net_loans_mm`/`target_gross_loans_mm`/
-    `target_existing_allowance_mm`: jump-off loan figures from each
-    bank's own `CreditLossProjection` -- target's are supplied GROSS (not
-    net) and with its allowance separately, since purchase accounting
-    eliminates the existing allowance and re-derives fair value from the
-    gross balance (see `purchase_accounting`'s module docstring).
-    `acquirer_cash_mm`/`target_cash_mm`: each bank's own jump-off cash
-    from `corefin.bank.balance_sheet.BalanceSheet.cash_mm[0]` (Stage 2's
-    OWN cash-plug output, not `BankOpeningBalance.cash_mm` directly --
-    see `pro_forma.compute_pro_forma_balance_sheet`'s docstring)."""
+    """`acquirer_result`/`target_result`: each bank's full Stage 2
+    `corefin.bank.model.run_bank_model` output. `acquirer_bank_config`/
+    `target_bank_config`: the `BankConfig` each bank was run with --
+    needed separately (not stored on `BankModelResult`) for the
+    acquirer's own `dividend_payout_ratio` (`projection.
+    compute_pro_forma_projection`) and the target's RWA risk weights
+    (`corefin.ma.capital`'s RWA blend, which must use the SAME weights
+    Stage 2 calibrated the target's own RWA against)."""
+    acquirer = acquirer_result.opening
+    target = target_result.opening
+    acquirer_cet1_mm = float(acquirer_result.capital.cet1_capital_mm[0])
+    target_cet1_mm = float(target_result.capital.cet1_capital_mm[0])
+    acquirer_net_loans_mm = float(
+        acquirer_result.balance_sheet.total_loans_mm[0]
+        - acquirer_result.balance_sheet.total_allowance_mm[0]
+    )
+    acquirer_cash_mm = float(acquirer_result.balance_sheet.cash_mm[0])
+    target_cash_mm = float(target_result.balance_sheet.cash_mm[0])
+    target_gross_loans_mm = float(target_result.balance_sheet.total_loans_mm[0])
+    target_existing_allowance_mm = float(target_result.balance_sheet.total_allowance_mm[0])
+
     marks = compute_fair_value_marks(
         target, target_gross_loans_mm, target_existing_allowance_mm, config
     )
@@ -80,11 +105,50 @@ def run_deal_model(
     pro_forma_cet1_bridge = compute_pro_forma_cet1_bridge(
         acquirer_cet1_mm, target_cet1_mm, target, marks, sources_and_uses, config
     )
+    pro_forma_capital_ratios = compute_pro_forma_capital_ratios(
+        acquirer_capital=acquirer_result.capital,
+        target_capital=target_result.capital,
+        target_balance_sheet=target_result.balance_sheet,
+        target_bank_config=target_bank_config,
+        pro_forma_cet1_mm=pro_forma_cet1_bridge.pro_forma_cet1_mm,
+        pro_forma_total_assets_mm=pro_forma_balance_sheet.total_assets_mm,
+        pro_forma_preferred_stock_mm=acquirer.preferred_stock_mm,
+        marks=marks,
+        acquirer_tier2_mm=compute_tier2_capital_mm(acquirer),
+        target_tier2_mm=compute_tier2_capital_mm(target),
+    )
+
+    pro_forma_projection = compute_pro_forma_projection(
+        acquirer_result=acquirer_result,
+        target_result=target_result,
+        marks=marks,
+        sources_and_uses=sources_and_uses,
+        pro_forma_equity_at_close_mm=pro_forma_balance_sheet.equity_mm,
+        pro_forma_goodwill_at_close_mm=pro_forma_balance_sheet.goodwill_mm,
+        pro_forma_other_intangibles_at_close_mm=pro_forma_balance_sheet.other_intangibles_mm,
+        acquirer_bank_config=acquirer_bank_config,
+        config=config,
+    )
+    eps_accretion = compute_eps_accretion_dilution(
+        acquirer_result, pro_forma_projection, sources_and_uses, config
+    )
+    tbv_earnback = compute_tbv_dilution_and_earnback(
+        acquirer_result, pro_forma_projection, sources_and_uses, config
+    )
+    acquirer_irr = compute_acquirer_irr(
+        acquirer_result, pro_forma_projection, sources_and_uses, config
+    )
+
     return DealResult(
         marks=marks,
         sources_and_uses=sources_and_uses,
         pro_forma_balance_sheet=pro_forma_balance_sheet,
         pro_forma_cet1_bridge=pro_forma_cet1_bridge,
+        pro_forma_capital_ratios=pro_forma_capital_ratios,
+        pro_forma_projection=pro_forma_projection,
+        eps_accretion=eps_accretion,
+        tbv_earnback=tbv_earnback,
+        acquirer_irr=acquirer_irr,
     )
 
 

@@ -1,6 +1,10 @@
 """Regulatory capital for ONE bank over a quarterly `Timeline`: CET1
 capital, risk-weighted assets (bottom-up, simplified, calibrated), the
-CET1 ratio, and the Tier 1 leverage ratio.
+CET1 ratio, and the Tier 1 leverage ratio (CET1 + preferred stock as
+Additional Tier 1, over average assets -- confirmed against real data
+that using CET1 ALONE as a Tier 1 proxy materially understates the
+leverage ratio for a bank with a sizeable preferred stock balance, e.g.
+the acquirer bank's own $343mm).
 
 CET1 CAPITAL: built from the EXPLICIT RC-R Part I bridge (equity minus
 preferred stock minus goodwill-net-of-DTL minus other-intangibles-net-of-
@@ -47,8 +51,9 @@ from corefin.timeline import Timeline
 # and home equity keep their own (lower/higher) weights; every other loan category falls into
 # the single OTHER_LOANS bucket (C&I, CRE x3, credit card, auto, other consumer) -- see
 # schema.py's AssetRiskCategory docstring for why this is deliberately coarser than the real
-# standardized approach.
-_LOAN_CATEGORY_TO_RISK_CATEGORY: dict[str, AssetRiskCategory] = {
+# standardized approach. Public (not underscore-prefixed) so corefin.ma can reuse the same
+# mapping for the pro forma RWA calculation instead of duplicating it.
+LOAN_CATEGORY_TO_RISK_CATEGORY: dict[str, AssetRiskCategory] = {
     "residential_mortgage": AssetRiskCategory.RESIDENTIAL_MORTGAGE,
     "home_equity": AssetRiskCategory.HOME_EQUITY,
     "commercial_and_industrial": AssetRiskCategory.OTHER_LOANS,
@@ -65,6 +70,7 @@ _LOAN_CATEGORY_TO_RISK_CATEGORY: dict[str, AssetRiskCategory] = {
 class CapitalResult:
     timeline: Timeline
     cet1_capital_mm: np.ndarray
+    preferred_stock_mm: np.ndarray  # Additional Tier 1 -- see tier1_capital_mm
     rwa_mm: np.ndarray
     average_assets_mm: np.ndarray  # leverage-ratio denominator
     rwa_calibration_factor: float
@@ -72,7 +78,12 @@ class CapitalResult:
 
     def __post_init__(self) -> None:
         n = self.timeline.n_periods
-        for name in ("cet1_capital_mm", "rwa_mm", "average_assets_mm"):
+        for name in (
+            "cet1_capital_mm",
+            "preferred_stock_mm",
+            "rwa_mm",
+            "average_assets_mm",
+        ):
             array = getattr(self, name)
             if array.shape != (n,):
                 raise ValueError(f"{name} has shape {array.shape}, expected ({n},)")
@@ -82,8 +93,17 @@ class CapitalResult:
         return self.cet1_capital_mm / self.rwa_mm
 
     @property
+    def tier1_capital_mm(self) -> np.ndarray:
+        """CET1 + Additional Tier 1. This simplified model's only AT1
+        instrument is preferred stock (no trust-preferred securities or
+        other AT1-qualifying instruments modeled) -- a reasonable
+        approximation for most community/regional banks, but still a
+        simplification worth naming explicitly."""
+        return self.cet1_capital_mm + self.preferred_stock_mm
+
+    @property
     def tier1_leverage_ratio(self) -> np.ndarray:
-        return self.cet1_capital_mm / self.average_assets_mm
+        return self.tier1_capital_mm / self.average_assets_mm
 
 
 def _bottom_up_rwa(
@@ -96,7 +116,7 @@ def _bottom_up_rwa(
     )
     net_loans_by_category = balance_sheet.loan_balance_mm - balance_sheet.allowance_mm
     for i, category in enumerate(balance_sheet.categories):
-        risk_category = _LOAN_CATEGORY_TO_RISK_CATEGORY.get(category, AssetRiskCategory.OTHER_LOANS)
+        risk_category = LOAN_CATEGORY_TO_RISK_CATEGORY.get(category, AssetRiskCategory.OTHER_LOANS)
         rwa = rwa + net_loans_by_category[i] * risk_weights[risk_category]
     return rwa
 
@@ -160,11 +180,30 @@ def compute_capital(
 ) -> CapitalResult:
     cet1_capital_mm, unexplained_cet1_residual_mm = compute_cet1_capital(balance_sheet, opening)
     rwa_mm, rwa_calibration_factor = calibrate_rwa(balance_sheet, opening, config)
+    preferred_stock_mm = np.full(timeline.n_periods, opening.preferred_stock_mm)
     return CapitalResult(
         timeline=timeline,
         cet1_capital_mm=cet1_capital_mm,
+        preferred_stock_mm=preferred_stock_mm,
         rwa_mm=rwa_mm,
         average_assets_mm=balance_sheet.total_assets_mm,
         rwa_calibration_factor=rwa_calibration_factor,
         unexplained_cet1_residual_mm=unexplained_cet1_residual_mm,
     )
+
+
+def compute_tier2_capital_mm(opening: BankOpeningBalance) -> float | None:
+    """Tier 2 capital (subordinated debt, allowance add-back, etc. --
+    none of it separately modeled here) backed out from the bank's own
+    REPORTED total and Tier 1 risk-based capital ratios: Tier2 = (total
+    ratio - Tier1 ratio) * reported RWA. Returns None if either reported
+    ratio is unavailable (`BankOpeningBalance.reported_tier1_capital_ratio`/
+    `reported_total_capital_ratio` are optional). Held static -- this
+    model doesn't project Tier 2 instruments forward or adjust them for
+    a deal (e.g. a redeemed/assumed subordinated note), the same
+    simplification as the CET1 bridge's other static items."""
+    if opening.reported_tier1_capital_ratio is None or opening.reported_total_capital_ratio is None:
+        return None
+    return (
+        opening.reported_total_capital_ratio - opening.reported_tier1_capital_ratio
+    ) * opening.reported_rwa_mm

@@ -47,6 +47,8 @@ def _synthetic_y9c_row(**overrides) -> pd.Series:
         "BHCAP793": 11.5,  # reported CET1 ratio (percentage points)
         "BHCAA223": 3_300_000.0,  # reported RWA
         "BHCA7204": 9.0,  # reported tier 1 leverage ratio (percentage points)
+        "BHCA7206": 15.0,  # reported tier 1 risk-based capital ratio (percentage points)
+        "BHCA7205": 18.0,  # reported total risk-based capital ratio (percentage points)
     }
     data.update(overrides)
     return pd.Series(data)
@@ -56,7 +58,7 @@ def test_build_opening_balance_sources_balance_sheet_from_y9c():
     call_report_row = _synthetic_call_report_row()
     y9c_row = _synthetic_y9c_row()
 
-    opening = build_opening_balance_from_real_data(
+    opening, _flags = build_opening_balance_from_real_data(
         name="Acquirer Bank A",
         bank_id="11111",
         hc_rssd_id="22222",
@@ -79,7 +81,7 @@ def test_build_opening_balance_derives_other_liabilities_as_a_residual():
     call_report_row = _synthetic_call_report_row(RCON2200=3_000_000.0)
     y9c_row = _synthetic_y9c_row(BHCK2948=3_700_000.0)
 
-    opening = build_opening_balance_from_real_data(
+    opening, _flags = build_opening_balance_from_real_data(
         name="Acquirer Bank A",
         bank_id="11111",
         hc_rssd_id="22222",
@@ -95,7 +97,7 @@ def test_build_opening_balance_derives_other_assets_as_a_residual():
     call_report_row = _synthetic_call_report_row()
     y9c_row = _synthetic_y9c_row(BHCK2170=4_200_000.0)
 
-    opening = build_opening_balance_from_real_data(
+    opening, _flags = build_opening_balance_from_real_data(
         name="Acquirer Bank A",
         bank_id="11111",
         hc_rssd_id="22222",
@@ -131,7 +133,7 @@ def test_build_opening_balance_sources_cet1_bridge_from_rcri_items():
     call_report_row = _synthetic_call_report_row()
     y9c_row = _synthetic_y9c_row()
 
-    opening = build_opening_balance_from_real_data(
+    opening, _flags = build_opening_balance_from_real_data(
         name="Acquirer Bank A",
         bank_id="11111",
         hc_rssd_id="22222",
@@ -150,33 +152,15 @@ def test_build_opening_balance_sources_cet1_bridge_from_rcri_items():
     assert opening.reported_cet1_ratio == pytest.approx(0.115)
     assert opening.reported_rwa_mm == pytest.approx(3300.0)
     assert opening.reported_tier1_leverage_ratio == pytest.approx(0.09)
-
-
-def test_build_opening_balance_income_statement_sourced_from_y9c():
-    call_report_row = _synthetic_call_report_row()
-    y9c_row = _synthetic_y9c_row()
-
-    opening = build_opening_balance_from_real_data(
-        name="Acquirer Bank A",
-        bank_id="11111",
-        hc_rssd_id="22222",
-        call_report_row=call_report_row,
-        y9c_row=y9c_row,
-        bank_level_net_loans_mm=3000.0,
-    )
-    # YTD (full year as of Q4), divided by 4 to approximate one quarter's run-rate -- see
-    # schema.py's "YTD-VS-QUARTERLY".
-    assert opening.net_interest_income_jumpoff_mm == pytest.approx(35.0)  # (200,000-60,000)/4
-    assert opening.noninterest_income_jumpoff_mm == pytest.approx(6.25)  # 25,000/4
-    assert opening.noninterest_expense_jumpoff_mm == pytest.approx(22.5)  # 90,000/4
-    assert opening.preferred_dividends_jumpoff_mm == pytest.approx(2.0)  # 8,000/4
+    assert opening.reported_tier1_capital_ratio == pytest.approx(0.15)
+    assert opening.reported_total_capital_ratio == pytest.approx(0.18)
 
 
 def test_build_opening_balance_name_is_fictitious_not_a_real_bank():
     # Guards against a real company name ever being hardcoded into this builder's defaults.
     call_report_row = _synthetic_call_report_row()
     y9c_row = _synthetic_y9c_row()
-    opening = build_opening_balance_from_real_data(
+    opening, _flags = build_opening_balance_from_real_data(
         name="Acquirer Bank A",
         bank_id="11111",
         hc_rssd_id="22222",
@@ -185,3 +169,117 @@ def test_build_opening_balance_name_is_fictitious_not_a_real_bank():
         bank_level_net_loans_mm=3000.0,
     )
     assert opening.name == "Acquirer Bank A"
+
+
+def test_income_statement_falls_back_to_ytd_over_4_when_no_prior_quarter_given():
+    call_report_row = _synthetic_call_report_row()
+    y9c_row = _synthetic_y9c_row()
+
+    opening, flags = build_opening_balance_from_real_data(
+        name="Acquirer Bank A",
+        bank_id="11111",
+        hc_rssd_id="22222",
+        call_report_row=call_report_row,
+        y9c_row=y9c_row,
+        bank_level_net_loans_mm=3000.0,
+    )
+    assert opening.net_interest_income_jumpoff_mm == pytest.approx(35.0)  # (200,000-60,000)/4
+    assert opening.noninterest_income_jumpoff_mm == pytest.approx(6.25)  # 25,000/4
+    assert opening.noninterest_expense_jumpoff_mm == pytest.approx(22.5)  # 90,000/4
+    assert opening.preferred_dividends_jumpoff_mm == pytest.approx(2.0)  # 8,000/4
+    assert set(flags.used_annualized_fallback_for) == {
+        "net_interest_income",
+        "noninterest_income",
+        "noninterest_expense",
+        "preferred_dividends",
+    }
+    assert flags.qoq_asset_change_pct is None
+    assert flags.qoq_asset_change_flagged is False
+
+
+def test_income_statement_uses_q4_minus_q3_when_prior_quarter_given():
+    # Confirmed against real data: a bank whose balance sheet grew materially during the year
+    # (e.g. its own acquisition) makes YTD/4 understate the true Q4 run-rate substantially --
+    # Q4-only (Q4 YTD minus Q3 YTD) is the correct default.
+    call_report_row = _synthetic_call_report_row()
+    y9c_row = _synthetic_y9c_row()
+    prior_quarter_row = _synthetic_y9c_row(
+        BHCK4107=140_000.0,  # Q3 YTD interest income (vs 200,000 at Q4)
+        BHCK4073=40_000.0,  # Q3 YTD interest expense (vs 60,000 at Q4)
+        BHCK4079=17_000.0,  # Q3 YTD noninterest income (vs 25,000 at Q4)
+        BHCK4093=60_000.0,  # Q3 YTD noninterest expense (vs 90,000 at Q4)
+        BHCK4598=5_000.0,  # Q3 YTD preferred dividends (vs 8,000 at Q4)
+        BHCK2170=3_000_000.0,  # Q3 total assets (vs 4,200,000 at Q4 -- a 40% QoQ jump)
+    )
+
+    opening, flags = build_opening_balance_from_real_data(
+        name="Acquirer Bank A",
+        bank_id="11111",
+        hc_rssd_id="22222",
+        call_report_row=call_report_row,
+        y9c_row=y9c_row,
+        bank_level_net_loans_mm=3000.0,
+        prior_quarter_y9c_row=prior_quarter_row,
+    )
+    # Q4-only NII = (200,000-60,000) - (140,000-40,000) = 40,000, in $mm = 40.0
+    assert opening.net_interest_income_jumpoff_mm == pytest.approx(40.0)
+    assert opening.noninterest_income_jumpoff_mm == pytest.approx(8.0)  # 25,000-17,000
+    assert opening.noninterest_expense_jumpoff_mm == pytest.approx(30.0)  # 90,000-60,000
+    assert opening.preferred_dividends_jumpoff_mm == pytest.approx(3.0)  # 8,000-5,000
+    assert flags.used_annualized_fallback_for == ()
+    assert flags.qoq_asset_change_pct == pytest.approx(0.4)  # (4,200,000-3,000,000)/3,000,000
+    assert flags.qoq_asset_change_flagged is True
+
+
+def test_qoq_asset_change_not_flagged_when_under_threshold():
+    call_report_row = _synthetic_call_report_row()
+    y9c_row = _synthetic_y9c_row(BHCK2170=4_200_000.0)
+    prior_quarter_row = _synthetic_y9c_row(BHCK2170=4_100_000.0)  # ~2.4% QoQ change
+
+    _opening, flags = build_opening_balance_from_real_data(
+        name="Acquirer Bank A",
+        bank_id="11111",
+        hc_rssd_id="22222",
+        call_report_row=call_report_row,
+        y9c_row=y9c_row,
+        bank_level_net_loans_mm=3000.0,
+        prior_quarter_y9c_row=prior_quarter_row,
+    )
+    assert flags.qoq_asset_change_flagged is False
+
+
+def test_explicit_quarterly_overrides_take_precedence_over_prior_quarter_data():
+    call_report_row = _synthetic_call_report_row()
+    y9c_row = _synthetic_y9c_row()
+    prior_quarter_row = _synthetic_y9c_row(BHCK4107=140_000.0, BHCK4073=40_000.0)
+
+    opening, flags = build_opening_balance_from_real_data(
+        name="Acquirer Bank A",
+        bank_id="11111",
+        hc_rssd_id="22222",
+        call_report_row=call_report_row,
+        y9c_row=y9c_row,
+        bank_level_net_loans_mm=3000.0,
+        prior_quarter_y9c_row=prior_quarter_row,
+        net_interest_income_quarterly_override_mm=99.0,
+    )
+    assert opening.net_interest_income_jumpoff_mm == pytest.approx(99.0)
+    assert "net_interest_income" not in flags.used_annualized_fallback_for
+
+
+def test_preferred_dividend_annual_rate_override():
+    call_report_row = _synthetic_call_report_row()
+    y9c_row = _synthetic_y9c_row(BHCK3283=300_000.0)  # $300mm preferred stock
+
+    opening, flags = build_opening_balance_from_real_data(
+        name="Acquirer Bank A",
+        bank_id="11111",
+        hc_rssd_id="22222",
+        call_report_row=call_report_row,
+        y9c_row=y9c_row,
+        bank_level_net_loans_mm=3000.0,
+        preferred_dividend_annual_rate=0.06,
+    )
+    # 6% annual on $300mm preferred, quarterly = 300 * 0.06 / 4 = 4.5
+    assert opening.preferred_dividends_jumpoff_mm == pytest.approx(4.5)
+    assert "preferred_dividends" not in flags.used_annualized_fallback_for

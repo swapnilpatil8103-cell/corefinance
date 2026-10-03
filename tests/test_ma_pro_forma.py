@@ -96,7 +96,12 @@ def _cet1_of(bank: BankOpeningBalance) -> float:
 
 def _deal_config(**overrides) -> DealConfig:
     kwargs: dict = dict(
-        consideration=ConsiderationConfig(price_to_tbv=1.5, stock_pct=0.8),
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.5,
+            stock_pct=0.8,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        ),
         credit_mark=CreditMarkConfig(credit_mark_pct=0.02, pcd_share=0.3),
     )
     kwargs.update(overrides)
@@ -201,7 +206,12 @@ def test_all_stock_zero_mark_zero_premium_deal_leaves_pro_forma_cet1_near_acquir
         other_assets_mm=40.0,
     )
     config = _deal_config(
-        consideration=ConsiderationConfig(price_to_tbv=1.0, stock_pct=1.0),
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.0,
+            stock_pct=1.0,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        ),
         credit_mark=CreditMarkConfig(credit_mark_pct=0.0, pcd_share=0.0),
         cdi=CdiConfig(cdi_pct_of_core_deposits=0.0),
     )
@@ -240,8 +250,22 @@ def test_higher_price_lowers_pro_forma_cet1():
     # goodwill from a higher price is exactly offset by the extra stock issued to fund it; see
     # test_all_stock_price_is_capital_neutral_to_cet1 below), so a mixed/cash deal is needed for
     # a higher price to actually show up as lower pro forma CET1.
-    low_config = _deal_config(consideration=ConsiderationConfig(price_to_tbv=1.2, stock_pct=0.5))
-    high_config = _deal_config(consideration=ConsiderationConfig(price_to_tbv=1.8, stock_pct=0.5))
+    low_config = _deal_config(
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.2,
+            stock_pct=0.5,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        )
+    )
+    high_config = _deal_config(
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.8,
+            stock_pct=0.5,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        )
+    )
 
     marks_low = compute_fair_value_marks(target, 800.0, 16.0, low_config)
     su_low = compute_sources_and_uses(target, marks_low, low_config)
@@ -280,8 +304,22 @@ def test_all_stock_price_is_capital_neutral_to_cet1():
     acquirer_cet1_mm = _cet1_of(acquirer)
     target_cet1_mm = _cet1_of(target)
 
-    low_config = _deal_config(consideration=ConsiderationConfig(price_to_tbv=1.2, stock_pct=1.0))
-    high_config = _deal_config(consideration=ConsiderationConfig(price_to_tbv=1.8, stock_pct=1.0))
+    low_config = _deal_config(
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.2,
+            stock_pct=1.0,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        )
+    )
+    high_config = _deal_config(
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.8,
+            stock_pct=1.0,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        )
+    )
 
     marks_low = compute_fair_value_marks(target, 800.0, 16.0, low_config)
     su_low = compute_sources_and_uses(target, marks_low, low_config)

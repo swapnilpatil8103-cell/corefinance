@@ -34,12 +34,32 @@ class ConsiderationConfig(BaseModel):
     `stock_pct`: fraction of total consideration paid in acquirer common
     stock (new shares issued); the remainder (`1 - stock_pct`) is cash,
     funded out of the acquirer's own balance sheet (no new acquisition
-    debt modeled -- a documented Stage 3 simplification)."""
+    debt modeled -- a documented Stage 3 simplification).
+
+    SHARE DATA (Stage 4: EPS accretion/dilution, TBV per share, IRR) --
+    explicit config inputs, never scraped market data, per the approved
+    plan. `acquirer_share_price`: used only to convert the stock
+    consideration's DOLLAR value into a number of new shares issued
+    (`stock_consideration_mm / acquirer_share_price`); this model has no
+    other use for a market price (it doesn't mark anything to market
+    value). `target_shares_outstanding_mm` is optional and used only to
+    report an illustrative exchange ratio -- not needed for EPS/TBV
+    math, which only cares about the ACQUIRER's post-deal share count.
+    `cash_funding_cost_rate`: the assumed forgone yield / cost of funds
+    on cash consideration (cash paid out stops earning this rate) --
+    Stage 3 assumes cash consideration is funded from the acquirer's own
+    balance sheet, not new debt, so this is an OPPORTUNITY cost, not an
+    interest expense on new borrowings; applied in Stage 4's pro forma
+    income statement."""
 
     model_config = ConfigDict(extra="forbid")
 
     price_to_tbv: float = Field(gt=0.0)
     stock_pct: float = Field(ge=0.0, le=1.0)
+    acquirer_share_price: float = Field(gt=0.0)
+    acquirer_shares_outstanding_mm: float = Field(gt=0.0)
+    target_shares_outstanding_mm: float | None = Field(default=None, gt=0.0)
+    cash_funding_cost_rate: float = Field(default=0.04, ge=0.0, lt=1.0)
 
     @property
     def cash_pct(self) -> float:

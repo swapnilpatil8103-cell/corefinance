@@ -27,13 +27,39 @@ bank; `BankOpeningBalance`'s own `ge=0.0` validation on both fields will
 raise if either DTA goes negative in a way that would indicate corefin.bank.schema
 item codes resolve to something unexpected for a given bank.
 
-YTD-TO-QUARTERLY: every Y-9C income-statement item used here (interest
-income/expense, noninterest income/expense, preferred dividends) is
-reported calendar-year-to-date as of the report date -- see schema.py's
-"YTD-VS-QUARTERLY". Each is divided by 4 here to approximate a single
-quarter's run-rate for a Q4 jump-off."""
+YTD-TO-QUARTERLY -- Q4-ONLY BY DEFAULT, NOT YTD/4: every Y-9C income-
+statement item used here (interest income/expense, noninterest income/
+expense, preferred dividends) is reported calendar-year-to-date as of
+the report date -- see schema.py's "YTD-VS-QUARTERLY". The CORRECT
+quarterly run-rate is Q4 YTD minus Q3 YTD (the standard `ytd_to_quarterly`
+differencing `corefin.credit.panel` already uses for charge-offs/
+recoveries), supplied here via the optional `prior_quarter_*_ytd_mm`
+parameters. A flat YTD/4 average is only used as a FALLBACK when no
+prior-quarter figure is supplied, and is a real source of error for any
+bank whose balance sheet changed materially during the year -- confirmed
+against real data: the acquirer bank's own total assets grew ~25%
+quarter-on-quarter between 2025Q3 and 2025Q4 (apparently its own
+acquisition), making YTD/4 understate Q4-only net interest income by
+~20% ($139mm vs the real $175mm) and noninterest expense by ~17% ($101mm
+vs $122mm). `QOQ_ASSET_CHANGE_FLAG_THRESHOLD` flags any bank whose HC
+total assets moved more than 10% quarter-on-quarter, specifically
+because that is exactly the condition under which YTD/4 becomes
+unreliable -- the flag is informational (`DataQualityFlags`), not an
+error; callers can still proceed, but should prefer supplying real prior-
+quarter figures when it fires.
+
+PREFERRED DIVIDENDS have the same YTD issue, PLUS a second one: a
+newly-issued or partially-redeemed preferred tranche can make even a
+correct Q4-only figure an unreliable estimate of the GOING-FORWARD
+quarterly dividend. `preferred_dividend_annual_rate` (a contractual
+coupon rate on `preferred_stock_mm`, e.g. 0.06 for a 6% annual rate) is
+offered as an alternative, explicit override for exactly this reason --
+documented per bank when used, since it is an assumption, not a reported
+figure."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import pandas as pd
 
@@ -43,6 +69,34 @@ from corefin.bank.schema import BankOpeningBalance
 _THOUSANDS_TO_MM = 1.0 / 1_000.0
 _YTD_Q4_TO_QUARTERLY = 1.0 / 4.0
 
+QOQ_ASSET_CHANGE_FLAG_THRESHOLD = 0.10
+
+
+@dataclass(frozen=True)
+class DataQualityFlags:
+    """Informational flags from building ONE bank's `BankOpeningBalance`
+    -- callers decide what to do with them (log, surface to the user,
+    etc.); nothing here raises on its own."""
+
+    qoq_asset_change_pct: float | None  # None if prior_quarter_hc_total_assets_mm wasn't given
+    qoq_asset_change_flagged: bool
+    used_annualized_fallback_for: tuple[str, ...]  # income items that fell back to YTD/4
+    # because no prior-quarter figure (or override) was supplied for them
+
+
+def _quarterly_run_rate(
+    current_ytd_mm: float,
+    prior_ytd_mm: float | None,
+    override_mm: float | None,
+) -> tuple[float, bool]:
+    """Returns (quarterly_mm, used_fallback). Precedence: explicit
+    override > Q4-minus-Q3 differencing > flat YTD/4 fallback."""
+    if override_mm is not None:
+        return override_mm, False
+    if prior_ytd_mm is not None:
+        return current_ytd_mm - prior_ytd_mm, False
+    return current_ytd_mm * _YTD_Q4_TO_QUARTERLY, True
+
 
 def build_opening_balance_from_real_data(
     name: str,
@@ -51,7 +105,13 @@ def build_opening_balance_from_real_data(
     call_report_row: pd.Series,
     y9c_row: pd.Series,
     bank_level_net_loans_mm: float,
-) -> BankOpeningBalance:
+    prior_quarter_y9c_row: pd.Series | None = None,
+    net_interest_income_quarterly_override_mm: float | None = None,
+    noninterest_income_quarterly_override_mm: float | None = None,
+    noninterest_expense_quarterly_override_mm: float | None = None,
+    preferred_dividends_quarterly_override_mm: float | None = None,
+    preferred_dividend_annual_rate: float | None = None,
+) -> tuple[BankOpeningBalance, DataQualityFlags]:
     """`call_report_row`/`y9c_row`: one row (e.g. `df.loc[idx]`) from
     `capital_parse.parse_bank_capital_zip`'s / `fr_y9c.parse_y9c_bulk_zip`'s
     output, already filtered to this bank/holding company. Dollar item
@@ -59,7 +119,20 @@ def build_opening_balance_from_real_data(
     $mm here. `bank_level_net_loans_mm`: the credit engine's own jump-off
     total loan balance net of allowance (already in $mm), e.g.
     `CreditLossProjection.balance_total_mm[0] - CreditLossProjection.
-    allowance_total_mm[0]`."""
+    allowance_total_mm[0]`.
+
+    `prior_quarter_y9c_row`: the SAME holding company's Y-9C row for the
+    prior quarter (e.g. Q3 if `y9c_row` is Q4) -- used for the Q4-only
+    run-rate differencing and the QoQ asset-change flag; see module
+    docstring. Omit if unavailable (falls back to YTD/4 for whichever
+    income items aren't also given an explicit override, and
+    `qoq_asset_change_pct`/`qoq_asset_change_flagged` stay unset).
+
+    `*_quarterly_override_mm`/`preferred_dividend_annual_rate`: explicit
+    overrides, highest precedence -- see `_quarterly_run_rate`.
+    `preferred_dividend_annual_rate` (e.g. 0.06) is applied as
+    `rate * preferred_stock_mm / 4`; ignored if
+    `preferred_dividends_quarterly_override_mm` is also given."""
     cash_mm = (
         y9c_row[schema.HC_CASH_NONINTEREST_ITEM] + y9c_row[schema.HC_CASH_INTEREST_BEARING_ITEM]
     ) * _THOUSANDS_TO_MM
@@ -70,6 +143,7 @@ def build_opening_balance_from_real_data(
     equity_mm = y9c_row[schema.HC_TOTAL_EQUITY_CAPITAL_ITEM] * _THOUSANDS_TO_MM
     hc_total_assets_mm = y9c_row[schema.HC_TOTAL_ASSETS_ITEM] * _THOUSANDS_TO_MM
     hc_total_liabilities_mm = y9c_row[schema.HC_TOTAL_LIABILITIES_ITEM] * _THOUSANDS_TO_MM
+    preferred_stock_mm = y9c_row[schema.HC_PREFERRED_STOCK_ITEM] * _THOUSANDS_TO_MM
 
     deposits_mm = call_report_row[schema.TOTAL_DEPOSITS_ITEM] * _THOUSANDS_TO_MM
     borrowings_mm = 0.0  # see module docstring -- folded into other_liabilities_mm
@@ -84,22 +158,87 @@ def build_opening_balance_from_real_data(
     )
 
     nii_income_item, nii_expense_item = schema.HC_NET_INTEREST_INCOME_ITEMS
-    net_interest_income_jumpoff_mm = (
-        (y9c_row[nii_income_item] - y9c_row[nii_expense_item])
-        * _THOUSANDS_TO_MM
-        * _YTD_Q4_TO_QUARTERLY
+    current_nii_ytd_mm = (y9c_row[nii_income_item] - y9c_row[nii_expense_item]) * _THOUSANDS_TO_MM
+    current_noninterest_income_ytd_mm = (
+        y9c_row[schema.HC_NONINTEREST_INCOME_ITEM] * _THOUSANDS_TO_MM
     )
-    noninterest_income_jumpoff_mm = (
-        y9c_row[schema.HC_NONINTEREST_INCOME_ITEM] * _THOUSANDS_TO_MM * _YTD_Q4_TO_QUARTERLY
+    current_noninterest_expense_ytd_mm = (
+        y9c_row[schema.HC_NONINTEREST_EXPENSE_ITEM] * _THOUSANDS_TO_MM
     )
-    noninterest_expense_jumpoff_mm = (
-        y9c_row[schema.HC_NONINTEREST_EXPENSE_ITEM] * _THOUSANDS_TO_MM * _YTD_Q4_TO_QUARTERLY
-    )
-    preferred_dividends_jumpoff_mm = (
-        y9c_row[schema.HC_PREFERRED_DIVIDENDS_ITEM] * _THOUSANDS_TO_MM * _YTD_Q4_TO_QUARTERLY
+    current_preferred_dividends_ytd_mm = (
+        y9c_row[schema.HC_PREFERRED_DIVIDENDS_ITEM] * _THOUSANDS_TO_MM
     )
 
-    return BankOpeningBalance(
+    prior_nii_ytd_mm = prior_noninterest_income_ytd_mm = None
+    prior_noninterest_expense_ytd_mm = prior_preferred_dividends_ytd_mm = None
+    prior_hc_total_assets_mm = None
+    if prior_quarter_y9c_row is not None:
+        prior_nii_ytd_mm = (
+            prior_quarter_y9c_row[nii_income_item] - prior_quarter_y9c_row[nii_expense_item]
+        ) * _THOUSANDS_TO_MM
+        prior_noninterest_income_ytd_mm = (
+            prior_quarter_y9c_row[schema.HC_NONINTEREST_INCOME_ITEM] * _THOUSANDS_TO_MM
+        )
+        prior_noninterest_expense_ytd_mm = (
+            prior_quarter_y9c_row[schema.HC_NONINTEREST_EXPENSE_ITEM] * _THOUSANDS_TO_MM
+        )
+        prior_preferred_dividends_ytd_mm = (
+            prior_quarter_y9c_row[schema.HC_PREFERRED_DIVIDENDS_ITEM] * _THOUSANDS_TO_MM
+        )
+        prior_hc_total_assets_mm = (
+            prior_quarter_y9c_row[schema.HC_TOTAL_ASSETS_ITEM] * _THOUSANDS_TO_MM
+        )
+
+    net_interest_income_jumpoff_mm, nii_fallback = _quarterly_run_rate(
+        current_nii_ytd_mm, prior_nii_ytd_mm, net_interest_income_quarterly_override_mm
+    )
+    noninterest_income_jumpoff_mm, noninterest_income_fallback = _quarterly_run_rate(
+        current_noninterest_income_ytd_mm,
+        prior_noninterest_income_ytd_mm,
+        noninterest_income_quarterly_override_mm,
+    )
+    noninterest_expense_jumpoff_mm, noninterest_expense_fallback = _quarterly_run_rate(
+        current_noninterest_expense_ytd_mm,
+        prior_noninterest_expense_ytd_mm,
+        noninterest_expense_quarterly_override_mm,
+    )
+
+    if preferred_dividends_quarterly_override_mm is not None:
+        preferred_dividends_jumpoff_mm = preferred_dividends_quarterly_override_mm
+        preferred_dividends_fallback = False
+    elif preferred_dividend_annual_rate is not None:
+        preferred_dividends_jumpoff_mm = preferred_dividend_annual_rate * preferred_stock_mm / 4.0
+        preferred_dividends_fallback = False
+    else:
+        preferred_dividends_jumpoff_mm, preferred_dividends_fallback = _quarterly_run_rate(
+            current_preferred_dividends_ytd_mm, prior_preferred_dividends_ytd_mm, None
+        )
+
+    fallbacks = []
+    if nii_fallback:
+        fallbacks.append("net_interest_income")
+    if noninterest_income_fallback:
+        fallbacks.append("noninterest_income")
+    if noninterest_expense_fallback:
+        fallbacks.append("noninterest_expense")
+    if preferred_dividends_fallback:
+        fallbacks.append("preferred_dividends")
+
+    qoq_asset_change_pct = (
+        float((hc_total_assets_mm - prior_hc_total_assets_mm) / prior_hc_total_assets_mm)
+        if prior_hc_total_assets_mm
+        else None
+    )
+    flags = DataQualityFlags(
+        qoq_asset_change_pct=qoq_asset_change_pct,
+        qoq_asset_change_flagged=bool(
+            qoq_asset_change_pct is not None
+            and abs(qoq_asset_change_pct) > QOQ_ASSET_CHANGE_FLAG_THRESHOLD
+        ),
+        used_annualized_fallback_for=tuple(fallbacks),
+    )
+
+    opening = BankOpeningBalance(
         name=name,
         bank_id=bank_id,
         hc_rssd_id=hc_rssd_id,
@@ -117,7 +256,7 @@ def build_opening_balance_from_real_data(
         noninterest_income_jumpoff_mm=noninterest_income_jumpoff_mm,
         noninterest_expense_jumpoff_mm=noninterest_expense_jumpoff_mm,
         preferred_dividends_jumpoff_mm=preferred_dividends_jumpoff_mm,
-        preferred_stock_mm=y9c_row[schema.HC_PREFERRED_STOCK_ITEM] * _THOUSANDS_TO_MM,
+        preferred_stock_mm=preferred_stock_mm,
         goodwill_net_of_dtl_mm=y9c_row[schema.HC_GOODWILL_NET_OF_DTL_ITEM] * _THOUSANDS_TO_MM,
         other_intangibles_net_of_dtl_mm=(
             y9c_row[schema.HC_OTHER_INTANGIBLES_NET_OF_DTL_ITEM] * _THOUSANDS_TO_MM
@@ -132,4 +271,11 @@ def build_opening_balance_from_real_data(
         reported_cet1_ratio=y9c_row[schema.HC_CET1_RATIO_ITEM] / 100.0,
         reported_rwa_mm=y9c_row[schema.HC_RWA_ITEM] * _THOUSANDS_TO_MM,
         reported_tier1_leverage_ratio=y9c_row[schema.HC_TIER1_LEVERAGE_RATIO_ITEM] / 100.0,
+        reported_tier1_capital_ratio=(
+            y9c_row[schema.HC_TIER1_RISK_BASED_CAPITAL_RATIO_ITEM] / 100.0
+        ),
+        reported_total_capital_ratio=(
+            y9c_row[schema.HC_TOTAL_RISK_BASED_CAPITAL_RATIO_ITEM] / 100.0
+        ),
     )
+    return opening, flags

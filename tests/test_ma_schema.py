@@ -15,7 +15,12 @@ from corefin.ma.schema import (
 
 def _deal_config(**overrides) -> DealConfig:
     kwargs = dict(
-        consideration=ConsiderationConfig(price_to_tbv=1.5, stock_pct=0.8),
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.5,
+            stock_pct=0.8,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        ),
         credit_mark=CreditMarkConfig(credit_mark_pct=0.02, pcd_share=0.3),
     )
     kwargs.update(overrides)
@@ -23,7 +28,12 @@ def _deal_config(**overrides) -> DealConfig:
 
 
 def test_consideration_config_cash_pct_is_complement_of_stock_pct():
-    consideration = ConsiderationConfig(price_to_tbv=1.5, stock_pct=0.8)
+    consideration = ConsiderationConfig(
+        price_to_tbv=1.5,
+        stock_pct=0.8,
+        acquirer_share_price=25.0,
+        acquirer_shares_outstanding_mm=50.0,
+    )
     assert consideration.cash_pct == pytest.approx(0.2)
 
 
@@ -44,12 +54,22 @@ def test_deal_config_rejects_unknown_fields():
 
 def test_consideration_config_rejects_stock_pct_out_of_range():
     with pytest.raises(ValidationError):
-        ConsiderationConfig(price_to_tbv=1.5, stock_pct=1.5)
+        ConsiderationConfig(
+            price_to_tbv=1.5,
+            stock_pct=1.5,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        )
 
 
 def test_consideration_config_rejects_non_positive_price_to_tbv():
     with pytest.raises(ValidationError):
-        ConsiderationConfig(price_to_tbv=0.0, stock_pct=0.5)
+        ConsiderationConfig(
+            price_to_tbv=0.0,
+            stock_pct=0.5,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        )
 
 
 def test_rate_mark_config_allows_negative_pct_for_a_writedown():

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from corefin.bank.balance_sheet import project_balance_sheet
-from corefin.bank.capital import compute_capital
+from corefin.bank.capital import compute_capital, compute_tier2_capital_mm
 from corefin.bank.schema import BankConfig, BankOpeningBalance
 from corefin.credit.interface import CreditLossProjection
 from corefin.timeline import Timeline
@@ -115,6 +115,32 @@ def test_jumpoff_rwa_matches_reported_exactly():
     assert capital.rwa_mm[0] == pytest.approx(opening.reported_rwa_mm, abs=1e-6)
 
 
+def test_tier1_capital_includes_preferred_stock_as_additional_tier1():
+    timeline = _timeline()
+    opening = _synthetic_opening(preferred_stock_mm=80.0)
+    config = BankConfig()
+    bs = _build_balance_sheet(opening, timeline, config)
+
+    capital = compute_capital(bs, opening, config, timeline)
+
+    assert np.allclose(capital.tier1_capital_mm, capital.cet1_capital_mm + 80.0)
+    assert np.allclose(
+        capital.tier1_leverage_ratio, capital.tier1_capital_mm / capital.average_assets_mm
+    )
+
+
+def test_tier1_leverage_ratio_exceeds_a_cet1_only_proxy_when_preferred_stock_is_material():
+    timeline = _timeline()
+    opening = _synthetic_opening(preferred_stock_mm=80.0)
+    config = BankConfig()
+    bs = _build_balance_sheet(opening, timeline, config)
+
+    capital = compute_capital(bs, opening, config, timeline)
+    cet1_only_proxy = capital.cet1_capital_mm / capital.average_assets_mm
+
+    assert np.all(capital.tier1_leverage_ratio > cet1_only_proxy)
+
+
 def test_rwa_calibration_factor_is_positive_and_finite():
     timeline = _timeline()
     opening = _synthetic_opening()
@@ -202,8 +228,25 @@ def test_capital_result_rejects_wrong_shape_array():
         CapitalResult(
             timeline=timeline,
             cet1_capital_mm=np.zeros(n),
+            preferred_stock_mm=np.zeros(n),
             rwa_mm=np.zeros(n + 1),
             average_assets_mm=np.zeros(n),
             rwa_calibration_factor=1.0,
             unexplained_cet1_residual_mm=0.0,
         )
+
+
+def test_compute_tier2_capital_mm_backs_out_the_gap_between_total_and_tier1_ratios():
+    opening = _synthetic_opening(
+        reported_total_capital_ratio=0.18,
+        reported_tier1_capital_ratio=0.15,
+        reported_rwa_mm=6583.33,
+    )
+    tier2_mm = compute_tier2_capital_mm(opening)
+    assert tier2_mm == pytest.approx((0.18 - 0.15) * 6583.33)
+
+
+def test_compute_tier2_capital_mm_returns_none_when_ratios_unavailable():
+    opening = _synthetic_opening()  # reported_total_capital_ratio/reported_tier1_capital_ratio
+    # default to None
+    assert compute_tier2_capital_mm(opening) is None

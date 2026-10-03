@@ -401,4 +401,12 @@ class BankOpeningBalance(BaseModel):
     reported_cet1_capital_mm: float = Field(gt=0.0)
     reported_cet1_ratio: float = Field(gt=0.0, lt=1.0)
     reported_rwa_mm: float = Field(gt=0.0)
-    reported_tier1_leverage_ratio: float = Field(gt=0.0, lt=1.0)
+    reported_tier1_leverage_ratio: float = Field(gt=0.0, lt=1.0)  # Tier1 / average assets
+
+    # RISK-BASED (RWA-denominator) ratios -- distinct from reported_tier1_leverage_ratio above
+    # (which uses average assets, not RWA). Optional: only needed to back out each bank's own
+    # Tier 2 capital $ (= (total_ratio - tier1_ratio) * reported_rwa_mm) for
+    # corefin.ma.capital's pro forma total capital ratio; Stage 2's own CET1/leverage
+    # calculations don't need them.
+    reported_tier1_capital_ratio: float | None = Field(default=None, gt=0.0, lt=1.0)
+    reported_total_capital_ratio: float | None = Field(default=None, gt=0.0, lt=1.0)

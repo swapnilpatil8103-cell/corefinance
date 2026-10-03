@@ -57,7 +57,12 @@ def _target(**overrides) -> BankOpeningBalance:
 
 def _deal_config(**overrides) -> DealConfig:
     kwargs: dict = dict(
-        consideration=ConsiderationConfig(price_to_tbv=1.5, stock_pct=0.8),
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.5,
+            stock_pct=0.8,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        ),
         credit_mark=CreditMarkConfig(credit_mark_pct=0.02, pcd_share=0.3),
     )
     kwargs.update(overrides)
@@ -116,6 +121,36 @@ def test_day2_allowance_target_acl_ratio_method():
     assert marks.day2_allowance_non_pcd_mm == pytest.approx(expected_rate * non_pcd_loans_mm)
 
 
+def test_net_dta_on_marks_nets_against_the_eliminated_allowances_own_dta():
+    # The target's existing allowance already carries its own DTA (not separately itemized,
+    # sitting inside target.other_assets_mm); eliminating that allowance reverses that DTA too,
+    # so the net DTA on the credit mark must be computed against the DIFFERENCE between the
+    # mark and the eliminated allowance, not the mark alone.
+    target = _target()
+    config = _deal_config(
+        credit_mark=CreditMarkConfig(credit_mark_pct=0.03, pcd_share=0.3), tax_rate=0.25
+    )
+    marks = compute_fair_value_marks(
+        target, target_gross_loans_mm=1000.0, target_existing_allowance_mm=20.0, config=config
+    )
+    # credit_mark_total = -30.0 (3% of 1000); net_dta = -(credit_mark + allowance) * tax_rate
+    # = -(-30.0 + 20.0) * 0.25 = 2.5
+    assert marks.credit_mark_total_mm == pytest.approx(-30.0)
+    assert marks.net_dta_on_marks_mm == pytest.approx(2.5)
+
+
+def test_net_dta_on_marks_turns_negative_when_mark_is_smaller_than_eliminated_allowance():
+    # A credit mark SMALLER than the allowance being eliminated releases more DTA than it
+    # creates -- a net DTL, not a DTA (confirmed via the sign flip).
+    target = _target()
+    config = _deal_config(credit_mark=CreditMarkConfig(credit_mark_pct=0.01, pcd_share=0.0))
+    marks = compute_fair_value_marks(
+        target, target_gross_loans_mm=1000.0, target_existing_allowance_mm=30.0, config=config
+    )
+    # credit_mark_total = -10.0; net_dta = -(-10.0 + 30.0) * 0.25 = -5.0
+    assert marks.net_dta_on_marks_mm == pytest.approx(-5.0)
+
+
 def test_cdi_net_of_dtl():
     target = _target(deposits_mm=1200.0)
     config = _deal_config(cdi=CdiConfig(cdi_pct_of_core_deposits=0.025), tax_rate=0.25)
@@ -132,7 +167,12 @@ def test_cdi_net_of_dtl():
 def test_goodwill_equals_consideration_minus_fair_value_of_net_assets_exactly():
     target = _target()
     config = _deal_config(
-        consideration=ConsiderationConfig(price_to_tbv=1.4, stock_pct=0.7),
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.4,
+            stock_pct=0.7,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        ),
         rate_mark=RateMarkConfig(rate_mark_pct=-0.01),
         securities_mark=SecuritiesMarkConfig(securities_mark_pct=-0.004),
     )
@@ -152,7 +192,12 @@ def test_zero_premium_zero_mark_zero_cdi_deal_produces_zero_goodwill():
     # assets acquired should exactly equal target's tangible book value, and goodwill zero.
     target = _target()
     config = _deal_config(
-        consideration=ConsiderationConfig(price_to_tbv=1.0, stock_pct=1.0),
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.0,
+            stock_pct=1.0,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        ),
         credit_mark=CreditMarkConfig(credit_mark_pct=0.0, pcd_share=0.0),
         cdi=CdiConfig(cdi_pct_of_core_deposits=0.0),
     )
@@ -171,9 +216,18 @@ def test_eliminating_a_nonzero_existing_allowance_with_no_offsetting_mark_raises
     # purchase (negative goodwill) in this edge case, not a bug: book net loans already
     # deducted the allowance, and a zero credit mark means "no further fair-value haircut is
     # needed," which is only consistent with loans being worth MORE than net book value.
+    # BUT the old allowance's own DTA (16.0 * 25% = 4.0) reverses out along with it, so the net
+    # economic benefit is only 16.0 - 4.0 = 12.0, not the full 16.0 -- see
+    # compute_fair_value_marks's net_dta_on_marks_mm (nets the new DTA against the eliminated
+    # allowance's old one).
     target = _target()
     config = _deal_config(
-        consideration=ConsiderationConfig(price_to_tbv=1.0, stock_pct=1.0),
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.0,
+            stock_pct=1.0,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        ),
         credit_mark=CreditMarkConfig(credit_mark_pct=0.0, pcd_share=0.0),
         cdi=CdiConfig(cdi_pct_of_core_deposits=0.0),
     )
@@ -182,16 +236,27 @@ def test_eliminating_a_nonzero_existing_allowance_with_no_offsetting_mark_raises
     )
     sources_and_uses = compute_sources_and_uses(target, marks, config)
 
-    assert sources_and_uses.goodwill_mm == pytest.approx(-16.0)
+    assert marks.net_dta_on_marks_mm == pytest.approx(-4.0)
+    assert sources_and_uses.goodwill_mm == pytest.approx(-12.0)
 
 
 def test_higher_price_produces_higher_goodwill():
     target = _target()
     low_price_config = _deal_config(
-        consideration=ConsiderationConfig(price_to_tbv=1.2, stock_pct=0.8)
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.2,
+            stock_pct=0.8,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        )
     )
     high_price_config = _deal_config(
-        consideration=ConsiderationConfig(price_to_tbv=1.8, stock_pct=0.8)
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.8,
+            stock_pct=0.8,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        )
     )
 
     marks_low = compute_fair_value_marks(target, 800.0, 16.0, low_price_config)

@@ -70,9 +70,11 @@ class FairValueMarks:
     cdi_dtl_mm: float  # positive: deferred tax liability on CDI (see module docstring)
     cdi_net_of_dtl_mm: float
 
-    net_dta_on_marks_mm: float  # positive if a net DTA (typical: net write-downs), negative if
-    # a net DTL (net write-ups) -- combined credit/rate/securities marks, NOT CDI (tracked
-    # separately above since corefin.bank.model's CET1 bridge reports it on its own line)
+    net_dta_on_marks_mm: float  # positive if a net DTA, negative if a net DTL -- combined
+    # credit/rate/securities marks NET OF the target's existing allowance's own DTA, which
+    # reverses when that allowance is eliminated (see compute_fair_value_marks). NOT CDI
+    # (tracked separately above since corefin.bank.model's CET1 bridge reports it on its own
+    # line).
 
 
 def compute_fair_value_marks(
@@ -105,8 +107,20 @@ def compute_fair_value_marks(
     cdi_dtl_mm = cdi_gross_mm * config.tax_rate
     cdi_net_of_dtl_mm = cdi_gross_mm - cdi_dtl_mm
 
-    net_dta_on_marks_mm = -(credit_mark_total_mm + rate_mark_mm + securities_mark_mm) * (
-        config.tax_rate
+    # The target's existing allowance already carries its OWN deferred tax asset (a loan-loss
+    # allowance is a book expense not yet tax-deductible until charge-off -- a classic
+    # deductible temporary difference) sitting inside target.other_assets_mm, not separately
+    # itemized in this simplified model. Eliminating that allowance at close (step 1, see
+    # module docstring) reverses that OLD DTA along with it; the credit mark then creates a
+    # NEW DTA on its own write-down. Netting the two (rather than adding a full new DTA on top
+    # of the old one still sitting in other_assets_mm, which would double the tax benefit) is
+    # equivalent to computing the new DTA on the DIFFERENCE between the credit mark and the
+    # eliminated allowance -- confirmed algebraically: -(credit_mark_total_mm +
+    # target_existing_allowance_mm) * tax_rate is exactly old_DTA removed plus new_DTA added,
+    # since old_DTA = target_existing_allowance_mm * tax_rate.
+    net_dta_on_marks_mm = (
+        -(credit_mark_total_mm + target_existing_allowance_mm + rate_mark_mm + securities_mark_mm)
+        * config.tax_rate
     )
 
     return FairValueMarks(
