@@ -136,7 +136,12 @@ def run_deal_model(
         acquirer_result, pro_forma_projection, sources_and_uses, config
     )
     acquirer_irr = compute_acquirer_irr(
-        acquirer_result, pro_forma_projection, sources_and_uses, config
+        acquirer_result,
+        pro_forma_projection,
+        sources_and_uses,
+        pro_forma_cet1_bridge.pro_forma_cet1_mm,
+        pro_forma_capital_ratios.pro_forma_rwa_mm,
+        config,
     )
 
     return DealResult(

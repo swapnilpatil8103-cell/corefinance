@@ -10,6 +10,9 @@ from corefin.ma.schema import (
     CreditMarkConfig,
     Day2AllowanceMethod,
     DealConfig,
+    DistributableCashMethod,
+    ExitMultipleBasis,
+    IrrConfig,
 )
 
 
@@ -85,3 +88,40 @@ def test_cdi_config_defaults_match_the_approved_plan():
     config = _deal_config()
     assert config.cdi.cdi_pct_of_core_deposits == pytest.approx(0.02)
     assert config.cdi.cdi_amortization_years == pytest.approx(10.0)
+
+
+def test_deal_config_defaults_horizon_to_5_years_of_quarters():
+    config = _deal_config()
+    assert config.deal_horizon_quarters == 20
+
+
+def test_deal_config_horizon_is_overridable():
+    config = _deal_config(deal_horizon_quarters=12)
+    assert config.deal_horizon_quarters == 12
+
+
+def test_irr_config_defaults_to_dividends_and_1x_price_to_tbv():
+    config = _deal_config()
+    assert config.irr.distributable_cash_method == DistributableCashMethod.DIVIDENDS
+    assert config.irr.exit_multiple_basis == ExitMultipleBasis.PRICE_TO_TBV
+    assert config.irr.exit_multiple == pytest.approx(1.0)
+
+
+def test_irr_config_excess_capital_method_requires_target_cet1_ratio():
+    with pytest.raises(ValidationError):
+        IrrConfig(
+            distributable_cash_method=DistributableCashMethod.EXCESS_CAPITAL_ABOVE_TARGET_CET1
+        )
+
+
+def test_irr_config_excess_capital_method_accepts_target_cet1_ratio():
+    config = IrrConfig(
+        distributable_cash_method=DistributableCashMethod.EXCESS_CAPITAL_ABOVE_TARGET_CET1,
+        target_cet1_ratio=0.10,
+    )
+    assert config.target_cet1_ratio == pytest.approx(0.10)
+
+
+def test_irr_config_exit_multiple_must_be_positive():
+    with pytest.raises(ValidationError):
+        IrrConfig(exit_multiple=0.0)

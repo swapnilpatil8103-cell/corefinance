@@ -11,6 +11,7 @@ import pytest
 from corefin.bank.model import run_bank_model
 from corefin.bank.schema import BankConfig, BankOpeningBalance
 from corefin.credit.interface import CreditLossProjection
+from corefin.ma.accretion import compute_irr_from_cash_flows
 from corefin.ma.model import run_deal_model
 from corefin.ma.schema import (
     CdiConfig,
@@ -18,6 +19,9 @@ from corefin.ma.schema import (
     CostSaveConfig,
     CreditMarkConfig,
     DealConfig,
+    DistributableCashMethod,
+    ExitMultipleBasis,
+    IrrConfig,
     RateMarkConfig,
     SecuritiesMarkConfig,
 )
@@ -222,7 +226,7 @@ def test_all_stock_zero_premium_zero_mark_zero_synergy_leaves_eps_and_tbv_unchan
     # EPS accretion/dilution at close (period 0) isn't meaningful (NaN by construction); check
     # year-1 instead -- should also be close to flat (no marks/synergies driving a difference).
     year1 = result.eps_accretion.annual()["Year 1"]
-    assert year1[2] == pytest.approx(0.0, abs=0.05)  # accretion_dilution_pct, small tolerance
+    assert year1.accretion_dilution_pct_gaap == pytest.approx(0.0, abs=0.05)  # small tolerance
     # for the combined entity's standalone earning power to roughly carry through
 
 
@@ -243,8 +247,12 @@ def test_higher_price_lowers_eps_accretion():
             acquirer_shares_outstanding_mm=50.0,
         )
     )
-    low_year1_accretion = low_price_result.eps_accretion.annual()["Year 1"][2]
-    high_year1_accretion = high_price_result.eps_accretion.annual()["Year 1"][2]
+    low_year1_accretion = low_price_result.eps_accretion.annual()[
+        "Year 1"
+    ].accretion_dilution_pct_gaap
+    high_year1_accretion = high_price_result.eps_accretion.annual()[
+        "Year 1"
+    ].accretion_dilution_pct_gaap
     assert high_year1_accretion < low_year1_accretion
 
 
@@ -312,3 +320,62 @@ def test_pro_forma_shares_outstanding_exceeds_acquirer_standalone_shares():
         > result.eps_accretion.new_shares_issued_mm
     )
     assert result.eps_accretion.new_shares_issued_mm > 0
+
+
+def test_irr_equals_discount_rate_when_price_equals_pv_of_its_cash_flows():
+    # the defining property of IRR: if CF[0] is priced at EXACTLY the present value of the
+    # other cash flows at rate r, NPV(r) = 0 by construction, so the solved IRR must equal r.
+    quarterly_rate = 0.025  # ~10.4% annualized
+    future_flows = np.array([8.0, 9.0, 10.0, 11.0 + 150.0])  # last includes a terminal value
+    price = sum(cf / (1.0 + quarterly_rate) ** (t + 1) for t, cf in enumerate(future_flows))
+    cash_flows = np.concatenate([[-price], future_flows])
+
+    irr = compute_irr_from_cash_flows(cash_flows)
+    expected_annual_irr = (1.0 + quarterly_rate) ** 4 - 1.0
+    assert irr == pytest.approx(expected_annual_irr, rel=1e-6)
+
+
+def test_acquirer_irr_with_excess_capital_distributable_cash_is_finite():
+    result = _run_deal(
+        irr=IrrConfig(
+            distributable_cash_method=DistributableCashMethod.EXCESS_CAPITAL_ABOVE_TARGET_CET1,
+            target_cet1_ratio=0.10,
+        )
+    )
+    assert np.isfinite(result.acquirer_irr)
+
+
+def test_acquirer_irr_with_forward_pe_exit_basis_is_finite():
+    result = _run_deal(
+        irr=IrrConfig(exit_multiple_basis=ExitMultipleBasis.FORWARD_PE, exit_multiple=10.0)
+    )
+    assert np.isfinite(result.acquirer_irr)
+
+
+def test_acquirer_irr_exit_multiple_scales_the_terminal_value_and_thus_the_irr():
+    low_multiple_result = _run_deal(irr=IrrConfig(exit_multiple=0.5))
+    high_multiple_result = _run_deal(irr=IrrConfig(exit_multiple=2.0))
+    # a bigger terminal value (higher exit multiple on the same underlying basis) can only
+    # raise or leave unchanged the IRR, never lower it -- all else held fixed
+    assert high_multiple_result.acquirer_irr >= low_multiple_result.acquirer_irr
+
+
+def test_tbv_earnback_label_reports_beyond_horizon_when_not_reached():
+    high_price_result = _run_deal(
+        consideration=ConsiderationConfig(
+            price_to_tbv=3.0,
+            stock_pct=0.8,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        )
+    )
+    assert high_price_result.tbv_earnback.earnback_period_index is None
+    assert high_price_result.tbv_earnback.earnback_label == "beyond horizon"
+
+
+def test_tbv_earnback_label_reports_years_and_quarter_when_reached():
+    result = _run_deal()
+    if result.tbv_earnback.earnback_period_index is not None:
+        label = result.tbv_earnback.earnback_label
+        assert "beyond horizon" not in label
+        assert "years" in label

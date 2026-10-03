@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Day2AllowanceMethod(StrEnum):
@@ -123,6 +123,69 @@ class CostSaveConfig(BaseModel):
     restructuring_charge_mm: float = Field(default=0.0, ge=0.0)
 
 
+class DistributableCashMethod(StrEnum):
+    """What counts as cash available to the acquirer's common shareholders
+    each post-close quarter, for `accretion.compute_acquirer_irr`'s
+    interim cash flows -- NOT the full net income available to common
+    (the original Stage 4 bug: counting ALL net income as an interim
+    flow AND the resulting retained tangible equity as a terminal value
+    double-counts the retained portion)."""
+
+    DIVIDENDS = "dividends"  # actual common dividends paid (BankConfig.dividend_payout_ratio)
+    EXCESS_CAPITAL_ABOVE_TARGET_CET1 = "excess_capital_above_target_cet1"  # see
+    # accretion._distributable_cash_above_target_mm
+
+
+class ExitMultipleBasis(StrEnum):
+    """What `IrrConfig.exit_multiple` is applied to, to produce
+    `compute_acquirer_irr`'s terminal value (added to the LAST interim
+    cash flow) -- the value of whatever wasn't already paid out as
+    distributable cash during the horizon."""
+
+    FORWARD_PE = "forward_pe"  # exit_multiple x the deal's INCREMENTAL net income available to
+    # common over the horizon's final 4 quarters (annualized "forward earnings")
+    PRICE_TO_TBV = "price_to_tbv"  # exit_multiple x the deal's INCREMENTAL tangible common
+    # equity at the end of the horizon
+
+
+class IrrConfig(BaseModel):
+    """`accretion.compute_acquirer_irr`'s interim-cash-flow and terminal-
+    value assumptions. `exit_multiple` defaults to 1.0x `PRICE_TO_TBV` --
+    a NEUTRAL default (no assumed multiple expansion/contraction versus
+    book value), matching this module's original (pre-fix) implicit
+    behavior as a default, not a realistic market assumption: override
+    with an actual market multiple for a real IRR estimate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    distributable_cash_method: DistributableCashMethod = DistributableCashMethod.DIVIDENDS
+    target_cet1_ratio: float | None = Field(
+        default=None,
+        gt=0.0,
+        lt=1.0,
+        description="Required when distributable_cash_method is "
+        "excess_capital_above_target_cet1; the CET1 ratio the acquirer/pro forma entity "
+        "retains earnings to maintain, distributing everything generated above it. RWA is "
+        "held flat at its close-date level for this calculation -- this project doesn't "
+        "project RWA growth beyond close (see corefin.ma.capital's own module docstring).",
+    )
+    exit_multiple_basis: ExitMultipleBasis = ExitMultipleBasis.PRICE_TO_TBV
+    exit_multiple: float = Field(default=1.0, gt=0.0)
+
+    @model_validator(mode="after")
+    def _require_target_cet1_ratio_for_excess_capital(self) -> IrrConfig:
+        if (
+            self.distributable_cash_method
+            == DistributableCashMethod.EXCESS_CAPITAL_ABOVE_TARGET_CET1
+            and self.target_cet1_ratio is None
+        ):
+            raise ValueError(
+                "target_cet1_ratio is required when distributable_cash_method is "
+                "excess_capital_above_target_cet1"
+            )
+        return self
+
+
 class DealConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -132,4 +195,15 @@ class DealConfig(BaseModel):
     securities_mark: SecuritiesMarkConfig = Field(default_factory=SecuritiesMarkConfig)
     cdi: CdiConfig = Field(default_factory=CdiConfig)
     cost_saves: CostSaveConfig = Field(default_factory=CostSaveConfig)
+    irr: IrrConfig = Field(default_factory=IrrConfig)
     tax_rate: float = Field(default=0.25, ge=0.0, lt=1.0)
+    deal_horizon_quarters: int = Field(
+        default=20,
+        gt=0,
+        description="Stage 4 deal economics (EPS accretion, TBV earnback, IRR) run over their "
+        "OWN horizon -- default 5 years (20 post-close quarters) -- separate from whatever "
+        "shorter or longer horizon a credit-engine scenario natively covers. See "
+        "corefin.ma.horizon.build_deal_horizon_bank_result, which extends each bank's "
+        "CreditLossProjection to this length before corefin.bank.model.run_bank_model builds "
+        "the BankModelResult that run_deal_model consumes.",
+    )

@@ -36,7 +36,20 @@ DEAL-SPECIFIC ADJUSTMENTS, each a quarterly schedule over periods 1..n-1
   - ONE-TIME CHARGES (Day-2 non-PCD allowance + restructuring charge,
     both pretax): hit ONLY quarter 1 (the first full quarter after
     close), not spread across the horizon -- a real GAAP income-
-    statement event in the quarter immediately following close."""
+    statement event in the quarter immediately following close.
+
+THREE NET-INCOME-AVAILABLE-TO-COMMON VIEWS, so it's clear how much of
+any EPS accretion is accounting vs economics: (a) GAAP
+(`net_income_available_to_common_mm`) -- everything above, as actually
+reported. (b) excluding one-time charges
+(`..._excl_one_time_mm`) -- adds back the Day-2/restructuring charges,
+since they're real but NON-RECURRING (a GAAP timing effect, not an
+ongoing economic one). (c) ALSO excluding loan mark accretion and CDI
+amortization (`..._excl_one_time_and_marks_mm`) -- further strips the
+two purchase-accounting non-cash items that unwind over their own
+amortization lives, leaving just cost saves minus foregone interest on
+top of the two banks' combined standalone earnings: the "cash/economic"
+view of the deal."""
 
 from __future__ import annotations
 
@@ -72,8 +85,18 @@ class ProFormaProjection:
     tax_expense_mm: np.ndarray
     net_income_mm: np.ndarray
     preferred_dividends_mm: np.ndarray
-    net_income_available_to_common_mm: np.ndarray
+    net_income_available_to_common_mm: np.ndarray  # GAAP -- view (a), see module docstring
     dividends_mm: np.ndarray
+
+    # view (b): GAAP excluding one-time Day-2/restructuring charges
+    pretax_income_excl_one_time_mm: np.ndarray
+    net_income_excl_one_time_mm: np.ndarray
+    net_income_available_to_common_excl_one_time_mm: np.ndarray
+
+    # view (c): (b) ALSO excluding loan mark accretion and CDI amortization
+    pretax_income_excl_one_time_and_marks_mm: np.ndarray
+    net_income_excl_one_time_and_marks_mm: np.ndarray
+    net_income_available_to_common_excl_one_time_and_marks_mm: np.ndarray
 
     equity_mm: np.ndarray
     goodwill_mm: np.ndarray
@@ -94,6 +117,12 @@ class ProFormaProjection:
             "preferred_dividends_mm",
             "net_income_available_to_common_mm",
             "dividends_mm",
+            "pretax_income_excl_one_time_mm",
+            "net_income_excl_one_time_mm",
+            "net_income_available_to_common_excl_one_time_mm",
+            "pretax_income_excl_one_time_and_marks_mm",
+            "net_income_excl_one_time_and_marks_mm",
+            "net_income_available_to_common_excl_one_time_and_marks_mm",
             "equity_mm",
             "goodwill_mm",
             "other_intangibles_mm",
@@ -192,6 +221,29 @@ def compute_pro_forma_projection(
         list(acquirer_result.income_statement.preferred_dividends_mm[1:])
     )
     net_income_available_to_common_mm = net_income_mm - preferred_dividends_mm
+
+    # view (b): add back the one-time Day-2/restructuring charges (see module docstring)
+    pretax_income_excl_one_time_mm = pretax_income_mm + one_time_charges_pretax_mm
+    tax_expense_excl_one_time_mm = np.maximum(pretax_income_excl_one_time_mm, 0.0) * config.tax_rate
+    net_income_excl_one_time_mm = pretax_income_excl_one_time_mm - tax_expense_excl_one_time_mm
+    net_income_available_to_common_excl_one_time_mm = (
+        net_income_excl_one_time_mm - preferred_dividends_mm
+    )
+
+    # view (c): (b) ALSO stripped of the mark-accretion reversal and CDI amortization
+    pretax_income_excl_one_time_and_marks_mm = (
+        pretax_income_excl_one_time_mm - mark_accretion_mm + cdi_amortization_mm
+    )
+    tax_expense_excl_one_time_and_marks_mm = (
+        np.maximum(pretax_income_excl_one_time_and_marks_mm, 0.0) * config.tax_rate
+    )
+    net_income_excl_one_time_and_marks_mm = (
+        pretax_income_excl_one_time_and_marks_mm - tax_expense_excl_one_time_and_marks_mm
+    )
+    net_income_available_to_common_excl_one_time_and_marks_mm = (
+        net_income_excl_one_time_and_marks_mm - preferred_dividends_mm
+    )
+
     dividends_mm = (
         np.maximum(net_income_available_to_common_mm, 0.0)
         * acquirer_bank_config.dividend_payout_ratio
@@ -221,6 +273,16 @@ def compute_pro_forma_projection(
         preferred_dividends_mm=preferred_dividends_mm,
         net_income_available_to_common_mm=net_income_available_to_common_mm,
         dividends_mm=dividends_mm,
+        pretax_income_excl_one_time_mm=pretax_income_excl_one_time_mm,
+        net_income_excl_one_time_mm=net_income_excl_one_time_mm,
+        net_income_available_to_common_excl_one_time_mm=(
+            net_income_available_to_common_excl_one_time_mm
+        ),
+        pretax_income_excl_one_time_and_marks_mm=pretax_income_excl_one_time_and_marks_mm,
+        net_income_excl_one_time_and_marks_mm=net_income_excl_one_time_and_marks_mm,
+        net_income_available_to_common_excl_one_time_and_marks_mm=(
+            net_income_available_to_common_excl_one_time_and_marks_mm
+        ),
         equity_mm=equity_mm,
         goodwill_mm=goodwill_mm,
         other_intangibles_mm=other_intangibles_mm,

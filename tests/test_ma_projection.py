@@ -256,6 +256,110 @@ def test_one_time_charges_hit_only_period_one():
     assert np.allclose(np.delete(projection.one_time_charges_pretax_mm, 1), 0.0)
 
 
+def test_excl_one_time_view_adds_back_only_the_one_time_charges():
+    acquirer_opening = _balanced_opening("Acquirer Bank A", "111", "222", net_loans_mm=2000.0)
+    target_opening = _balanced_opening(
+        "Target Bank B",
+        "333",
+        "444",
+        net_loans_mm=784.0,
+        equity_mm=400.0,
+        deposits_mm=1200.0,
+        borrowings_mm=50.0,
+        other_liabilities_mm=20.0,
+        securities_mm=200.0,
+        other_assets_mm=40.0,
+    )
+    acquirer_result = _run_bank(acquirer_opening, 2000.0)
+    target_result = _run_bank(target_opening, 784.0)
+
+    from corefin.ma.schema import CostSaveConfig
+
+    config = _deal_config(cost_saves=CostSaveConfig(restructuring_charge_mm=5.0))
+    marks = compute_fair_value_marks(target_opening, 800.0, 16.0, config)
+    sources_and_uses = compute_sources_and_uses(target_opening, marks, config)
+
+    projection = compute_pro_forma_projection(
+        acquirer_result=acquirer_result,
+        target_result=target_result,
+        marks=marks,
+        sources_and_uses=sources_and_uses,
+        pro_forma_equity_at_close_mm=1000.0,
+        pro_forma_goodwill_at_close_mm=100.0,
+        pro_forma_other_intangibles_at_close_mm=50.0,
+        acquirer_bank_config=BankConfig(),
+        config=config,
+    )
+
+    # period 1 carries the one-time charge -- excl_one_time's pretax income should be exactly
+    # that charge higher than GAAP's, and equal elsewhere (no one-time charge outside period 1)
+    one_time = projection.one_time_charges_pretax_mm
+    assert np.allclose(
+        projection.pretax_income_excl_one_time_mm - projection.pretax_income_mm, one_time
+    )
+    # GAAP EPS-relevant net income available to common must be LOWER than the excl-one-time
+    # view in the period the charge hits (a real, nonzero charge, pretax_income > 0 either way)
+    assert (
+        projection.net_income_available_to_common_excl_one_time_mm[1]
+        > projection.net_income_available_to_common_mm[1]
+    )
+    # and identical in every other period
+    other_periods = np.delete(np.arange(len(one_time)), 1)
+    assert np.allclose(
+        projection.net_income_available_to_common_excl_one_time_mm[other_periods],
+        projection.net_income_available_to_common_mm[other_periods],
+    )
+
+
+def test_excl_one_time_and_marks_view_also_strips_mark_accretion_and_cdi():
+    acquirer_opening = _balanced_opening("Acquirer Bank A", "111", "222", net_loans_mm=2000.0)
+    target_opening = _balanced_opening(
+        "Target Bank B",
+        "333",
+        "444",
+        net_loans_mm=784.0,
+        equity_mm=400.0,
+        deposits_mm=1200.0,
+        borrowings_mm=50.0,
+        other_liabilities_mm=20.0,
+        securities_mm=200.0,
+        other_assets_mm=40.0,
+    )
+    acquirer_result = _run_bank(acquirer_opening, 2000.0)
+    target_result = _run_bank(target_opening, 784.0)
+
+    config = _deal_config(
+        rate_mark=RateMarkConfig(rate_mark_pct=-0.02, rate_mark_life_years=2.0),
+        cdi=CdiConfig(cdi_pct_of_core_deposits=0.02, cdi_amortization_years=2.0),
+    )
+    marks = compute_fair_value_marks(target_opening, 800.0, 16.0, config)
+    sources_and_uses = compute_sources_and_uses(target_opening, marks, config)
+
+    projection = compute_pro_forma_projection(
+        acquirer_result=acquirer_result,
+        target_result=target_result,
+        marks=marks,
+        sources_and_uses=sources_and_uses,
+        pro_forma_equity_at_close_mm=1000.0,
+        pro_forma_goodwill_at_close_mm=100.0,
+        pro_forma_other_intangibles_at_close_mm=50.0 + marks.cdi_gross_mm,
+        acquirer_bank_config=BankConfig(),
+        config=config,
+    )
+
+    # view (c) = view (b) minus mark accretion plus CDI amortization, exactly
+    expected = (
+        projection.pretax_income_excl_one_time_mm
+        - projection.mark_accretion_mm
+        + projection.cdi_amortization_mm
+    )
+    assert np.allclose(projection.pretax_income_excl_one_time_and_marks_mm, expected)
+    # at period 0 all three views agree (no post-close flow yet)
+    assert projection.net_income_available_to_common_excl_one_time_and_marks_mm[0] == pytest.approx(
+        projection.net_income_available_to_common_mm[0]
+    )
+
+
 def test_net_income_available_to_common_is_zero_at_close():
     acquirer_opening = _balanced_opening("Acquirer Bank A", "111", "222", net_loans_mm=2000.0)
     target_opening = _balanced_opening(
