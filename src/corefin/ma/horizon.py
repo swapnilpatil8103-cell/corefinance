@@ -116,3 +116,66 @@ def build_deal_horizon_bank_result(
     n_periods = deal_horizon_quarters + 1
     extended = extend_credit_loss_projection(credit_projection, n_periods)
     return run_bank_model(opening, extended, bank_config, extended.timeline)
+
+
+def truncate_credit_loss_projection(
+    projection: CreditLossProjection, n_periods: int
+) -> CreditLossProjection:
+    """The inverse of `extend_credit_loss_projection`: returns `projection`
+    sliced down to its first `n_periods` periods (including the jump-off
+    quarter) -- e.g. the Fed's own 9-quarter DFAST reporting window
+    (`credit.projection.FED_COMPARISON_QUARTERS`), which Stage 5's stress
+    test uses and which is often SHORTER than this project's own native
+    scenario horizon. Returns `projection` unchanged if it already has
+    exactly `n_periods`. Raises `ValueError` if `n_periods` exceeds
+    `projection`'s own horizon -- use `extend_credit_loss_projection` to
+    go the other way."""
+    original_n = projection.timeline.n_periods
+    if n_periods == original_n:
+        return projection
+    if n_periods > original_n:
+        raise ValueError(
+            f"n_periods ({n_periods}) exceeds projection's own horizon ({original_n}) -- "
+            "truncate_credit_loss_projection only truncates; use extend_credit_loss_projection "
+            "to lengthen instead"
+        )
+
+    n_historical = int(np.sum(~projection.timeline.is_projection[:n_periods]))
+    truncated_timeline = Timeline.quarterly(
+        n_periods=n_periods,
+        n_historical=n_historical,
+        start_year=projection.timeline.start_year,
+        start_quarter=projection.timeline.start_quarter,
+    )
+    return CreditLossProjection(
+        timeline=truncated_timeline,
+        categories=projection.categories,
+        scenario_name=projection.scenario_name,
+        bank_identifier=projection.bank_identifier,
+        balance_mm=projection.balance_mm[:, :n_periods],
+        net_charge_off_mm=projection.net_charge_off_mm[:, :n_periods],
+        provision_expense_mm=projection.provision_expense_mm[:, :n_periods],
+        allowance_mm=projection.allowance_mm[:, :n_periods],
+        npl_mm=projection.npl_mm[:, :n_periods],
+        nco_rate=projection.nco_rate[:, :n_periods],
+        npl_ratio=projection.npl_ratio[:, :n_periods],
+        monte_carlo_mean=projection.monte_carlo_mean,
+        monte_carlo_percentiles=projection.monte_carlo_percentiles,
+    )
+
+
+def build_stress_bank_result(
+    opening: BankOpeningBalance,
+    credit_projection: CreditLossProjection,
+    bank_config: BankConfig,
+    n_quarters: int,
+) -> BankModelResult:
+    """Convenience wrapper, the stress-test counterpart to
+    `build_deal_horizon_bank_result`: truncates `credit_projection` to
+    `n_quarters` PROJECTED quarters (`n_quarters + 1` periods, including
+    the jump-off quarter -- e.g. `credit.projection.
+    FED_COMPARISON_QUARTERS` for the Fed's own 9-quarter DFAST window)
+    if it's longer, then reruns `run_bank_model` over that horizon."""
+    n_periods = n_quarters + 1
+    truncated = truncate_credit_loss_projection(credit_projection, n_periods)
+    return run_bank_model(opening, truncated, bank_config, truncated.timeline)

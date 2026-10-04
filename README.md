@@ -1191,6 +1191,40 @@ own largest banks carrying more concentrated risk than this project's
 full industry-wide panel averages to, but not fully disentangled from a
 residual scenario-severity difference.
 
+## Bank M&A CET1 & Accretion Simulator
+
+Project #2: purchase accounting at deal close (goodwill, PCD/Day-2
+allowance, the pro forma CET1/Tier 1 leverage/total capital bridge) and
+Stage 4 deal economics (EPS accretion/dilution in three views, TBV per
+share dilution/earnback, acquirer IRR) for a two-bank merger, consuming
+each bank's own standalone statement model (`corefin.bank`) and the
+Credit-Loss Forecasting Engine's `CreditLossProjection` (above) for
+provision/allowance. Real two-bank example in
+`configs/example_bank_deal.yaml` (illustrative deal terms only, never a
+real announced transaction) -- run it with
+`corefin ma run --config configs/example_bank_deal.yaml` (needs the same
+locally-fetched FFIEC/FR Y-9C/credit-engine files the rest of this
+project's real-data workflows do; see `corefin/ma/cli.py`'s own module
+docstring). A fuller CLI (Excel export, charts) and this section's own
+expanded write-up are Stage 7, queued.
+
+**A finding worth flagging explicitly**, surfaced by `corefin ma run`'s
+own realized-vs-projected NCO rate report: the real example deal's
+acquirer bank has a realized (recent, actual) NCO rate of only ~0.03%,
+while the Fed's baseline scenario's own projected rate for it is ~0.35%
+-- roughly 10x higher. This is NOT a bug (see `credit/projection.py`'s
+`compute_bank_relative_level`/bank-relative-scaling fix, which exists
+precisely to make a bank's OWN historical level drive its projection
+rather than the raw industry rate, and which still reports this real
+gap rather than hiding it): it reflects a genuinely benign recent loss
+history for this specific bank against an economy-wide baseline
+scenario that assumes a materially worse environment going forward.
+Every Stage 4 earnings figure for the real example deal is built on
+that elevated baseline provision level, so they should be read as
+CONSERVATIVE relative to a simple extrapolation of this bank's own
+recent experience, not as this project's own best-guess "expected"
+case.
+
 ## Testing conventions
 
 - `pytest.mark.slow` is excluded by default (`addopts = "-m 'not slow'"` in

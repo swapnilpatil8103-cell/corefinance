@@ -11,7 +11,12 @@ import pytest
 
 from corefin.bank.schema import BankConfig, BankOpeningBalance
 from corefin.credit.interface import CreditLossProjection
-from corefin.ma.horizon import build_deal_horizon_bank_result, extend_credit_loss_projection
+from corefin.ma.horizon import (
+    build_deal_horizon_bank_result,
+    build_stress_bank_result,
+    extend_credit_loss_projection,
+    truncate_credit_loss_projection,
+)
 from corefin.timeline import Timeline
 
 _TIMELINE = Timeline.quarterly(5, n_historical=1, start_year=2025, start_quarter=4)
@@ -127,4 +132,37 @@ def test_build_deal_horizon_bank_result_rebuilds_over_the_requested_horizon():
     assert result.income_statement.timeline.n_periods == 9
     assert result.balance_sheet.timeline.n_periods == 9
     # period-0 (jump-off) figures are unaffected by the horizon extension
+    assert result.capital.cet1_capital_mm[0] == pytest.approx(opening.reported_cet1_capital_mm)
+
+
+def test_truncate_is_a_no_op_when_n_periods_already_matches():
+    projection = _projection([0.0, 0.02, 0.03, 0.025, 0.02], [0.0, 20.0, 25.0, 23.0, 20.0])
+    truncated = truncate_credit_loss_projection(projection, 5)
+    assert truncated is projection
+
+
+def test_truncate_raises_when_n_periods_is_longer():
+    projection = _projection([0.0, 0.02, 0.03, 0.025, 0.02], [0.0, 20.0, 25.0, 23.0, 20.0])
+    with pytest.raises(ValueError):
+        truncate_credit_loss_projection(projection, 7)
+
+
+def test_truncate_slices_every_array_and_keeps_the_timeline_convention():
+    projection = _projection([0.0, 0.02, 0.03, 0.025, 0.02], [0.0, 20.0, 25.0, 23.0, 20.0])
+    truncated = truncate_credit_loss_projection(projection, 3)
+
+    assert truncated.timeline.n_periods == 3
+    assert truncated.timeline.start_year == 2025
+    assert truncated.timeline.start_quarter == 4
+    assert np.sum(~truncated.timeline.is_projection) == 1  # jump-off only
+    assert np.allclose(truncated.nco_rate, projection.nco_rate[:, :3])
+    assert np.allclose(truncated.allowance_mm, projection.allowance_mm[:, :3])
+    assert np.allclose(truncated.balance_mm, projection.balance_mm[:, :3])
+
+
+def test_build_stress_bank_result_rebuilds_over_the_requested_horizon():
+    opening = _opening()
+    projection = _projection([0.0, 0.02, 0.03, 0.025, 0.02], [0.0, 20.0, 25.0, 23.0, 20.0])
+    result = build_stress_bank_result(opening, projection, BankConfig(), n_quarters=3)
+    assert result.income_statement.timeline.n_periods == 4
     assert result.capital.cet1_capital_mm[0] == pytest.approx(opening.reported_cet1_capital_mm)

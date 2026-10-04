@@ -66,6 +66,16 @@ except ImportError:
     # the core install.
     pass
 
+try:
+    from corefin.ma.cli import app as ma_app
+
+    app.add_typer(ma_app, name="ma")
+except ImportError:
+    # corefin.ma.cli imports corefin.credit.interface (the credit engine
+    # it builds each bank's CreditLossProjection from), so it needs the
+    # same corefin[fig] extra -- same reasoning as `credit` above.
+    pass
+
 
 @app.command()
 def version() -> None:

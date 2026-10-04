@@ -1,0 +1,48 @@
+# Illustrative example deal for Project #2 (the Bank M&A CET1 & Accretion
+# Simulator). ALL deal terms below are ILLUSTRATIVE assumptions chosen to
+# exercise the model end to end -- NOT a real announced transaction, NOT
+# derived from any market pricing, and NOT investment advice. The two real
+# banks this example is built from (identified below only by RSSD ID, for
+# `corefin ma run` to fetch their real Call Report / FR Y-9C financials) are
+# never named in any committed output anywhere in this project -- they are
+# always reported generically as "Acquirer Bank A" / "Target Bank B".
+#
+# Run with: corefin ma run --config configs/example_bank_deal.yaml
+# (needs the same locally-fetched real data files every other real-data
+# workflow in this project does -- see ma/cli.py's own module docstring.)
+#
+# Units: dollar amounts are $mm; rates/percentages/shares are decimal
+# fractions (0.02, not 2); multiples are bare floats (1.5, not "1.5x").
+
+acquirer:
+  label: "Acquirer Bank A"
+  bank_id: "34537" # Call Report RSSD ID (bank subsidiary)
+  hc_rssd_id: "1085013" # FR Y-9C RSSD ID (holding company)
+
+target:
+  label: "Target Bank B"
+  bank_id: "876634"
+  hc_rssd_id: "1085509"
+
+deal:
+  consideration:
+    price_to_tbv: 1.5 # ILLUSTRATIVE: 1.5x the target's tangible common book value
+    stock_pct: 1.0 # 100% stock consideration -- no cash
+    # ILLUSTRATIVE capitalization inputs (never scraped market data) -- needed to turn the
+    # stock consideration's dollar value into a share count for EPS/TBV-per-share/IRR.
+    acquirer_share_price: 35.0
+    acquirer_shares_outstanding_mm: 55.0
+    target_shares_outstanding_mm: 28.0 # for the reported exchange ratio only
+  credit_mark:
+    credit_mark_pct: 0.02 # 2% blanket fair-value credit mark on the target's gross loans
+    pcd_share: 0.15 # 15% of the credit mark attributed to purchased-credit-deteriorated loans
+  cdi:
+    cdi_pct_of_core_deposits: 0.015 # 1.5% core deposit intangible
+  cost_saves:
+    cost_save_pct_of_target_noninterest_expense: 0.25 # 25% of the target's noninterest expense
+    phase_in_year1_pct: 0.5 # half phased in during year 1 (quarters 1-4), full thereafter
+    restructuring_charge_mm: 40.0 # one-time restructuring charge, hits the quarter after close
+  irr:
+    exit_multiple_basis: price_to_tbv
+    exit_multiple: 1.5 # ILLUSTRATIVE base case -- `corefin ma run` reports a 1.0x-2.0x range too
+  deal_horizon_quarters: 20 # 5 years post-close, for EPS accretion / TBV earnback / IRR
