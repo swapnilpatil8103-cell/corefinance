@@ -1225,6 +1225,22 @@ CONSERVATIVE relative to a simple extrapolation of this bank's own
 recent experience, not as this project's own best-guess "expected"
 case.
 
+**A caveat on the calibrated NIM beta** (`corefin.bank.ppnr.
+calibrate_nim_beta`, Stage 5's PPNR stress): it's calibrated on
+2020Q1-2021Q4, the one real episode in this project's own cached data
+where short-term rates collapsed the way the Fed's severely-adverse
+scenario assumes. That window's margin compression wasn't driven by
+rates ALONE, though -- it coincided with the pandemic-era deposit
+surge (a flood of low-cost/non-interest-bearing deposits diluting
+yield on earning assets) and PPP loan originations (near-zero-rate,
+federally guaranteed loans that depressed loan yields independent of
+the Fed's own benchmark rate). Both likely inflate the MEASURED
+NIM-to-rate sensitivity beyond what a rate move alone would cause, so
+the calibrated beta probably OVERSTATES this specific channel's true
+rate sensitivity -- `corefin ma run` reports each bank's own calibrated
+beta next to the illustrative default so this can be judged directly,
+not hidden behind a single number.
+
 ## Testing conventions
 
 - `pytest.mark.slow` is excluded by default (`addopts = "-m 'not slow'"` in

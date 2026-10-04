@@ -425,9 +425,12 @@ def run(
         if calibration is not None and calibration.nim_beta is not None:
             typer.echo(
                 f"{identity.label}: calibrated NIM beta = {calibration.nim_beta:+.3f} "
-                f"(realized NIM {calibration.start_nim:.4%} -> {calibration.end_nim:.4%} vs. "
-                f"realized rate change {calibration.realized_rate_change_pp:+.2f}pp, "
-                f"{calibration.start_quarter}-{calibration.end_quarter})"
+                f"(illustrative default: {DEFAULT_NIM_BETA:+.3f}) -- realized NIM "
+                f"{calibration.start_nim:.4%} -> {calibration.end_nim:.4%} vs. realized rate "
+                f"change {calibration.realized_rate_change_pp:+.2f}pp, "
+                f"{calibration.start_quarter}-{calibration.end_quarter}. CAVEAT: calibrated on "
+                "2020Q1-2021Q4, when margins also moved from the deposit surge and PPP loans, "
+                "not rates alone -- likely overstates true rate sensitivity (see README)."
             )
         else:
             typer.echo(
