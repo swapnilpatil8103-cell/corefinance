@@ -59,49 +59,13 @@ def test_lifetime_expected_loss_rate_raises_if_quarter_not_in_path():
         projection.lifetime_expected_loss_rate(path, pd.Period("2027Q1", freq="Q"), 4)
 
 
-def test_backward_looking_lifetime_expected_loss_rate_scales_the_mean_rate_by_wal_years():
-    quarters = _quarters("2025Q1", 4)
-    path = pd.Series([0.01, 0.02, 0.03, 0.04], index=quarters)
-    rate = projection.backward_looking_lifetime_expected_loss_rate(
-        path, pd.Period("2025Q4", freq="Q"), 4
-    )
-    assert rate == pytest.approx((0.01 + 0.02 + 0.03 + 0.04) / 4 * (4 / 4))
-
-
-def test_backward_looking_lifetime_expected_loss_rate_uses_whatever_history_exists():
-    # Only 2 quarters of real history exist even though wal_quarters=4 --
-    # average over what's actually there, don't invent data for the rest.
-    # Scaling still uses the FULL wal_quarters (the lifetime horizon
-    # doesn't shrink just because less history happens to be available).
-    quarters = _quarters("2025Q3", 2)
-    path = pd.Series([0.02, 0.06], index=quarters)
-    rate = projection.backward_looking_lifetime_expected_loss_rate(
-        path, pd.Period("2025Q4", freq="Q"), 4
-    )
-    assert rate == pytest.approx((0.02 + 0.06) / 2 * (4 / 4))
-
-
-def test_backward_looking_lifetime_expected_loss_rate_is_floored_at_zero():
-    quarters = _quarters("2025Q1", 4)
-    path = pd.Series([-0.02, -0.03, -0.01, -0.02], index=quarters)
-    rate = projection.backward_looking_lifetime_expected_loss_rate(
-        path, pd.Period("2025Q4", freq="Q"), 4
-    )
-    assert rate == 0.0
-
-
-def test_backward_looking_lifetime_expected_loss_rate_raises_with_no_history():
-    path = pd.Series([0.02], index=_quarters("2020Q1", 1))
-    with pytest.raises(ValueError, match="no realized data"):
-        projection.backward_looking_lifetime_expected_loss_rate(
-            path, pd.Period("2025Q4", freq="Q"), 4
-        )
-
-
 # --------------------------------------------------------- CECL projection ---
 
 
-def test_build_cecl_projection_jump_off_row_uses_backward_looking_rate():
+def test_build_cecl_projection_jump_off_row_uses_the_forward_looking_basis():
+    # The jump-off rate must now be computed the SAME way (lifetime_expected_loss_rate) as
+    # every projected quarter's -- forward-looking from a window starting AT the jump-off
+    # quarter, seeded by the realized rate's own single value there (not a backward average).
     realized = pd.Series([0.01, 0.02, 0.03, 0.04], index=_quarters("2025Q1", 4))
     projected = pd.Series([0.05], index=_quarters("2026Q1", 1))
     result = projection.build_cecl_projection(
@@ -109,13 +73,21 @@ def test_build_cecl_projection_jump_off_row_uses_backward_looking_rate():
     )
     jump_off = result.loc[pd.Period("2025Q4", freq="Q")]
     wal = projection.CATEGORY_WEIGHTED_AVERAGE_LIFE_QUARTERS["credit_card"]
-    expected_rate = projection.backward_looking_lifetime_expected_loss_rate(
-        realized, pd.Period("2025Q4", freq="Q"), wal
+    forward_basis = pd.concat([pd.Series([0.04], index=_quarters("2025Q4", 1)), projected])
+    expected_rate = projection.lifetime_expected_loss_rate(
+        forward_basis, pd.Period("2025Q4", freq="Q"), wal
     )
     assert jump_off["lifetime_expected_loss_rate"] == pytest.approx(expected_rate)
     assert jump_off["allowance_required"] == pytest.approx(1_000.0 * expected_rate)
     assert pd.isna(jump_off["net_charge_off"])
     assert pd.isna(jump_off["provision_expense"])
+
+
+def test_build_cecl_projection_raises_without_a_realized_value_at_jump_off():
+    realized = pd.Series([0.01, 0.02, float("nan")], index=_quarters("2025Q2", 3))
+    projected = pd.Series([0.05], index=_quarters("2026Q1", 1))
+    with pytest.raises(ValueError, match="jump-off quarter"):
+        projection.build_cecl_projection(realized, projected, "auto", starting_balance=1_000.0)
 
 
 def test_build_cecl_projection_rejects_projected_path_including_jump_off():
@@ -142,9 +114,7 @@ def test_build_cecl_projection_provision_follows_the_rollforward_identity():
 def test_build_cecl_projection_net_charge_off_is_quarterly_not_annualized():
     realized = pd.Series([0.02], index=_quarters("2025Q4", 1))
     projected = pd.Series([0.08], index=_quarters("2026Q1", 1))  # 8% annualized
-    result = projection.build_cecl_projection(
-        realized, projected, "auto", starting_balance=1_000.0
-    )
+    result = projection.build_cecl_projection(realized, projected, "auto", starting_balance=1_000.0)
     row = result.loc[pd.Period("2026Q1", freq="Q")]
     assert row["net_charge_off"] == pytest.approx((0.08 / 4.0) * 1_000.0)
 
@@ -286,9 +256,7 @@ def test_project_category_nco_rate_truncates_long_history_that_overlaps_the_scen
     # extend long_rate 2 quarters PAST macro_history's own last quarter,
     # overlapping scenario's first 2 quarters -- the real situation.
     overlap_quarters = scenario.index[:2]
-    extended_long_rate = pd.concat(
-        [long_rate, pd.Series([0.5, 0.5], index=overlap_quarters)]
-    )
+    extended_long_rate = pd.concat([long_rate, pd.Series([0.5, 0.5], index=overlap_quarters)])
     extended_macro_history_for_long = pd.concat(
         [macro_history, scenario.iloc[:2]]
     )  # so build_long_industry_frame has macro data to join against
@@ -347,9 +315,12 @@ def test_project_single_bank_nco_rate_covers_every_scenario_quarter(family):
     assert forecast.notna().all()
 
 
-def test_project_single_bank_nco_rate_aggregate_families_match_the_industry_forecast():
-    # aggregate_ar/aggregate_long have no bank-specific step at all --
-    # a single bank's "own" forecast is just the industry forecast.
+def test_project_single_bank_nco_rate_aggregate_families_scale_by_the_banks_relative_level():
+    # aggregate_ar/aggregate_long have no bank-specific MODEL step -- but the single-bank
+    # forecast must still be the bank's OWN relative level times the raw industry forecast,
+    # not the raw industry forecast unscaled (the bug this fix addresses: a bank whose own
+    # realized losses sit well below the industry's otherwise gets the industry's own higher
+    # level dumped on it at the first projected quarter).
     macro_history, scenario = _synthetic_macro_history_and_scenario()
     category_train_dataset = _synthetic_category_train_dataset(macro_history)
     bank_id = category_train_dataset["bank_id"].iloc[0]
@@ -360,7 +331,68 @@ def test_project_single_bank_nco_rate_aggregate_families_match_the_industry_fore
     bank_forecast = projection.project_single_bank_nco_rate(
         _CATEGORY, "aggregate_ar", bank_id, category_train_dataset, macro_history, scenario, None
     )
-    pd.testing.assert_series_equal(bank_forecast, industry_forecast, check_names=False)
+    relative_level = projection.compute_bank_relative_level(
+        _CATEGORY, bank_id, "aggregate_ar", category_train_dataset, None
+    )
+    pd.testing.assert_series_equal(
+        bank_forecast, relative_level * industry_forecast, check_names=False
+    )
+
+
+def test_compute_bank_relative_level_rejects_non_aggregate_families():
+    macro_history, _ = _synthetic_macro_history_and_scenario()
+    category_train_dataset = _synthetic_category_train_dataset(macro_history)
+    bank_id = category_train_dataset["bank_id"].iloc[0]
+    with pytest.raises(ValueError, match="aggregate_ar/aggregate_long"):
+        projection.compute_bank_relative_level(
+            _CATEGORY, bank_id, "panel_fe", category_train_dataset, None
+        )
+
+
+def test_single_bank_aggregate_family_shows_a_smaller_jumpoff_step_once_scaled():
+    # A bank whose own realized NCO rate tracks the SAME macro-driven shape as the rest of
+    # the synthetic population, just at a CONSTANT 30% of it -- a stable, low-loss bank.
+    # Scaling its projection by its own relative level (fix 1) and sharing one rate basis
+    # between the jump-off and projected rows (fix 2) should produce a SMALLER jump-off-to-
+    # first-projected-quarter allowance step than feeding the raw, unscaled industry
+    # forecast through the same roll-forward would.
+    macro_history, scenario = _synthetic_macro_history_and_scenario()
+    category_train_dataset = _synthetic_category_train_dataset(macro_history)
+
+    base_bank_rows = category_train_dataset[category_train_dataset["bank_id"] == 0].copy()
+    stable_bank_id = "stable_low_loss_bank"
+    stable_rows = base_bank_rows.copy()
+    stable_rows["bank_id"] = stable_bank_id
+    stable_rows["winsorized_nco_rate"] = base_bank_rows["winsorized_nco_rate"] * 0.3
+    category_train_dataset = pd.concat([category_train_dataset, stable_rows], ignore_index=True)
+
+    industry_forecast = projection.project_category_nco_rate(
+        _CATEGORY, "aggregate_ar", category_train_dataset, macro_history, scenario, None
+    )
+    bank_forecast = projection.project_single_bank_nco_rate(
+        _CATEGORY,
+        "aggregate_ar",
+        stable_bank_id,
+        category_train_dataset,
+        macro_history,
+        scenario,
+        None,
+    )
+    realized_rate = stable_rows.set_index("quarter")["winsorized_nco_rate"]
+
+    cecl_scaled = projection.build_cecl_projection(
+        realized_rate, bank_forecast, _CATEGORY, starting_balance=1_000.0
+    )
+    cecl_unscaled = projection.build_cecl_projection(
+        realized_rate, industry_forecast, _CATEGORY, starting_balance=1_000.0
+    )
+    scaled_step = abs(
+        cecl_scaled.iloc[1]["allowance_required"] - cecl_scaled.iloc[0]["allowance_required"]
+    )
+    unscaled_step = abs(
+        cecl_unscaled.iloc[1]["allowance_required"] - cecl_unscaled.iloc[0]["allowance_required"]
+    )
+    assert scaled_step < unscaled_step
 
 
 def test_project_single_bank_nco_rate_anchored_uses_that_banks_own_relative_level():

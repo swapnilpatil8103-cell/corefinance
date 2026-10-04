@@ -126,30 +126,6 @@ def lifetime_expected_loss_rate(
     return max(lifetime_rate, 0.0)
 
 
-def backward_looking_lifetime_expected_loss_rate(
-    realized_annualized_nco_rate: pd.Series, as_of_quarter: pd.Period, wal_quarters: int
-) -> float:
-    """The simplified "lifetime expected loss rate" as of a REALIZED
-    (non-projected) quarter, e.g. the 2025Q4 jump-off -- the mean of
-    `realized_annualized_nco_rate` over the `wal_quarters` quarters
-    ENDING at `as_of_quarter` (backward-looking, since there is no
-    forward projection to average yet at the jump-off itself), scaled and
-    floored exactly as `lifetime_expected_loss_rate` is (see that
-    function and the module docstring). Used only to establish a baseline
-    allowance level to roll the projection's provision forward from --
-    not a claim about what the real bank actually held as its allowance
-    that quarter (this project has no per-category real allowance data --
-    see panel.py's allowance functions, which are bank-TOTAL, not split
-    by category)."""
-    window_quarters = [as_of_quarter - i for i in range(wal_quarters)]
-    available = realized_annualized_nco_rate.reindex(window_quarters).dropna()
-    if available.empty:
-        raise ValueError(f"no realized data available on or before {as_of_quarter}")
-    average_annualized_rate = float(available.mean())
-    lifetime_rate = average_annualized_rate * (wal_quarters / 4.0)
-    return max(lifetime_rate, 0.0)
-
-
 def build_cecl_projection(
     realized_annualized_nco_rate: pd.Series,
     projected_annualized_nco_rate: pd.Series,
@@ -158,14 +134,32 @@ def build_cecl_projection(
 ) -> pd.DataFrame:
     """The simplified CECL allowance/provision roll-forward for one
     category/scenario. `realized_annualized_nco_rate`: the real, actual
-    annualized NCO rate history (quarter-indexed), used only to establish
-    the jump-off quarter's baseline allowance level (via
-    `backward_looking_lifetime_expected_loss_rate`). `projected_
-    annualized_nco_rate`: the projected path (quarter-indexed) for the
-    scenario/model being evaluated, covering the projection horizon
-    ONLY (e.g. 2026Q1-2029Q1) -- must NOT include the jump-off quarter
-    itself. `starting_balance`: the category's static (held-constant)
-    balance, e.g. its last actual (jump-off) average balance.
+    annualized NCO rate history (quarter-indexed) -- used only for its
+    OWN jump-off quarter's single rate value now (see below), not
+    averaged backward over a window. `projected_annualized_nco_rate`:
+    the projected path (quarter-indexed) for the scenario/model being
+    evaluated, covering the projection horizon ONLY (e.g. 2026Q1-2029Q1)
+    -- must NOT include the jump-off quarter itself. `starting_balance`:
+    the category's static (held-constant) balance, e.g. its last actual
+    (jump-off) average balance.
+
+    JUMP-OFF AND PROJECTED RATES SHARE ONE BASIS: the jump-off quarter's
+    own "lifetime_expected_loss_rate" is computed the SAME way every
+    projected quarter's is (`lifetime_expected_loss_rate`, forward-
+    looking over the WAL window STARTING at that quarter) rather than
+    averaging backward over REALIZED history -- the two bases otherwise
+    disagree (a model's forward-looking projected rate need not equal
+    its own backward-looking realized rate, especially for a bank whose
+    realized losses sit far from the industry's), producing an
+    artificial allowance jump between the jump-off and first projected
+    quarter that isn't a real credit event. The jump-off quarter itself
+    has no "projected" value (by construction, `projected_annualized_
+    nco_rate` excludes it), so its OWN single realized rate seeds the
+    window's first point, with the (now bank-relative-level-scaled, for
+    single-bank aggregate_ar/aggregate_long) projected path filling the
+    rest -- the window is forward-looking in exactly the same sense a
+    later projected quarter's own window is, just anchored at a REAL
+    data point instead of an already-projected one.
 
     Returns a frame indexed by quarter (the jump-off quarter plus every
     projected quarter) with columns: "lifetime_expected_loss_rate",
@@ -184,9 +178,19 @@ def build_cecl_projection(
             "projected_annualized_nco_rate must not include the jump-off quarter "
             f"({jump_off_quarter}) -- it's supplied separately via realized_annualized_nco_rate"
         )
+    if pd.isna(realized_annualized_nco_rate.get(jump_off_quarter)):
+        raise ValueError(
+            f"realized_annualized_nco_rate has no value at its own jump-off quarter "
+            f"({jump_off_quarter}) to anchor the forward-looking jump-off rate"
+        )
 
-    jump_off_rate = backward_looking_lifetime_expected_loss_rate(
-        realized_annualized_nco_rate, jump_off_quarter, wal_quarters
+    projected_sorted = projected_annualized_nco_rate.sort_index()
+    jump_off_realized_rate = float(realized_annualized_nco_rate.loc[jump_off_quarter])
+    forward_basis_from_jumpoff = pd.concat(
+        [pd.Series([jump_off_realized_rate], index=[jump_off_quarter]), projected_sorted]
+    )
+    jump_off_rate = lifetime_expected_loss_rate(
+        forward_basis_from_jumpoff, jump_off_quarter, wal_quarters
     )
     rows = [
         {
@@ -198,7 +202,6 @@ def build_cecl_projection(
         }
     ]
 
-    projected_sorted = projected_annualized_nco_rate.sort_index()
     prior_allowance = rows[0]["allowance_required"]
     for quarter in projected_sorted.index:
         lifetime_rate = lifetime_expected_loss_rate(projected_sorted, quarter, wal_quarters)
@@ -658,6 +661,48 @@ def project_category_nco_rate(
     raise ValueError(f"unknown model family {best_model_family!r}")
 
 
+def compute_bank_relative_level(
+    category: str,
+    bank_id: str,
+    best_model_family: str,
+    category_train_dataset: pd.DataFrame,
+    long_history_frame: pd.DataFrame | None,
+) -> float:
+    """The bank-level relative-loss-level scalar `project_single_bank_
+    nco_rate` applies to the industry/long-history forecast for the
+    `aggregate_ar`/`aggregate_long` families (`models.compute_shrunk_
+    bank_relative_levels`, against `long_history_frame` for
+    aggregate_long or the Call-Report-only industry series for
+    aggregate_ar -- the SAME source each family was fit on). Exposed
+    standalone for REPORTING ("how far does this bank's own realized
+    loss history sit from the industry's, for this category?") -- not
+    used internally beyond what `project_single_bank_nco_rate` already
+    computes inline for its two eligible families. Raises if
+    `best_model_family` isn't one of those two, or if `bank_id` has no
+    estimable relative level (never seen in training)."""
+    if best_model_family not in ("aggregate_ar", "aggregate_long"):
+        raise ValueError(
+            f"compute_bank_relative_level only applies to aggregate_ar/aggregate_long, "
+            f"got {best_model_family!r}"
+        )
+    if best_model_family == "aggregate_long":
+        if long_history_frame is None:
+            raise ValueError("aggregate_long requires long_history_frame")
+        train_industry = long_history_frame[
+            long_history_frame["quarter"].isin(category_train_dataset["quarter"])
+        ]
+    else:
+        train_industry = models.build_industry_series(
+            category_train_dataset, "winsorized_nco_rate"
+        ).frame
+    relative_levels = models.compute_shrunk_bank_relative_levels(
+        category_train_dataset, "winsorized_nco_rate", train_industry
+    )
+    if bank_id not in relative_levels.index:
+        raise ValueError(f"bank_id {bank_id!r} has no estimable relative level")
+    return float(relative_levels.loc[bank_id])
+
+
 def project_single_bank_nco_rate(
     category: str,
     best_model_family: str,
@@ -679,14 +724,20 @@ def project_single_bank_nco_rate(
       estimable relative level (never seen in training, the same
       limitation `forecast_anchored_to_aggregate` documents for any
       unseen bank).
-    - aggregate_ar/aggregate_long: these have no bank-specific
-      differentiation at all (no bank-level step in the model); this
-      bank's own projected rate is simply ASSUMED to track the industry-
-      wide forecast exactly -- a documented simplification, not a
-      per-bank adjustment these family types are capable of making.
+    - aggregate_ar/aggregate_long: scaled by that bank's own relative
+      loss level (`models.compute_shrunk_bank_relative_levels`) against
+      the SAME industry/long-history series the family was fit on --
+      the identical mechanism `anchored_to_aggregate` already uses, so a
+      bank whose own realized losses sit well above or below the
+      industry's (the common case: see this function's own module-level
+      caller for the real pair this was found against, whose realized
+      losses were far below the industry average) tracks its OWN level,
+      not the raw industry level. Previously this branch returned the
+      raw industry forecast UNSCALED, which is what produced an
+      artificial jump-off provision spike for exactly that kind of bank.
     Returns a quarter-indexed Series covering `scenario`'s own quarters."""
     if best_model_family in ("aggregate_ar", "aggregate_long"):
-        return project_category_nco_rate(
+        industry_forecast = project_category_nco_rate(
             category,
             best_model_family,
             category_train_dataset,
@@ -694,6 +745,10 @@ def project_single_bank_nco_rate(
             scenario,
             long_history_frame,
         )
+        relative_level = compute_bank_relative_level(
+            category, bank_id, best_model_family, category_train_dataset, long_history_frame
+        )
+        return (relative_level * industry_forecast).rename(None)
 
     jump_off_quarter = macro_history.index.max()
     if long_history_frame is not None:
@@ -710,9 +765,7 @@ def project_single_bank_nco_rate(
     ]
     if last_actual_bank_row.empty:
         raise ValueError(f"bank_id {bank_id!r} has no row at the jump-off quarter {last_quarter}")
-    synthetic_future_bank = build_synthetic_future_bank_frame(
-        last_actual_bank_row, macro_lag_frame
-    )
+    synthetic_future_bank = build_synthetic_future_bank_frame(last_actual_bank_row, macro_lag_frame)
 
     if best_model_family == "panel_fe":
         fit = models.fit_panel_fe_model(

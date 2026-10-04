@@ -213,7 +213,10 @@ def test_predict_panel_fe_and_fit_must_agree_on_category_or_columns_mismatch():
     )
     with pytest.raises(KeyError):
         models.predict_panel_fe(
-            fit, dataset, "commercial_and_industrial", "winsorized_nco_rate",
+            fit,
+            dataset,
+            "commercial_and_industrial",
+            "winsorized_nco_rate",
             include_pandemic_dummy=False,
         )
 
@@ -363,12 +366,12 @@ def test_forecast_aggregate_dynamic_is_recursive_not_one_step():
         models.feature_column("House Price Index YoY % change"): row[
             models.feature_column("House Price Index YoY % change")
         ],
-        models.feature_column(
-            "Commercial Real Estate Price Index YoY % change"
-        ): row[models.feature_column("Commercial Real Estate Price Index YoY % change")],
-        models.feature_column(
-            "Dow Jones Total Stock Market Index YoY % change"
-        ): row[models.feature_column("Dow Jones Total Stock Market Index YoY % change")],
+        models.feature_column("Commercial Real Estate Price Index YoY % change"): row[
+            models.feature_column("Commercial Real Estate Price Index YoY % change")
+        ],
+        models.feature_column("Dow Jones Total Stock Market Index YoY % change"): row[
+            models.feature_column("Dow Jones Total Stock Market Index YoY % change")
+        ],
         "industry_rate_lag1": forecast.loc[forecast_start],
     }
     x = pd.DataFrame([values])
@@ -519,6 +522,60 @@ def test_compute_bank_relative_levels_is_bank_mean_over_aggregate_mean():
     assert relative.loc[2] == pytest.approx(0.01 / 0.015)
 
 
+def test_compute_shrunk_bank_relative_levels_matches_raw_above_the_min_quarters_threshold():
+    train_bank = pd.DataFrame(
+        {
+            "bank_id": [1] * 10,
+            "winsorized_nco_rate": [0.02] * 10,
+        }
+    )
+    train_industry = pd.DataFrame({"industry_rate": [0.01] * 10})
+    shrunk = models.compute_shrunk_bank_relative_levels(
+        train_bank, "winsorized_nco_rate", train_industry, min_quarters=8
+    )
+    raw = models.compute_bank_relative_levels(train_bank, "winsorized_nco_rate", train_industry)
+    assert shrunk.loc[1] == pytest.approx(raw.loc[1])
+
+
+def test_compute_shrunk_bank_relative_levels_shrinks_toward_1_below_the_threshold():
+    # bank 1 has only 2 quarters of history (min_quarters=8) -- its raw relative level (2.0,
+    # a large outlier) should be pulled toward the industry-neutral 1.0, not used raw.
+    train_bank = pd.DataFrame(
+        {
+            "bank_id": [1, 1],
+            "winsorized_nco_rate": [0.02, 0.02],
+        }
+    )
+    train_industry = pd.DataFrame({"industry_rate": [0.01, 0.01]})
+    shrunk = models.compute_shrunk_bank_relative_levels(
+        train_bank, "winsorized_nco_rate", train_industry, min_quarters=8
+    )
+    raw = models.compute_bank_relative_levels(train_bank, "winsorized_nco_rate", train_industry)
+    assert raw.loc[1] == pytest.approx(2.0)
+    weight = 2.0 / 8.0
+    expected_shrunk = raw.loc[1] * weight + 1.0 * (1.0 - weight)
+    assert shrunk.loc[1] == pytest.approx(expected_shrunk)
+    assert 1.0 < shrunk.loc[1] < raw.loc[1]  # pulled toward 1.0, not left at the raw outlier
+
+
+def test_compute_shrunk_bank_relative_levels_is_exactly_1_with_zero_quarters_of_overlap():
+    # bank 2 has nonnull rows, but NONE of its quarters appear in train_industry's own
+    # period -- its count of USABLE quarters for the shrinkage weight should floor it to a
+    # heavily-shrunk (here: fully shrunk, since the weight clips at 0 quarters -> weight 0)
+    # relative level once pulled toward 1.0. (Realistically this edge case is rare; this
+    # confirms the weight formula degrades gracefully rather than dividing by zero or
+    # producing a nonsensical negative weight.)
+    train_bank = pd.DataFrame({"bank_id": [1], "winsorized_nco_rate": [0.05]})
+    train_industry = pd.DataFrame({"industry_rate": [0.01]})
+    shrunk = models.compute_shrunk_bank_relative_levels(
+        train_bank, "winsorized_nco_rate", train_industry, min_quarters=8
+    )
+    weight = 1.0 / 8.0
+    raw = models.compute_bank_relative_levels(train_bank, "winsorized_nco_rate", train_industry)
+    expected = raw.loc[1] * weight + 1.0 * (1.0 - weight)
+    assert shrunk.loc[1] == pytest.approx(expected)
+
+
 def test_forecast_anchored_to_aggregate_multiplies_relative_level_by_aggregate_forecast():
     relative_levels = pd.Series({1: 2.0, 2: 0.5})
     aggregate_forecast = pd.Series(
@@ -540,9 +597,7 @@ def test_forecast_anchored_to_aggregate_multiplies_relative_level_by_aggregate_f
 def test_forecast_anchored_to_aggregate_drops_a_bank_never_seen_in_training():
     relative_levels = pd.Series({1: 2.0})
     aggregate_forecast = pd.Series({pd.Period("2007Q1", freq="Q"): 0.04})
-    test_bank = pd.DataFrame(
-        {"bank_id": [1, 99], "quarter": [pd.Period("2007Q1", freq="Q")] * 2}
-    )
+    test_bank = pd.DataFrame({"bank_id": [1, 99], "quarter": [pd.Period("2007Q1", freq="Q")] * 2})
     predicted = models.forecast_anchored_to_aggregate(
         relative_levels, aggregate_forecast, test_bank
     )

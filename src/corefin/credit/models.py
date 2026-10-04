@@ -308,9 +308,7 @@ class IndustrySeries:
     frame: pd.DataFrame
 
 
-def build_industry_series(
-    bank_dataset: pd.DataFrame, dependent_column: str
-) -> IndustrySeries:
+def build_industry_series(bank_dataset: pd.DataFrame, dependent_column: str) -> IndustrySeries:
     """bank_dataset: one category's bank-quarter rows from the modeling
     dataset (already filtered to a single `category`). Aggregates
     `dependent_column` (e.g. "winsorized_nco_rate" or
@@ -603,6 +601,43 @@ def compute_bank_relative_levels(
     bank_means = train_bank.groupby("bank_id")[dependent_column].mean()
     aggregate_mean = train_industry["industry_rate"].mean()
     return bank_means / aggregate_mean
+
+
+# Below this many quarters of its own training history, a bank's raw relative-level estimate
+# (compute_bank_relative_levels) is shrunk toward the industry-neutral 1.0 -- see
+# compute_shrunk_bank_relative_levels. 8 quarters (2 years) is a judgment call, not derived from
+# this project's own data (there's no ground truth for "how many quarters is enough" without a
+# separate validation study) -- a round, defensible minimum given this project's quarterly
+# cadence, documented as an assumption like CATEGORY_WEIGHTED_AVERAGE_LIFE_QUARTERS.
+MIN_QUARTERS_FOR_FULL_BANK_RELATIVE_LEVEL = 8
+
+
+def compute_shrunk_bank_relative_levels(
+    train_bank: pd.DataFrame,
+    dependent_column: str,
+    train_industry: pd.DataFrame,
+    min_quarters: int = MIN_QUARTERS_FOR_FULL_BANK_RELATIVE_LEVEL,
+) -> pd.Series:
+    """`compute_bank_relative_levels`, SHRUNK toward the industry-neutral
+    level of 1.0 for any bank with fewer than `min_quarters` of its own
+    training history. A bank's raw mean-ratio estimate from a handful of
+    quarters is noisy -- a single unusually high/low quarter can swing it
+    a long way from any true long-run relative level -- so this blends
+    linearly toward 1.0 by `n_quarters / min_quarters` (clipped to
+    [0, 1]): full weight on the raw estimate once a bank has
+    `min_quarters` or more of its own history, linearly less below that.
+    A bank with zero usable quarters gets no raw estimate at all (dropped
+    by `compute_bank_relative_levels`' own groupby, which only produces
+    an entry per bank_id actually present in `train_bank`'s non-null
+    rows) and so is absent here too -- callers (e.g. `projection.
+    project_single_bank_nco_rate`) still need to handle an unseen bank
+    explicitly, the same as the unshrunk function."""
+    raw_levels = compute_bank_relative_levels(train_bank, dependent_column, train_industry)
+    n_quarters = (
+        train_bank.dropna(subset=[dependent_column]).groupby("bank_id")[dependent_column].count()
+    )
+    weight = (n_quarters.reindex(raw_levels.index) / min_quarters).clip(upper=1.0)
+    return raw_levels * weight + 1.0 * (1.0 - weight)
 
 
 def forecast_anchored_to_aggregate(
