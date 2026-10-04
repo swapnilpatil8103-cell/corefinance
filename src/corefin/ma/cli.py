@@ -42,7 +42,11 @@ from corefin.credit.cli import _load_long_history_frames
 from corefin.credit.projection import FED_COMPARISON_QUARTERS
 from corefin.credit.sources.fed_stress_test_results import DFAST_2026_SEVERELY_ADVERSE_LOSS_RATES
 from corefin.ma.accretion import compute_acquirer_irr_sensitivity
-from corefin.ma.horizon import build_deal_horizon_bank_result
+from corefin.ma.horizon import (
+    build_deal_horizon_bank_result,
+    extend_credit_loss_projection,
+    truncate_credit_loss_projection,
+)
 from corefin.ma.model import (
     check_cet1_bridge_matches_balance_sheet,
     check_goodwill_equals_consideration_less_fair_value,
@@ -51,6 +55,13 @@ from corefin.ma.model import (
     run_deal_model,
 )
 from corefin.ma.schema import DealConfig, ExitMultipleBasis
+from corefin.ma.sensitivity import (
+    DEFAULT_MONTE_CARLO_DRAWS,
+    DealContext,
+    compute_price_cost_save_grid,
+    compute_tornado,
+    run_monte_carlo,
+)
 from corefin.ma.stress import StressTestResult, run_stress_test
 
 app = typer.Typer(add_completion=False)
@@ -344,6 +355,12 @@ def run(
         "(CALIBRATION_QUARTER_FILENAMES) used to calibrate each bank's own NIM beta. A "
         "missing quarter falls back to the illustrative default for that bank, not an error.",
     ),
+    monte_carlo_draws: int = typer.Option(
+        DEFAULT_MONTE_CARLO_DRAWS, "--monte-carlo-draws", help="Stage 6 Monte Carlo draw count."
+    ),
+    monte_carlo_seed: int = typer.Option(
+        0, "--monte-carlo-seed", help="Stage 6 Monte Carlo RNG seed (reproducible draws)."
+    ),
 ) -> None:
     """Runs `config` (an `ExampleDealConfig` YAML -- see `configs/
     example_bank_deal.yaml`) end to end: builds each bank's credit-loss
@@ -635,6 +652,119 @@ def run(
             f"{fed_total_loans_pct:.2f}% (all loan types, published average) -- "
             f"gap {gap_pp:+.2f}pp"
         )
+
+    typer.echo("\n=== Stage 6: Sensitivities & Monte Carlo ===")
+    deal_horizon_rate_path = ppnr.align_rate_path_to_timeline(
+        float(macro_history.loc[QUARTER_Q4, ppnr.RATE_VARIABLE]),
+        scenario[ppnr.RATE_VARIABLE].sort_index().to_numpy(),
+        example.deal.deal_horizon_quarters + 1,
+    )
+    ctx = DealContext(
+        acquirer_opening=results["acquirer"].opening,
+        target_opening=results["target"].opening,
+        acquirer_bank_config=bank_configs["acquirer"],
+        target_bank_config=bank_configs["target"],
+        acquirer_baseline_result=results["acquirer"],
+        target_baseline_result=results["target"],
+        acquirer_baseline_projection=extend_credit_loss_projection(
+            scenario_projections["baseline"]["acquirer"], example.deal.deal_horizon_quarters + 1
+        ),
+        target_baseline_projection=extend_credit_loss_projection(
+            scenario_projections["baseline"]["target"], example.deal.deal_horizon_quarters + 1
+        ),
+        acquirer_severely_adverse_projection=truncate_credit_loss_projection(
+            scenario_projections["severely_adverse"]["acquirer"], FED_COMPARISON_QUARTERS + 1
+        ),
+        target_severely_adverse_projection=truncate_credit_loss_projection(
+            scenario_projections["severely_adverse"]["target"], FED_COMPARISON_QUARTERS + 1
+        ),
+        baseline_rate_path_pp=deal_horizon_rate_path,
+        severely_adverse_rate_path_pp=scenario_rate_paths["severely_adverse"],
+        base_config=example.deal,
+        acquirer_unexplained_cet1_residual_mm=results[
+            "acquirer"
+        ].capital.unexplained_cet1_residual_mm,
+    )
+
+    typer.echo("\n  --- Tornado (base case vs. low/high, holding everything else fixed) ---")
+    tornado = compute_tornado(ctx)
+    base = tornado.base_metrics
+    base_accretion_str = (
+        f"{base.year2_accretion_pct_excl_one_time:+.2%}"
+        if base.year2_accretion_pct_excl_one_time is not None
+        else "n.m."
+    )
+    base_earnback_str = base.earnback_years if base.earnback_years is not None else "beyond horizon"
+    typer.echo(
+        f"  Base case: Year-2 accretion (excl. one-time)={base_accretion_str}  "
+        f"TBV dilution={base.tbv_dilution_at_close_pct:+.2%}  earnback={base_earnback_str}  "
+        f"min stressed CET1={base.minimum_stressed_cet1_ratio:.4%}"
+    )
+    for metric_name, metric_attr, fmt, not_meaningful_label in (
+        (
+            "Year-2 accretion (excl. one-time)",
+            "year2_accretion_pct_excl_one_time",
+            "{:+.2%}",
+            "n.m.",
+        ),
+        ("TBV dilution at close", "tbv_dilution_at_close_pct", "{:+.2%}", "n.m."),
+        ("Earnback (years)", "earnback_years", "{:.2f}", "beyond horizon"),
+        ("Minimum stressed CET1", "minimum_stressed_cet1_ratio", "{:.4%}", "n.m."),
+    ):
+        typer.echo(f"\n  {metric_name}:")
+        for row in tornado.sorted_by(metric_attr):
+            low_val = getattr(row.low_metrics, metric_attr)
+            high_val = getattr(row.high_metrics, metric_attr)
+            low_str = fmt.format(low_val) if low_val is not None else not_meaningful_label
+            high_str = fmt.format(high_val) if high_val is not None else not_meaningful_label
+            typer.echo(
+                f"    {row.driver_name:<28} [{row.low_value:.3f}, {row.high_value:.3f}] -> "
+                f"{low_str} .. {high_str}"
+            )
+
+    typer.echo("\n  --- Grid: Year-2 accretion (excl. one-time) & earnback, price x cost saves ---")
+    price_values = np.array(
+        [
+            max(example.deal.consideration.price_to_tbv - 0.3, 0.1),
+            example.deal.consideration.price_to_tbv,
+            example.deal.consideration.price_to_tbv + 0.3,
+        ]
+    )
+    cost_save_values = np.array(
+        [
+            max(example.deal.cost_saves.cost_save_pct_of_target_noninterest_expense - 0.10, 0.0),
+            example.deal.cost_saves.cost_save_pct_of_target_noninterest_expense,
+            min(example.deal.cost_saves.cost_save_pct_of_target_noninterest_expense + 0.10, 1.0),
+        ]
+    )
+    grid = compute_price_cost_save_grid(ctx, price_values, cost_save_values)
+    header = "".join(f"{p:>10.2f}x" for p in price_values)
+    typer.echo(f"  accretion{'':<4}{header}")
+    for i, cs in enumerate(cost_save_values):
+        row = "".join(
+            f"{v:>10.1%}" if np.isfinite(v) else f"{'n.m.':>10}"
+            for v in grid.year2_accretion_pct[i]
+        )
+        typer.echo(f"  cost save={cs:.0%}  {row}")
+    typer.echo(f"  earnback (yrs){'':<0}{header}")
+    for i, cs in enumerate(cost_save_values):
+        row = "".join(
+            f"{v:>10.2f}" if np.isfinite(v) else f"{'beyond':>10}" for v in grid.earnback_years[i]
+        )
+        typer.echo(f"  cost save={cs:.0%}  {row}")
+
+    typer.echo("\n  --- Monte Carlo (credit mark, cost saves, rate mark, NIM beta) ---")
+    mc = run_monte_carlo(ctx, n_draws=monte_carlo_draws, seed=monte_carlo_seed)
+    typer.echo(f"  {mc.n_draws} draws, seed={mc.seed}")
+    for metric_name, metric_attr, fmt in (
+        ("Year-2 accretion (excl. one-time)", "year2_accretion_pct", "{:+.2%}"),
+        ("Earnback (years)", "earnback_years", "{:.2f}"),
+        ("Minimum stressed CET1", "minimum_stressed_cet1_ratio", "{:.4%}"),
+    ):
+        pct = mc.percentiles(metric_attr, percentiles=(5, 25, 50, 75, 95))
+        pct_str = "  ".join(f"p{p}={fmt.format(v)}" for p, v in pct.items())
+        typer.echo(f"    {metric_name}: {pct_str}")
+    typer.echo(f"    P(TBV earnback beyond horizon) = {mc.probability_beyond_horizon():.1%}")
 
 
 if __name__ == "__main__":
