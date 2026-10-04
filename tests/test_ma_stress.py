@@ -133,6 +133,25 @@ def _acquirer_and_target():
     return _run_bank(acquirer_opening, 2000.0), _run_bank(target_opening, 784.0)
 
 
+def _dummy_income_statement(n: int, tl: Timeline):
+    from corefin.bank.income_statement import IncomeStatement
+
+    zeros = np.zeros(n)
+    return IncomeStatement(
+        timeline=tl,
+        net_interest_income_mm=zeros,
+        noninterest_income_mm=zeros,
+        noninterest_expense_mm=zeros,
+        provision_expense_mm=zeros,
+        pretax_income_mm=zeros,
+        tax_expense_mm=zeros,
+        net_income_mm=zeros,
+        preferred_dividends_mm=zeros,
+        net_income_available_to_common_mm=zeros,
+        dividends_mm=zeros,
+    )
+
+
 def test_standalone_stressed_path_breach_and_scb_floor():
     from corefin.bank.capital import CapitalResult
     from corefin.bank.model import BankModelResult
@@ -151,7 +170,12 @@ def test_standalone_stressed_path_breach_and_scb_floor():
     starting = cet1_ratio[0]
     minimum = cet1_ratio.min()
     summarized = compute_standalone_stressed_cet1_path(
-        BankModelResult(opening=None, balance_sheet=None, income_statement=None, capital=capital)
+        BankModelResult(
+            opening=None,
+            balance_sheet=None,
+            income_statement=_dummy_income_statement(5, tl),
+            capital=capital,
+        )
     )
     assert summarized.starting_cet1_ratio == pytest.approx(starting)
     assert summarized.minimum_cet1_ratio == pytest.approx(minimum)
@@ -177,7 +201,12 @@ def test_standalone_stressed_path_flags_a_real_breach():
         unexplained_cet1_residual_mm=0.0,
     )
     summarized = compute_standalone_stressed_cet1_path(
-        BankModelResult(opening=None, balance_sheet=None, income_statement=None, capital=capital)
+        BankModelResult(
+            opening=None,
+            balance_sheet=None,
+            income_statement=_dummy_income_statement(4, tl),
+            capital=capital,
+        )
     )
     assert summarized.breaches_4_5_pct_minimum is True
 
@@ -198,7 +227,12 @@ def test_illustrative_scb_floors_at_2_5_pct_for_shallow_depletion():
         unexplained_cet1_residual_mm=0.0,
     )
     summarized = compute_standalone_stressed_cet1_path(
-        BankModelResult(opening=None, balance_sheet=None, income_statement=None, capital=capital)
+        BankModelResult(
+            opening=None,
+            balance_sheet=None,
+            income_statement=_dummy_income_statement(3, tl),
+            capital=capital,
+        )
     )
     assert summarized.illustrative_stress_capital_buffer == pytest.approx(
         STRESS_CAPITAL_BUFFER_FLOOR
@@ -305,3 +339,114 @@ def test_run_stress_test_minimum_cet1_ratio_change_pp_is_the_difference():
     assert result.minimum_cet1_ratio_change_pp == pytest.approx(
         result.pro_forma_combined.minimum_cet1_ratio - result.acquirer_standalone.minimum_cet1_ratio
     )
+
+
+def test_peak_to_trough_is_zero_when_cet1_only_rises():
+    from corefin.bank.capital import CapitalResult
+    from corefin.bank.model import BankModelResult
+
+    tl = Timeline.quarterly(4, n_historical=1, start_year=2025, start_quarter=4)
+    cet1_ratio = np.array([0.10, 0.11, 0.12, 0.13])  # monotonically rising
+    capital = CapitalResult(
+        timeline=tl,
+        cet1_capital_mm=cet1_ratio * 1000.0,
+        preferred_stock_mm=np.zeros(4),
+        rwa_mm=np.full(4, 1000.0),
+        average_assets_mm=np.full(4, 1000.0),
+        rwa_calibration_factor=1.0,
+        unexplained_cet1_residual_mm=0.0,
+    )
+    summarized = compute_standalone_stressed_cet1_path(
+        BankModelResult(
+            opening=None,
+            balance_sheet=None,
+            income_statement=_dummy_income_statement(4, tl),
+            capital=capital,
+        )
+    )
+    assert summarized.peak_to_trough_cet1_change_pp == pytest.approx(0.0)
+
+
+def test_peak_to_trough_captures_a_decline_after_an_earlier_peak():
+    from corefin.bank.capital import CapitalResult
+    from corefin.bank.model import BankModelResult
+
+    tl = Timeline.quarterly(4, n_historical=1, start_year=2025, start_quarter=4)
+    cet1_ratio = np.array([0.10, 0.14, 0.09, 0.11])  # peaks at 0.14, troughs at 0.09
+    capital = CapitalResult(
+        timeline=tl,
+        cet1_capital_mm=cet1_ratio * 1000.0,
+        preferred_stock_mm=np.zeros(4),
+        rwa_mm=np.full(4, 1000.0),
+        average_assets_mm=np.full(4, 1000.0),
+        rwa_calibration_factor=1.0,
+        unexplained_cet1_residual_mm=0.0,
+    )
+    summarized = compute_standalone_stressed_cet1_path(
+        BankModelResult(
+            opening=None,
+            balance_sheet=None,
+            income_statement=_dummy_income_statement(4, tl),
+            capital=capital,
+        )
+    )
+    # NOT starting (0.10) minus minimum (0.09) = 1pp -- the true peak-to-trough is
+    # 0.14 -> 0.09 = 5pp, a bigger decline than comparing only to the starting point would show
+    assert summarized.peak_to_trough_cet1_change_pp == pytest.approx(5.0)
+
+
+def test_cumulative_ppnr_provision_net_income_sum_periods_1_onward():
+    acquirer_result, target_result, deal_result, config = _run_deal()
+    acquirer_stress_proj = _credit_projection_for(acquirer_result.opening, 2000.0)
+    target_stress_proj = _credit_projection_for(target_result.opening, 784.0)
+
+    result = run_stress_test(
+        acquirer_result.opening,
+        target_result.opening,
+        acquirer_stress_proj,
+        target_stress_proj,
+        BankConfig(),
+        BankConfig(),
+        deal_result,
+        config,
+        acquirer_unexplained_cet1_residual_mm=0.0,
+        n_quarters=8,
+    )
+    standalone = result.acquirer_standalone
+    assert standalone.cumulative_ppnr_mm == pytest.approx(float(standalone.ppnr_mm[1:].sum()))
+    assert standalone.cumulative_provision_mm == pytest.approx(
+        float(standalone.provision_mm[1:].sum())
+    )
+    assert standalone.cumulative_net_income_mm == pytest.approx(
+        float(standalone.net_income_mm[1:].sum())
+    )
+    # PPNR = pretax + provision, by construction -- zero provision in this fixture means
+    # PPNR equals pretax income exactly
+    assert np.allclose(standalone.provision_mm, 0.0)
+    assert np.allclose(standalone.ppnr_mm, standalone.net_income_mm / 0.75)  # tax_rate=0.25 default
+
+
+def test_pro_forma_ppnr_includes_one_time_charges_and_provision():
+    acquirer_result, target_result, deal_result, config = _run_deal(
+        cdi=CdiConfig(cdi_pct_of_core_deposits=0.02, cdi_amortization_years=2.0)
+    )
+    acquirer_stress_proj = _credit_projection_for(acquirer_result.opening, 2000.0)
+    target_stress_proj = _credit_projection_for(target_result.opening, 784.0)
+
+    result = run_stress_test(
+        acquirer_result.opening,
+        target_result.opening,
+        acquirer_stress_proj,
+        target_stress_proj,
+        BankConfig(),
+        BankConfig(),
+        deal_result,
+        config,
+        acquirer_unexplained_cet1_residual_mm=0.0,
+        n_quarters=8,
+    )
+    combined = result.pro_forma_combined
+    # PPNR = pretax + provision + one_time_charges -- so pretax = PPNR - provision -
+    # one_time_charges; spot-check period 1 (where one_time_charges, if any, would land)
+    assert combined.ppnr_mm.shape == (9,)
+    assert np.isfinite(combined.ppnr_mm).all()

@@ -1,11 +1,13 @@
-"""Stage 5: stress test under the Fed's severely adverse scenario --
-standalone acquirer and the pro forma combined bank's minimum CET1
-ratio over the Fed's own 9-quarter DFAST reporting window
+"""Stage 5: stress test under a projection scenario (the Fed's severely
+adverse scenario, or the baseline scenario for comparison) -- standalone
+acquirer and the pro forma combined bank's minimum CET1 ratio over the
+Fed's own 9-quarter DFAST reporting window
 (`credit.projection.FED_COMPARISON_QUARTERS`), compared against the
 Basel III 4.5% CET1 minimum (the BARE minimum -- NOT the +2.5% capital
 conservation buffer; see `BASEL_III_CET1_MINIMUM_RATIO`'s own name), an
-ILLUSTRATIVE stress capital buffer, and how much the deal itself changes
-stressed capital (standalone acquirer vs. the pro forma combined
+ILLUSTRATIVE stress capital buffer, cumulative PPNR/provisions/net
+income, the peak-to-trough CET1 change, and how much the deal itself
+changes stressed capital (standalone acquirer vs. the pro forma combined
 entity).
 
 ILLUSTRATIVE STRESS CAPITAL BUFFER: the Fed's real SCB = max(stress CET1
@@ -15,25 +17,42 @@ project doesn't maintain a distinct "planned dividend under stress"
 schedule separate from its normal payout-ratio-driven dividends -- hence
 "illustrative": a lower bound on the real SCB, not a reproduction of it.
 
+PEAK-TO-TROUGH CET1 CHANGE: the maximum DRAWDOWN in the CET1 ratio path
+(the largest decline from any running peak to a later trough), NOT
+simply starting-minus-minimum -- a bank whose CET1 ratio rises before
+later falling would otherwise understate its own worst peak-to-trough
+decline. Zero when the path never declines from its own running peak
+(e.g. a bank whose CET1 ratio only ever rises under the scenario).
+
+PPNR/PROVISION/NET INCOME: reported per-period and as 9-quarter
+cumulative totals. "PPNR" (pre-provision net revenue) = pretax income
+PLUS provision expense (standalone) or PLUS provision expense PLUS
+`ProFormaProjection.one_time_charges_pretax_mm` (pro forma combined --
+bucketing the Day-2 allowance/restructuring one-time items together
+with provision as "below PPNR," a simple, documented convention rather
+than decomposing that already-combined field further).
+
 PRO FORMA COMBINED ENTITY UNDER STRESS: both banks' own standalone
-`BankModelResult`s are rerun under the severely_adverse scenario (the
-SAME credit-engine machinery the baseline deal economics use, just a
-different scenario), then combined via `ma.projection.compute_pro_forma_
-projection` -- the SAME combination logic Stage 4 uses, fed stressed
-inputs. The regulatory CET1 bridge is mostly STATIC (per `corefin.bank.
-schema`'s "WHICH ITEMS CHANGE IN A MERGER"), so the stressed pro forma
-CET1 path only needs to track two things moving quarter to quarter: (1)
-net income minus dividends (the GAAP equity roll-forward `ProFormaProjection.equity_mm`
-already performs), and (2) the new CDI intangible's own net-of-DTL
-balance as it amortizes -- which is REGULATORY-CAPITAL-NEUTRAL (a real
-accounting fact: the book value decline and the regulatory deduction's
-own decline offset exactly, confirmed algebraically here), so it is
-tracked separately rather than naively carried through `equity_mm`'s
-own GAAP amortization-EXPENSE effect, which would otherwise incorrectly
-let CDI amortization drag CET1 down over time. RWA is held FLAT at its
-at-close level for the whole stress horizon -- this project doesn't
-project RWA growth beyond close anywhere (see `ma.capital`'s own module
-docstring), the same already-established simplification."""
+`BankModelResult`s are rerun under the given scenario (the SAME credit-
+engine machinery the baseline deal economics use, just a different
+scenario, and with PPNR stress applied too when `bank_config.ppnr_stress`
+is set -- see `corefin.bank.ppnr`), then combined via `ma.projection.
+compute_pro_forma_projection` -- the SAME combination logic Stage 4
+uses, fed stressed inputs. The regulatory CET1 bridge is mostly STATIC
+(per `corefin.bank.schema`'s "WHICH ITEMS CHANGE IN A MERGER"), so the
+stressed pro forma CET1 path only needs to track two things moving
+quarter to quarter: (1) net income minus dividends (the GAAP equity
+roll-forward `ProFormaProjection.equity_mm` already performs), and (2)
+the new CDI intangible's own net-of-DTL balance as it amortizes --
+which is REGULATORY-CAPITAL-NEUTRAL (a real accounting fact: the book
+value decline and the regulatory deduction's own decline offset
+exactly, confirmed algebraically here), so it is tracked separately
+rather than naively carried through `equity_mm`'s own GAAP
+amortization-EXPENSE effect, which would otherwise incorrectly let CDI
+amortization drag CET1 down over time. RWA is held FLAT at its at-close
+level for the whole stress horizon -- this project doesn't project RWA
+growth beyond close anywhere (see `ma.capital`'s own module docstring),
+the same already-established simplification."""
 
 from __future__ import annotations
 
@@ -59,24 +78,56 @@ class StressedCet1Path:
     cet1_ratio: np.ndarray  # (n_periods,), period 0 = jump-off (not yet stressed)
     starting_cet1_ratio: float
     minimum_cet1_ratio: float
+    peak_to_trough_cet1_change_pp: float  # max drawdown, in percentage points, >= 0
     breaches_4_5_pct_minimum: bool
     illustrative_stress_capital_buffer: float  # max(starting - minimum, 0.025)
 
+    ppnr_mm: np.ndarray
+    provision_mm: np.ndarray
+    net_income_mm: np.ndarray
 
-def _summarize(cet1_ratio: np.ndarray) -> StressedCet1Path:
+    @property
+    def cumulative_ppnr_mm(self) -> float:
+        return float(np.nansum(self.ppnr_mm[1:]))
+
+    @property
+    def cumulative_provision_mm(self) -> float:
+        return float(np.nansum(self.provision_mm[1:]))
+
+    @property
+    def cumulative_net_income_mm(self) -> float:
+        return float(np.nansum(self.net_income_mm[1:]))
+
+
+def _summarize(
+    cet1_ratio: np.ndarray,
+    ppnr_mm: np.ndarray,
+    provision_mm: np.ndarray,
+    net_income_mm: np.ndarray,
+) -> StressedCet1Path:
     starting = float(cet1_ratio[0])
     minimum = float(cet1_ratio.min())
+    running_peak = np.maximum.accumulate(cet1_ratio)
+    peak_to_trough_pp = float((running_peak - cet1_ratio).max()) * 100.0
     return StressedCet1Path(
         cet1_ratio=cet1_ratio,
         starting_cet1_ratio=starting,
         minimum_cet1_ratio=minimum,
+        peak_to_trough_cet1_change_pp=peak_to_trough_pp,
         breaches_4_5_pct_minimum=minimum < BASEL_III_CET1_MINIMUM_RATIO,
         illustrative_stress_capital_buffer=max(starting - minimum, STRESS_CAPITAL_BUFFER_FLOOR),
+        ppnr_mm=ppnr_mm,
+        provision_mm=provision_mm,
+        net_income_mm=net_income_mm,
     )
 
 
 def compute_standalone_stressed_cet1_path(result: BankModelResult) -> StressedCet1Path:
-    return _summarize(result.capital.cet1_ratio)
+    income = result.income_statement
+    ppnr_mm = income.pretax_income_mm + income.provision_expense_mm
+    return _summarize(
+        result.capital.cet1_ratio, ppnr_mm, income.provision_expense_mm, income.net_income_mm
+    )
 
 
 def compute_pro_forma_stressed_cet1_path(
@@ -132,7 +183,19 @@ def compute_pro_forma_stressed_cet1_path(
         + acquirer_unexplained_cet1_residual_mm
     )
     cet1_ratio = pro_forma_cet1_mm / deal_result.pro_forma_capital_ratios.pro_forma_rwa_mm
-    return _summarize(cet1_ratio)
+
+    provision_combined_mm = (
+        acquirer_result_stressed.income_statement.provision_expense_mm
+        + target_result_stressed.income_statement.provision_expense_mm
+    )
+    ppnr_combined_mm = (
+        stressed_projection.pretax_income_mm
+        + provision_combined_mm
+        + stressed_projection.one_time_charges_pretax_mm
+    )
+    return _summarize(
+        cet1_ratio, ppnr_combined_mm, provision_combined_mm, stressed_projection.net_income_mm
+    )
 
 
 @dataclass(frozen=True)
@@ -154,24 +217,41 @@ class StressTestResult:
 def run_stress_test(
     acquirer_opening: BankOpeningBalance,
     target_opening: BankOpeningBalance,
-    acquirer_severely_adverse_projection: CreditLossProjection,
-    target_severely_adverse_projection: CreditLossProjection,
+    acquirer_scenario_projection: CreditLossProjection,
+    target_scenario_projection: CreditLossProjection,
     acquirer_bank_config: BankConfig,
     target_bank_config: BankConfig,
     deal_result: DealResult,
     config: DealConfig,
     acquirer_unexplained_cet1_residual_mm: float,
     n_quarters: int = FED_COMPARISON_QUARTERS,
+    jumpoff_rate_pp: float | None = None,
+    projected_rate_path_pp: np.ndarray | None = None,
 ) -> StressTestResult:
-    """Runs both banks' own severely-adverse-scenario `CreditLossProjection`
-    (built the same way the baseline deal's were, just against the
-    severely_adverse scenario) through the Fed's own 9-quarter DFAST
-    window, and reports each entity's own `StressedCet1Path`."""
+    """Runs both banks' own scenario `CreditLossProjection` (built the
+    same way the baseline deal's were, just against whichever scenario
+    `acquirer_scenario_projection`/`target_scenario_projection` are --
+    the Fed's severely adverse, or baseline for comparison) through the
+    Fed's own 9-quarter DFAST window, and reports each entity's own
+    `StressedCet1Path`. `jumpoff_rate_pp`/`projected_rate_path_pp`: that
+    SAME scenario's own rate path -- see `build_stress_bank_result`'s
+    own docstring; both banks see the same economy, so one rate path
+    covers both."""
     acquirer_result_stressed = build_stress_bank_result(
-        acquirer_opening, acquirer_severely_adverse_projection, acquirer_bank_config, n_quarters
+        acquirer_opening,
+        acquirer_scenario_projection,
+        acquirer_bank_config,
+        n_quarters,
+        jumpoff_rate_pp=jumpoff_rate_pp,
+        projected_rate_path_pp=projected_rate_path_pp,
     )
     target_result_stressed = build_stress_bank_result(
-        target_opening, target_severely_adverse_projection, target_bank_config, n_quarters
+        target_opening,
+        target_scenario_projection,
+        target_bank_config,
+        n_quarters,
+        jumpoff_rate_pp=jumpoff_rate_pp,
+        projected_rate_path_pp=projected_rate_path_pp,
     )
     acquirer_standalone = compute_standalone_stressed_cet1_path(acquirer_result_stressed)
     pro_forma_combined = compute_pro_forma_stressed_cet1_path(

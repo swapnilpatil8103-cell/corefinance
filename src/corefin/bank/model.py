@@ -36,6 +36,7 @@ def run_bank_model(
     credit_projection: CreditLossProjection,
     config: BankConfig,
     timeline: Timeline,
+    rate_path_pp: np.ndarray | None = None,
 ) -> BankModelResult:
     """`credit_projection` must already be a SINGLE-bank projection
     (`CreditLossProjection.bank_identifier == opening.bank_id`) aligned to
@@ -46,7 +47,19 @@ def run_bank_model(
     bank's real reported figure, producing an artificial provision spike
     at the first projected quarter). Left unanchored (old behavior) when
     `reported_allowance_mm` is None, e.g. for synthetic test fixtures that
-    don't model this nuance."""
+    don't model this nuance.
+
+    `rate_path_pp`: only used (and required) when `config.ppnr_stress` is
+    set -- see `corefin.bank.ppnr.align_rate_path_to_timeline` for
+    building it aligned to `timeline`. "Earning assets" for the PPNR
+    stress's own NII calculation is approximated here as this bank's
+    jump-off TOTAL assets (net loans + securities + cash + goodwill +
+    other intangibles + other assets -- the same figure `balance_sheet.
+    BalanceSheet.total_assets_mm[0]` computes, just derived here before
+    the balance sheet itself exists, since the income statement is
+    computed first) -- see `corefin.bank.ppnr`'s own module docstring
+    for why this simplification is used instead of a true earning-
+    assets decomposition."""
     if credit_projection.bank_identifier != opening.bank_id:
         raise ValueError(
             f"credit_projection is for bank_identifier={credit_projection.bank_identifier!r}, "
@@ -58,6 +71,15 @@ def run_bank_model(
         )
 
     provision_expense_total_mm = credit_projection.provision_expense_mm.sum(axis=0)
+    earning_assets_jumpoff_mm = (
+        float(credit_projection.balance_total_mm[0] - credit_projection.allowance_total_mm[0])
+        + opening.securities_afs_mm
+        + opening.securities_htm_mm
+        + opening.cash_mm
+        + opening.goodwill_mm
+        + opening.other_intangibles_mm
+        + opening.other_assets_mm
+    )
     income_statement = compute_income_statement(
         net_interest_income_jumpoff_mm=opening.net_interest_income_jumpoff_mm,
         noninterest_income_jumpoff_mm=opening.noninterest_income_jumpoff_mm,
@@ -66,6 +88,8 @@ def run_bank_model(
         config=config,
         timeline=timeline,
         preferred_dividends_jumpoff_mm=opening.preferred_dividends_jumpoff_mm,
+        rate_path_pp=rate_path_pp,
+        earning_assets_jumpoff_mm=earning_assets_jumpoff_mm,
     )
     balance_sheet = project_balance_sheet(
         opening=opening,

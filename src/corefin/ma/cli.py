@@ -25,19 +25,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import typer
 import yaml
 from pydantic import BaseModel, ConfigDict
 
+from corefin.bank import ppnr
 from corefin.bank.model import BankModelResult
-from corefin.bank.schema import BankConfig
+from corefin.bank.schema import DEFAULT_NIM_BETA, BankConfig, PpnrStressConfig
 from corefin.bank.sources.capital_parse import parse_bank_capital_zip
 from corefin.bank.sources.fr_y9c import parse_y9c_bulk_zip
 from corefin.bank.sources.real_data import DataQualityFlags, build_opening_balance_from_real_data
 from corefin.credit import backtest, interface
 from corefin.credit.cli import _load_long_history_frames
 from corefin.credit.projection import FED_COMPARISON_QUARTERS
+from corefin.credit.sources.fed_stress_test_results import DFAST_2026_SEVERELY_ADVERSE_LOSS_RATES
 from corefin.ma.accretion import compute_acquirer_irr_sensitivity
 from corefin.ma.horizon import build_deal_horizon_bank_result
 from corefin.ma.model import (
@@ -48,13 +51,29 @@ from corefin.ma.model import (
     run_deal_model,
 )
 from corefin.ma.schema import DealConfig, ExitMultipleBasis
-from corefin.ma.stress import run_stress_test
+from corefin.ma.stress import StressTestResult, run_stress_test
 
 app = typer.Typer(add_completion=False)
 
 QUARTER_Q4 = pd.Period("2025Q4", freq="Q")
 QUARTER_Q3 = pd.Period("2025Q3", freq="Q")
 EXIT_MULTIPLE_SENSITIVITY = (1.0, 1.25, 1.5, 1.75, 2.0)
+
+# NIM-beta calibration window (corefin.bank.ppnr) -- the Call Report quarterly bulk ZIP
+# filenames for 2020Q1-2021Q4, matching DEFAULT_RAW_DIR's own naming convention
+# (credit/cli.py's "{MM-DD-YYYY}.zip"). All 8 are expected to already be cached locally
+# (the same raw directory every other real-data workflow in this project uses); a missing
+# quarter just falls back to the illustrative default beta for that bank, not a hard error.
+CALIBRATION_QUARTER_FILENAMES: dict[pd.Period, str] = {
+    pd.Period("2020Q1", freq="Q"): "03-31-2020.zip",
+    pd.Period("2020Q2", freq="Q"): "06-30-2020.zip",
+    pd.Period("2020Q3", freq="Q"): "09-30-2020.zip",
+    pd.Period("2020Q4", freq="Q"): "12-31-2020.zip",
+    pd.Period("2021Q1", freq="Q"): "03-31-2021.zip",
+    pd.Period("2021Q2", freq="Q"): "06-30-2021.zip",
+    pd.Period("2021Q3", freq="Q"): "09-30-2021.zip",
+    pd.Period("2021Q4", freq="Q"): "12-31-2021.zip",
+}
 
 # This example's acquirer is the one real-data quirk this stub hardcodes rather than
 # generalizes (a fuller Stage 7 CLI would make this a per-bank config option): its assets
@@ -86,8 +105,26 @@ class ExampleDealConfig(BaseModel):
     deal: DealConfig
 
 
-def load_example_deal_config(path: Path) -> ExampleDealConfig:
-    return ExampleDealConfig.model_validate(yaml.safe_load(path.read_text()))
+class LocalBankIdentityOverride(BaseModel):
+    """`configs/local/*.yaml`'s own schema (gitignored -- see
+    `configs/local/example_bank_deal.local.yaml.template`): REPLACES
+    `ExampleDealConfig.acquirer`/`target` wholesale, for anyone adapting
+    this example to their own (possibly sensitive) real deal without
+    committing their own bank RSSD IDs."""
+
+    model_config = ConfigDict(extra="forbid")
+    acquirer: BankIdentity
+    target: BankIdentity
+
+
+def load_example_deal_config(
+    path: Path, local_config_path: Path | None = None
+) -> ExampleDealConfig:
+    example = ExampleDealConfig.model_validate(yaml.safe_load(path.read_text()))
+    if local_config_path is None:
+        return example
+    local = LocalBankIdentityOverride.model_validate(yaml.safe_load(local_config_path.read_text()))
+    return example.model_copy(update={"acquirer": local.acquirer, "target": local.target})
 
 
 def _require_file(path: Path, hint: str) -> Path:
@@ -125,6 +162,46 @@ def _balance_weighted_total_nco_rate(
     return realized_weighted / realized_weight, projected_weighted / projected_weight
 
 
+def _load_calibration_call_report_frames(raw_dir: Path) -> dict[pd.Period, pd.DataFrame]:
+    """One nationwide Call Report frame per 2020Q1-2021Q4 quarter found
+    in `raw_dir` (missing quarters just aren't in the result -- see
+    `CALIBRATION_QUARTER_FILENAMES`), read ONCE and shared across both
+    banks (not re-parsed per bank)."""
+    frames: dict[pd.Period, pd.DataFrame] = {}
+    for quarter, filename in CALIBRATION_QUARTER_FILENAMES.items():
+        path = raw_dir / filename
+        if not path.exists():
+            continue
+        with open(path, "rb") as f:
+            frames[quarter], _ = parse_bank_capital_zip(f.read(), quarter)
+    return frames
+
+
+def _resolve_bank_config(
+    identity: BankIdentity,
+    calibration_frames_by_quarter: dict[pd.Period, pd.DataFrame],
+    rate_by_quarter: pd.Series,
+) -> tuple[BankConfig, ppnr.CalibratedNimBeta | None]:
+    """Calibrates this bank's own NIM beta (`corefin.bank.ppnr.
+    calibrate_nim_beta`) from the 2020Q1-2021Q4 Call Report frames if
+    available and estimable, falling back to the illustrative default
+    otherwise. Returns (bank_config with ppnr_stress set, the
+    calibration result or None)."""
+    rows_by_quarter: dict[pd.Period, pd.Series] = {}
+    for quarter, frame in calibration_frames_by_quarter.items():
+        bank_rows = frame[frame["bank_id"] == identity.bank_id]
+        if not bank_rows.empty:
+            rows_by_quarter[quarter] = bank_rows.iloc[0]
+    calibration = ppnr.calibrate_nim_beta(identity.bank_id, rows_by_quarter, rate_by_quarter)
+    nim_beta = (
+        calibration.nim_beta
+        if calibration is not None and calibration.nim_beta is not None
+        else DEFAULT_NIM_BETA
+    )
+    bank_config = BankConfig(ppnr_stress=PpnrStressConfig(nim_beta=nim_beta))
+    return bank_config, calibration
+
+
 def _build_credit_projection(
     identity: BankIdentity,
     scenario_name: str,
@@ -154,6 +231,7 @@ def _build_credit_projection(
 
 def _build_bank_result(
     identity: BankIdentity,
+    bank_config: BankConfig,
     training: pd.DataFrame,
     macro_history: pd.DataFrame,
     scenario: pd.DataFrame,
@@ -164,8 +242,8 @@ def _build_bank_result(
     call_df_q3: pd.DataFrame,
     y9c_df: pd.DataFrame,
     deal_horizon_quarters: int,
-) -> tuple[BankModelResult, BankConfig, DataQualityFlags, float, float]:
-    """Returns (result, bank_config, flags, realized_total_nco_rate,
+) -> tuple[BankModelResult, DataQualityFlags, float, float]:
+    """Returns (result, flags, realized_total_nco_rate,
     baseline_projected_total_nco_rate)."""
     credit_projection = _build_credit_projection(
         identity,
@@ -208,17 +286,31 @@ def _build_bank_result(
         build_kwargs["preferred_dividend_annual_rate"] = ACQUIRER_PREFERRED_DIVIDEND_ANNUAL_RATE
 
     opening, flags = build_opening_balance_from_real_data(**build_kwargs)
-    bank_config = BankConfig()
+    jumpoff_rate_pp = float(macro_history.loc[QUARTER_Q4, ppnr.RATE_VARIABLE])
+    projected_rate_path_pp = scenario[ppnr.RATE_VARIABLE].sort_index().to_numpy()
     result = build_deal_horizon_bank_result(
-        opening, credit_projection, bank_config, deal_horizon_quarters=deal_horizon_quarters
+        opening,
+        credit_projection,
+        bank_config,
+        deal_horizon_quarters=deal_horizon_quarters,
+        jumpoff_rate_pp=jumpoff_rate_pp,
+        projected_rate_path_pp=projected_rate_path_pp,
     )
-    return result, bank_config, flags, realized_total, projected_total
+    return result, flags, realized_total, projected_total
 
 
 @app.command()
 def run(
     config: Path = typer.Option(
         ..., "--config", exists=True, dir_okay=False, help="Path to an ExampleDealConfig YAML."
+    ),
+    local_config: Path | None = typer.Option(
+        None,
+        "--local-config",
+        exists=True,
+        dir_okay=False,
+        help="Optional LOCAL, gitignored YAML (see configs/local/example_bank_deal.local."
+        "yaml.template) that REPLACES --config's own acquirer/target RSSD IDs.",
     ),
     call_report_q4_zip: Path = typer.Option(
         Path("data/raw/ffiec/12-31-2025.zip"), "--call-report-q4"
@@ -244,6 +336,13 @@ def run(
     ),
     severely_adverse_scenario_path: Path = typer.Option(
         Path("data/processed/scenarios/severely_adverse.parquet"), "--severely-adverse-scenario"
+    ),
+    calibration_raw_dir: Path = typer.Option(
+        Path("data/raw/ffiec"),
+        "--calibration-raw-dir",
+        help="Directory holding the 2020Q1-2021Q4 Call Report bulk ZIPs "
+        "(CALIBRATION_QUARTER_FILENAMES) used to calibrate each bank's own NIM beta. A "
+        "missing quarter falls back to the illustrative default for that bank, not an error.",
     ),
 ) -> None:
     """Runs `config` (an `ExampleDealConfig` YAML -- see `configs/
@@ -277,7 +376,7 @@ def run(
     ):
         _require_file(path, hint)
 
-    example = load_example_deal_config(config)
+    example = load_example_deal_config(config, local_config)
 
     with open(call_report_q4_zip, "rb") as f:
         call_df_q4, _ = parse_bank_capital_zip(f.read(), QUARTER_Q4)
@@ -314,11 +413,31 @@ def run(
     )
     severely_adverse_scenario = severely_adverse_scenario.set_index("quarter")
 
+    calibration_frames_by_quarter = _load_calibration_call_report_frames(calibration_raw_dir)
+    rate_by_quarter = macro_history[ppnr.RATE_VARIABLE]
+
     results: dict[str, BankModelResult] = {}
     bank_configs: dict[str, BankConfig] = {}
     for key, identity in (("acquirer", example.acquirer), ("target", example.target)):
-        result, bank_config, flags, realized_total, projected_total = _build_bank_result(
+        bank_config, calibration = _resolve_bank_config(
+            identity, calibration_frames_by_quarter, rate_by_quarter
+        )
+        if calibration is not None and calibration.nim_beta is not None:
+            typer.echo(
+                f"{identity.label}: calibrated NIM beta = {calibration.nim_beta:+.3f} "
+                f"(realized NIM {calibration.start_nim:.4%} -> {calibration.end_nim:.4%} vs. "
+                f"realized rate change {calibration.realized_rate_change_pp:+.2f}pp, "
+                f"{calibration.start_quarter}-{calibration.end_quarter})"
+            )
+        else:
+            typer.echo(
+                f"{identity.label}: NIM beta calibration unavailable -- using the illustrative "
+                f"default ({DEFAULT_NIM_BETA:+.3f})"
+            )
+
+        result, flags, realized_total, projected_total = _build_bank_result(
             identity,
+            bank_config,
             training,
             macro_history,
             scenario,
@@ -333,7 +452,7 @@ def run(
         results[key] = result
         bank_configs[key] = bank_config
         typer.echo(
-            f"{identity.label}: realized NCO rate = {realized_total:.4%}, "
+            f"  realized NCO rate = {realized_total:.4%}, "
             f"baseline projected (Q1) NCO rate = {projected_total:.4%}, "
             f"QoQ asset change flagged = {flags.qoq_asset_change_flagged}"
         )
@@ -424,55 +543,95 @@ def run(
         marker = "  <-- base case" if multiple == base_case else ""
         typer.echo(f"  {multiple:.2f}x {basis_label} exit: IRR = {irr:.2%}{marker}")
 
-    typer.echo(f"\n=== Stage 5: Stress Test (Fed severely adverse, {FED_COMPARISON_QUARTERS}Q) ===")
-    acquirer_severely_adverse_projection = _build_credit_projection(
-        example.acquirer,
-        "severely_adverse",
-        severely_adverse_scenario,
-        training,
-        macro_history,
-        long_history_frames,
-        categories,
-        selected_family_by_category,
-    )
-    target_severely_adverse_projection = _build_credit_projection(
-        example.target,
-        "severely_adverse",
-        severely_adverse_scenario,
-        training,
-        macro_history,
-        long_history_frames,
-        categories,
-        selected_family_by_category,
-    )
-    stress_result = run_stress_test(
-        results["acquirer"].opening,
-        results["target"].opening,
-        acquirer_severely_adverse_projection,
-        target_severely_adverse_projection,
-        bank_configs["acquirer"],
-        bank_configs["target"],
-        deal_result,
-        example.deal,
-        acquirer_unexplained_cet1_residual_mm=results[
-            "acquirer"
-        ].capital.unexplained_cet1_residual_mm,
-    )
-    for label, path in (
-        ("Acquirer standalone", stress_result.acquirer_standalone),
-        ("Pro forma combined", stress_result.pro_forma_combined),
+    typer.echo(f"\n=== Stage 5: Stress Test ({FED_COMPARISON_QUARTERS}Q DFAST window) ===")
+    scenario_projections: dict[str, dict[str, interface.CreditLossProjection]] = {}
+    scenario_rate_paths: dict[str, np.ndarray] = {}
+    for scenario_name, scenario_df in (
+        ("baseline", scenario),
+        ("severely_adverse", severely_adverse_scenario),
     ):
-        breach = "BREACHES" if path.breaches_4_5_pct_minimum else "does not breach"
-        typer.echo(
-            f"  {label}: starting CET1={path.starting_cet1_ratio:.4%}  "
-            f"minimum CET1={path.minimum_cet1_ratio:.4%} ({breach} the 4.5% minimum)  "
-            f"illustrative SCB={path.illustrative_stress_capital_buffer:.4%}"
+        scenario_projections[scenario_name] = {
+            key: _build_credit_projection(
+                identity,
+                scenario_name,
+                scenario_df,
+                training,
+                macro_history,
+                long_history_frames,
+                categories,
+                selected_family_by_category,
+            )
+            for key, identity in (("acquirer", example.acquirer), ("target", example.target))
+        }
+        jumpoff_rate_pp = float(macro_history.loc[QUARTER_Q4, ppnr.RATE_VARIABLE])
+        projected_rate_path_pp = scenario_df[ppnr.RATE_VARIABLE].sort_index().to_numpy()
+        scenario_rate_paths[scenario_name] = ppnr.align_rate_path_to_timeline(
+            jumpoff_rate_pp, projected_rate_path_pp, FED_COMPARISON_QUARTERS + 1
         )
-    typer.echo(
-        f"  Deal impact: minimum stressed CET1 ratio changes by "
-        f"{stress_result.minimum_cet1_ratio_change_pp:+.4%} (pro forma combined vs. "
-        f"acquirer standalone)"
-    )
+
+    stress_results: dict[str, StressTestResult] = {}
+    for scenario_name in ("baseline", "severely_adverse"):
+        rate_path = scenario_rate_paths[scenario_name]
+        stress_results[scenario_name] = run_stress_test(
+            results["acquirer"].opening,
+            results["target"].opening,
+            scenario_projections[scenario_name]["acquirer"],
+            scenario_projections[scenario_name]["target"],
+            bank_configs["acquirer"],
+            bank_configs["target"],
+            deal_result,
+            example.deal,
+            acquirer_unexplained_cet1_residual_mm=results[
+                "acquirer"
+            ].capital.unexplained_cet1_residual_mm,
+            jumpoff_rate_pp=float(rate_path[0]),
+            projected_rate_path_pp=rate_path[1:],
+        )
+
+    for scenario_name in ("baseline", "severely_adverse"):
+        stress_result = stress_results[scenario_name]
+        typer.echo(f"\n  --- {scenario_name} ---")
+        for label, path in (
+            ("Acquirer standalone", stress_result.acquirer_standalone),
+            ("Pro forma combined", stress_result.pro_forma_combined),
+        ):
+            breach = "BREACHES" if path.breaches_4_5_pct_minimum else "does not breach"
+            typer.echo(
+                f"  {label}: starting CET1={path.starting_cet1_ratio:.4%}  "
+                f"minimum CET1={path.minimum_cet1_ratio:.4%} ({breach} the 4.5% minimum)  "
+                f"peak-to-trough={path.peak_to_trough_cet1_change_pp:.2f}pp  "
+                f"illustrative SCB={path.illustrative_stress_capital_buffer:.4%}"
+            )
+            typer.echo(
+                f"    cumulative {FED_COMPARISON_QUARTERS}Q: "
+                f"PPNR=${path.cumulative_ppnr_mm:,.1f}mm  "
+                f"provisions=${path.cumulative_provision_mm:,.1f}mm  "
+                f"net income=${path.cumulative_net_income_mm:,.1f}mm"
+            )
+        typer.echo(
+            f"  Deal impact: minimum stressed CET1 ratio changes by "
+            f"{stress_result.minimum_cet1_ratio_change_pp:+.4%} (pro forma combined vs. "
+            f"acquirer standalone)"
+        )
+
+    typer.echo("\n  --- 9-quarter cumulative loss rate vs. Fed DFAST published average ---")
+    fed_total_loans_pct = DFAST_2026_SEVERELY_ADVERSE_LOSS_RATES[
+        "total_loans"
+    ].severely_adverse_9q_loss_rate_percent
+    for key, identity in (("acquirer", example.acquirer), ("target", example.target)):
+        severely_adverse_proj = scenario_projections["severely_adverse"][key]
+        total_balance = severely_adverse_proj.balance_mm[:, 0].sum()
+        blended_nco_rate = (
+            severely_adverse_proj.nco_rate[:, 1 : FED_COMPARISON_QUARTERS + 1]
+            * severely_adverse_proj.balance_mm[:, 1 : FED_COMPARISON_QUARTERS + 1]
+        ).sum(axis=0) / total_balance
+        our_cumulative_loss_rate_pct = float(np.sum(blended_nco_rate / 4.0)) * 100.0
+        gap_pp = our_cumulative_loss_rate_pct - fed_total_loans_pct
+        typer.echo(
+            f"  {identity.label}: our {our_cumulative_loss_rate_pct:.2f}% vs. Fed DFAST "
+            f"{fed_total_loans_pct:.2f}% (all loan types, published average) -- "
+            f"gap {gap_pp:+.2f}pp"
+        )
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ from __future__ import annotations
 import numpy as np
 
 from corefin.bank.model import BankModelResult, run_bank_model
+from corefin.bank.ppnr import align_rate_path_to_timeline
 from corefin.bank.schema import BankConfig, BankOpeningBalance
 from corefin.credit.interface import CreditLossProjection
 from corefin.timeline import Timeline
@@ -104,6 +105,8 @@ def build_deal_horizon_bank_result(
     credit_projection: CreditLossProjection,
     bank_config: BankConfig,
     deal_horizon_quarters: int,
+    jumpoff_rate_pp: float | None = None,
+    projected_rate_path_pp: np.ndarray | None = None,
 ) -> BankModelResult:
     """Convenience wrapper: extends `credit_projection` to
     `deal_horizon_quarters` PROJECTED quarters (`deal_horizon_quarters +
@@ -112,10 +115,23 @@ def build_deal_horizon_bank_result(
     the result into `corefin.ma.model.run_deal_model` in place of a
     bank's native-horizon `BankModelResult` wherever Stage 4 deal
     economics are needed -- the at-close Stage 3 figures only ever read
-    period 0, so they're unaffected either way."""
+    period 0, so they're unaffected either way.
+
+    `jumpoff_rate_pp`/`projected_rate_path_pp`: only needed when
+    `bank_config.ppnr_stress` is set -- the scenario's own rate path
+    (e.g. "3-month Treasury rate", in percentage points), aligned here
+    to the SAME extended horizon via `corefin.bank.ppnr.
+    align_rate_path_to_timeline`."""
     n_periods = deal_horizon_quarters + 1
     extended = extend_credit_loss_projection(credit_projection, n_periods)
-    return run_bank_model(opening, extended, bank_config, extended.timeline)
+    rate_path_pp = None
+    if jumpoff_rate_pp is not None and projected_rate_path_pp is not None:
+        rate_path_pp = align_rate_path_to_timeline(
+            jumpoff_rate_pp, projected_rate_path_pp, n_periods
+        )
+    return run_bank_model(
+        opening, extended, bank_config, extended.timeline, rate_path_pp=rate_path_pp
+    )
 
 
 def truncate_credit_loss_projection(
@@ -169,13 +185,25 @@ def build_stress_bank_result(
     credit_projection: CreditLossProjection,
     bank_config: BankConfig,
     n_quarters: int,
+    jumpoff_rate_pp: float | None = None,
+    projected_rate_path_pp: np.ndarray | None = None,
 ) -> BankModelResult:
     """Convenience wrapper, the stress-test counterpart to
     `build_deal_horizon_bank_result`: truncates `credit_projection` to
     `n_quarters` PROJECTED quarters (`n_quarters + 1` periods, including
     the jump-off quarter -- e.g. `credit.projection.
     FED_COMPARISON_QUARTERS` for the Fed's own 9-quarter DFAST window)
-    if it's longer, then reruns `run_bank_model` over that horizon."""
+    if it's longer, then reruns `run_bank_model` over that horizon.
+    `jumpoff_rate_pp`/`projected_rate_path_pp`: see `build_deal_horizon_
+    bank_result`'s own docstring -- the SAME, just aligned to this
+    truncated horizon instead."""
     n_periods = n_quarters + 1
     truncated = truncate_credit_loss_projection(credit_projection, n_periods)
-    return run_bank_model(opening, truncated, bank_config, truncated.timeline)
+    rate_path_pp = None
+    if jumpoff_rate_pp is not None and projected_rate_path_pp is not None:
+        rate_path_pp = align_rate_path_to_timeline(
+            jumpoff_rate_pp, projected_rate_path_pp, n_periods
+        )
+    return run_bank_model(
+        opening, truncated, bank_config, truncated.timeline, rate_path_pp=rate_path_pp
+    )

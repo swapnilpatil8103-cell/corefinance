@@ -16,7 +16,7 @@ from corefin.bank.model import (
     reconcile_levels,
     run_bank_model,
 )
-from corefin.bank.schema import BankConfig, BankOpeningBalance
+from corefin.bank.schema import BankConfig, BankOpeningBalance, PpnrStressConfig
 from corefin.credit.interface import CreditLossProjection
 from corefin.timeline import Timeline
 
@@ -93,6 +93,35 @@ def test_run_bank_model_returns_a_consistent_result():
     assert result.balance_sheet.timeline is timeline
     assert result.income_statement.timeline is timeline
     assert result.capital.timeline is timeline
+
+
+def test_run_bank_model_applies_ppnr_stress_when_rate_path_given():
+    timeline = _timeline()
+    opening = _synthetic_opening()
+    credit_projection = _synthetic_credit_projection(timeline)
+    config = BankConfig(ppnr_stress=PpnrStressConfig(nim_beta=0.3))
+    rate_path_pp = np.full(timeline.n_periods, 3.7)
+    rate_path_pp[1:] = 0.1  # rate collapses from period 1 onward
+
+    result = run_bank_model(opening, credit_projection, config, timeline, rate_path_pp=rate_path_pp)
+
+    earning_assets_jumpoff_mm = (
+        credit_projection.balance_total_mm[0]
+        - credit_projection.allowance_total_mm[0]
+        + opening.securities_afs_mm
+        + opening.securities_htm_mm
+        + opening.cash_mm
+        + opening.goodwill_mm
+        + opening.other_intangibles_mm
+        + opening.other_assets_mm
+    )
+    expected_delta = (0.3 * (0.1 - 3.7) / 100.0) * earning_assets_jumpoff_mm / 4.0
+    assert result.income_statement.net_interest_income_mm[0] == pytest.approx(
+        opening.net_interest_income_jumpoff_mm
+    )
+    assert result.income_statement.net_interest_income_mm[1] == pytest.approx(
+        opening.net_interest_income_jumpoff_mm + expected_delta
+    )
 
 
 def test_run_bank_model_rejects_mismatched_bank_identifier():

@@ -1,0 +1,25 @@
+# Template for a LOCAL, UNTRACKED override of configs/example_bank_deal.yaml's acquirer/target
+# RSSD IDs -- copy this file to configs/local/example_bank_deal.local.yaml (gitignored; that
+# exact path is never committed) and fill in your own real bank's RSSD IDs, then run:
+#
+#   corefin ma run --config configs/example_bank_deal.yaml --local-config configs/local/example_bank_deal.local.yaml
+#
+# --local-config's acquirer/target REPLACE the main --config file's own (the deal TERMS --
+# price, marks, cost saves, etc. -- still come from --config). This exists so anyone adapting
+# this example to a real, possibly sensitive deal doesn't have to commit their own bank RSSD
+# IDs into version control to use the tool -- see .gitignore's own note on /configs/local/.
+#
+# label is never printed in place of "Acquirer Bank A"/"Target Bank B" -- it's carried through
+# only as a reminder of which real bank this local override points at; this project's own
+# standing rule (never print real bank names/tickers in committed or displayed output) still
+# applies to whatever `corefin ma run` itself prints.
+
+acquirer:
+  label: "REPLACE WITH YOUR ACQUIRER'S NAME (for your own reference only)"
+  bank_id: "00000000"       # Call Report RSSD ID (bank subsidiary) -- REPLACE
+  hc_rssd_id: "00000000"    # FR Y-9C RSSD ID (holding company) -- REPLACE
+
+target:
+  label: "REPLACE WITH YOUR TARGET'S NAME (for your own reference only)"
+  bank_id: "00000000"
+  hc_rssd_id: "00000000"

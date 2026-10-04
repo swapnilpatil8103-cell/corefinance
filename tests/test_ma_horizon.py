@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from corefin.bank.schema import BankConfig, BankOpeningBalance
+from corefin.bank.schema import BankConfig, BankOpeningBalance, PpnrStressConfig
 from corefin.credit.interface import CreditLossProjection
 from corefin.ma.horizon import (
     build_deal_horizon_bank_result,
@@ -166,3 +166,51 @@ def test_build_stress_bank_result_rebuilds_over_the_requested_horizon():
     result = build_stress_bank_result(opening, projection, BankConfig(), n_quarters=3)
     assert result.income_statement.timeline.n_periods == 4
     assert result.capital.cet1_capital_mm[0] == pytest.approx(opening.reported_cet1_capital_mm)
+
+
+def test_build_deal_horizon_bank_result_threads_the_rate_path_when_ppnr_stress_set():
+    opening = _opening()
+    projection = _projection([0.0, 0.02, 0.03, 0.025, 0.02], [0.0, 20.0, 25.0, 23.0, 20.0])
+    config = BankConfig(ppnr_stress=PpnrStressConfig(nim_beta=0.3))
+    result = build_deal_horizon_bank_result(
+        opening,
+        projection,
+        config,
+        deal_horizon_quarters=8,
+        jumpoff_rate_pp=3.7,
+        projected_rate_path_pp=np.full(4, 0.1),
+    )
+    assert result.income_statement.net_interest_income_mm[0] == pytest.approx(
+        opening.net_interest_income_jumpoff_mm
+    )
+    assert result.income_statement.net_interest_income_mm[1] != pytest.approx(
+        opening.net_interest_income_jumpoff_mm
+    )
+
+
+def test_build_stress_bank_result_threads_the_rate_path_when_ppnr_stress_set():
+    opening = _opening()
+    projection = _projection([0.0, 0.02, 0.03, 0.025, 0.02], [0.0, 20.0, 25.0, 23.0, 20.0])
+    config = BankConfig(ppnr_stress=PpnrStressConfig(nim_beta=0.3))
+    result = build_stress_bank_result(
+        opening,
+        projection,
+        config,
+        n_quarters=3,
+        jumpoff_rate_pp=3.7,
+        projected_rate_path_pp=np.full(3, 0.1),
+    )
+    assert result.income_statement.net_interest_income_mm[1] != pytest.approx(
+        opening.net_interest_income_jumpoff_mm
+    )
+
+
+def test_build_deal_horizon_bank_result_without_rate_path_leaves_nii_flat():
+    opening = _opening()
+    projection = _projection([0.0, 0.02, 0.03, 0.025, 0.02], [0.0, 20.0, 25.0, 23.0, 20.0])
+    result = build_deal_horizon_bank_result(
+        opening, projection, BankConfig(), deal_horizon_quarters=8
+    )
+    assert np.allclose(
+        result.income_statement.net_interest_income_mm, opening.net_interest_income_jumpoff_mm
+    )

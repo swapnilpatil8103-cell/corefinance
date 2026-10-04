@@ -16,6 +16,7 @@ from corefin.credit.interface import CreditLossProjection
 from corefin.ma.cli import (
     BankIdentity,
     ExampleDealConfig,
+    LocalBankIdentityOverride,
     _balance_weighted_total_nco_rate,
     app,
     load_example_deal_config,
@@ -41,6 +42,42 @@ def test_load_example_deal_config_parses_the_committed_example():
     assert example.deal.cost_saves.restructuring_charge_mm == pytest.approx(40.0)
     assert example.deal.irr.exit_multiple == pytest.approx(1.5)
     assert example.deal.deal_horizon_quarters == 20
+
+
+def test_load_example_deal_config_local_override_replaces_acquirer_and_target(tmp_path):
+    local_path = tmp_path / "local.yaml"
+    local_path.write_text(
+        "acquirer:\n"
+        '  label: "My Acquirer"\n'
+        '  bank_id: "11111"\n'
+        '  hc_rssd_id: "22222"\n'
+        "target:\n"
+        '  label: "My Target"\n'
+        '  bank_id: "33333"\n'
+        '  hc_rssd_id: "44444"\n'
+    )
+    example = load_example_deal_config(EXAMPLE_CONFIG, local_path)
+    assert example.acquirer.label == "My Acquirer"
+    assert example.acquirer.bank_id == "11111"
+    assert example.target.bank_id == "33333"
+    # the deal TERMS still come from the main --config, unaffected by the local override
+    assert example.deal.consideration.price_to_tbv == pytest.approx(1.5)
+
+
+def test_load_example_deal_config_without_local_override_keeps_main_config():
+    example = load_example_deal_config(EXAMPLE_CONFIG, None)
+    assert example.acquirer.label == "Acquirer Bank A"
+
+
+def test_local_bank_identity_override_rejects_unknown_fields():
+    with pytest.raises(ValidationError):
+        LocalBankIdentityOverride.model_validate(
+            {
+                "acquirer": {"label": "A", "bank_id": "1", "hc_rssd_id": "2"},
+                "target": {"label": "B", "bank_id": "3", "hc_rssd_id": "4"},
+                "deal": {"not_allowed_here": 1},
+            }
+        )
 
 
 def test_bank_identity_rejects_unknown_fields():
@@ -70,6 +107,14 @@ def test_example_deal_config_rejects_unknown_top_level_fields():
 
 def test_run_command_missing_config_fails_cleanly():
     result = runner.invoke(app, ["run", "--config", "does_not_exist.yaml"])
+    assert result.exit_code != 0
+
+
+def test_run_command_missing_local_config_fails_cleanly():
+    result = runner.invoke(
+        app,
+        ["run", "--config", str(EXAMPLE_CONFIG), "--local-config", "does_not_exist.yaml"],
+    )
     assert result.exit_code != 0
 
 

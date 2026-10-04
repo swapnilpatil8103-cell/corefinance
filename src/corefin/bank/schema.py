@@ -303,6 +303,28 @@ DEFAULT_RISK_WEIGHTS: dict[AssetRiskCategory, float] = {
 }
 
 
+DEFAULT_NIM_BETA = 0.3  # ILLUSTRATIVE, not derived -- see bank.ppnr.calibrate_nim_beta for a
+# bank-specific, data-derived alternative.
+DEFAULT_NONINTEREST_INCOME_DECLINE_PCT = 0.10  # ILLUSTRATIVE: a flat 10% decline under stress
+
+
+class PpnrStressConfig(BaseModel):
+    """Pre-provision net revenue (PPNR) stress assumptions -- see
+    `corefin.bank.ppnr`'s own module docstring for the full NII-rate-
+    sensitivity/noninterest-income-decline mechanism and why it exists
+    (NII/noninterest income/expense otherwise never respond to a
+    projection's own macro scenario at all). `BankConfig.ppnr_stress`
+    defaults to `None`, which leaves them held flat -- the original
+    behavior."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    nim_beta: float = Field(default=DEFAULT_NIM_BETA)
+    noninterest_income_decline_pct: float = Field(
+        default=DEFAULT_NONINTEREST_INCOME_DECLINE_PCT, ge=0.0, le=1.0
+    )
+
+
 class BankConfig(BaseModel):
     """Assumptions for ONE standalone bank's statement model. Units: all
     dollar amounts are in $mm (the credit engine's own convention, per
@@ -334,6 +356,12 @@ class BankConfig(BaseModel):
         "balance sheet lines when not static (loan/allowance balances always come from the "
         "credit engine's own CreditLossProjection instead, regardless of this setting; "
         "goodwill/other intangibles stay static -- see balance_sheet.py).",
+    )
+    ppnr_stress: PpnrStressConfig | None = Field(
+        default=None,
+        description="When set (and a rate path is supplied to income_statement."
+        "compute_income_statement), NII/noninterest income respond to the projection's own "
+        "macro scenario -- see corefin.bank.ppnr. None (default) leaves them held flat.",
     )
 
 

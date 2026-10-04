@@ -31,3 +31,10 @@ Thumbs.db
 # Credit-loss forecasting engine: raw downloads and processed panels --
 # never commit real Call Report / FRED / Fed-scenario data or API keys.
 /data/
+
+# Bank M&A simulator: a LOCAL override for configs/example_bank_deal.yaml's
+# acquirer/target RSSD IDs, for anyone adapting this example to their own
+# (possibly sensitive) real deal -- never committed. The checked-in
+# .template file (placeholders only) is explicitly kept, below.
+/configs/local/*.yaml
+!/configs/local/*.yaml.template
