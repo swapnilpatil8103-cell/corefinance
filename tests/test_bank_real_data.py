@@ -54,6 +54,45 @@ def _synthetic_y9c_row(**overrides) -> pd.Series:
     return pd.Series(data)
 
 
+def test_build_opening_balance_reports_allowance_from_rcon3123():
+    call_report_row = _synthetic_call_report_row(RCON3123=45_000.0)
+    opening, _flags = build_opening_balance_from_real_data(
+        name="Acquirer Bank A",
+        bank_id="11111",
+        hc_rssd_id="22222",
+        call_report_row=call_report_row,
+        y9c_row=_synthetic_y9c_row(),
+        bank_level_net_loans_mm=3000.0,
+    )
+    assert opening.reported_allowance_mm == pytest.approx(45.0)
+
+
+def test_build_opening_balance_falls_back_to_rcfd3123_when_rcon_is_zero():
+    call_report_row = _synthetic_call_report_row(RCON3123=0.0, RCFD3123=45_000.0)
+    opening, _flags = build_opening_balance_from_real_data(
+        name="Acquirer Bank A",
+        bank_id="11111",
+        hc_rssd_id="22222",
+        call_report_row=call_report_row,
+        y9c_row=_synthetic_y9c_row(),
+        bank_level_net_loans_mm=3000.0,
+    )
+    assert opening.reported_allowance_mm == pytest.approx(45.0)
+
+
+def test_build_opening_balance_reported_allowance_is_none_when_item_is_absent():
+    call_report_row = _synthetic_call_report_row()  # no RCON3123/RCFD3123 at all
+    opening, _flags = build_opening_balance_from_real_data(
+        name="Acquirer Bank A",
+        bank_id="11111",
+        hc_rssd_id="22222",
+        call_report_row=call_report_row,
+        y9c_row=_synthetic_y9c_row(),
+        bank_level_net_loans_mm=3000.0,
+    )
+    assert opening.reported_allowance_mm is None
+
+
 def test_build_opening_balance_sources_balance_sheet_from_y9c():
     call_report_row = _synthetic_call_report_row()
     y9c_row = _synthetic_y9c_row()

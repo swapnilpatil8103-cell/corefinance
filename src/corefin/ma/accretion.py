@@ -27,7 +27,18 @@ net income available to common (a P/E-style exit) or its incremental
 tangible common equity at the end of the horizon (a P/TBV-style exit) --
 `IrrConfig.exit_multiple_basis`. This represents the value of whatever
 WASN'T already paid out as distributable cash during the horizon, not a
-re-capture of cash already counted."""
+re-capture of cash already counted.
+
+ACCRETION % IS NOT MEANINGFUL AGAINST A NON-POSITIVE STANDALONE EPS: the
+ratio `pro_forma/standalone - 1` can invert sign relative to the DOLLAR
+change when `standalone` is zero or negative (e.g. a smaller loss can
+show a MORE negative % than a bigger one -- confirmed against the real
+acquirer's own Year 1, whose standalone EPS is negative). Every
+accretion % here (both the quarterly arrays and `annual()`'s per-year
+figures) is NaN whenever that period's/year's standalone EPS is <= 0;
+`dollar_accretion_*` (pro forma minus standalone, in $/share) is always
+reported and always meaningful -- read it instead of the % in that
+case."""
 
 from __future__ import annotations
 
@@ -60,11 +71,21 @@ def compute_pro_forma_shares_outstanding_mm(
 @dataclass(frozen=True)
 class AnnualEpsAccretion:
     standalone_eps: float
+    # False when standalone_eps <= 0 -- the RATIO-based accretion % inverts sign/meaning
+    # against a non-positive denominator (e.g. a smaller loss can show a MORE negative % than
+    # a bigger one), so it's set to NaN in every view below; read the dollar accretion instead.
+    accretion_pct_meaningful: bool
+
     pro_forma_eps_gaap: float
-    accretion_dilution_pct_gaap: float
+    dollar_accretion_gaap: float  # pro_forma_eps_gaap - standalone_eps, always meaningful
+    accretion_dilution_pct_gaap: float  # NaN when not accretion_pct_meaningful
+
     pro_forma_eps_excl_one_time: float
+    dollar_accretion_excl_one_time: float
     accretion_dilution_pct_excl_one_time: float
+
     pro_forma_eps_excl_one_time_and_marks: float
+    dollar_accretion_excl_one_time_and_marks: float
     accretion_dilution_pct_excl_one_time_and_marks: float
 
 
@@ -76,28 +97,37 @@ class EpsAccretionResult:
     exchange_ratio: float | None  # new shares issued per target share, if target share count given
 
     standalone_eps: np.ndarray  # $ per share, periods 0..n-1 (period 0 = pre-close actual)
+    # NaN wherever that period's standalone_eps <= 0 -- see module docstring
+    accretion_pct_meaningful: np.ndarray  # dtype bool
 
     # view (a): GAAP
     pro_forma_eps_gaap: np.ndarray  # period 0 = 0.0 (no income flow at the close instant)
-    accretion_dilution_pct_gaap: np.ndarray  # pro_forma/standalone - 1; NaN at period 0
+    dollar_accretion_gaap: np.ndarray  # pro_forma - standalone, always meaningful
+    accretion_dilution_pct_gaap: np.ndarray  # pro_forma/standalone - 1; NaN where not meaningful
 
     # view (b): GAAP excluding one-time Day-2/restructuring charges
     pro_forma_eps_excl_one_time: np.ndarray
+    dollar_accretion_excl_one_time: np.ndarray
     accretion_dilution_pct_excl_one_time: np.ndarray
 
     # view (c): (b) ALSO excluding loan mark accretion and CDI amortization
     pro_forma_eps_excl_one_time_and_marks: np.ndarray
+    dollar_accretion_excl_one_time_and_marks: np.ndarray
     accretion_dilution_pct_excl_one_time_and_marks: np.ndarray
 
     def __post_init__(self) -> None:
         n = self.timeline.n_periods
         for name in (
             "standalone_eps",
+            "accretion_pct_meaningful",
             "pro_forma_eps_gaap",
+            "dollar_accretion_gaap",
             "accretion_dilution_pct_gaap",
             "pro_forma_eps_excl_one_time",
+            "dollar_accretion_excl_one_time",
             "accretion_dilution_pct_excl_one_time",
             "pro_forma_eps_excl_one_time_and_marks",
+            "dollar_accretion_excl_one_time_and_marks",
             "accretion_dilution_pct_excl_one_time_and_marks",
         ):
             array = getattr(self, name)
@@ -109,12 +139,18 @@ class EpsAccretionResult:
         quarterly EPS within each 4-quarter year (periods 1-4, 5-8, ...;
         period 0 excluded, see module docstring) since EPS is additive
         across quarters at a CONSTANT share count."""
-        def _pro_forma_and_accretion(
-            pro_forma_eps: np.ndarray, start: int, end: int, standalone_year: float
-        ) -> tuple[float, float]:
+
+        def _pro_forma_dollar_and_pct(
+            pro_forma_eps: np.ndarray,
+            start: int,
+            end: int,
+            standalone_year: float,
+            pct_meaningful: bool,
+        ) -> tuple[float, float, float]:
             pro_forma_year = float(pro_forma_eps[start:end].sum())
-            accretion = pro_forma_year / standalone_year - 1.0 if standalone_year else float("nan")
-            return pro_forma_year, accretion
+            dollar_accretion = pro_forma_year - standalone_year
+            pct = pro_forma_year / standalone_year - 1.0 if pct_meaningful else float("nan")
+            return pro_forma_year, dollar_accretion, pct
 
         n_years = (len(self.standalone_eps) - 1) // 4
         result = {}
@@ -122,24 +158,33 @@ class EpsAccretionResult:
             start = 1 + year * 4
             end = start + 4
             standalone_year = float(self.standalone_eps[start:end].sum())
+            pct_meaningful = standalone_year > 0.0
 
-            gaap_eps, gaap_accretion = _pro_forma_and_accretion(
-                self.pro_forma_eps_gaap, start, end, standalone_year
+            gaap_eps, gaap_dollar, gaap_pct = _pro_forma_dollar_and_pct(
+                self.pro_forma_eps_gaap, start, end, standalone_year, pct_meaningful
             )
-            excl_one_time_eps, excl_one_time_accretion = _pro_forma_and_accretion(
-                self.pro_forma_eps_excl_one_time, start, end, standalone_year
+            excl_one_time_eps, excl_one_time_dollar, excl_one_time_pct = _pro_forma_dollar_and_pct(
+                self.pro_forma_eps_excl_one_time, start, end, standalone_year, pct_meaningful
             )
-            excl_marks_eps, excl_marks_accretion = _pro_forma_and_accretion(
-                self.pro_forma_eps_excl_one_time_and_marks, start, end, standalone_year
+            excl_marks_eps, excl_marks_dollar, excl_marks_pct = _pro_forma_dollar_and_pct(
+                self.pro_forma_eps_excl_one_time_and_marks,
+                start,
+                end,
+                standalone_year,
+                pct_meaningful,
             )
             result[f"Year {year + 1}"] = AnnualEpsAccretion(
                 standalone_eps=standalone_year,
+                accretion_pct_meaningful=pct_meaningful,
                 pro_forma_eps_gaap=gaap_eps,
-                accretion_dilution_pct_gaap=gaap_accretion,
+                dollar_accretion_gaap=gaap_dollar,
+                accretion_dilution_pct_gaap=gaap_pct,
                 pro_forma_eps_excl_one_time=excl_one_time_eps,
-                accretion_dilution_pct_excl_one_time=excl_one_time_accretion,
+                dollar_accretion_excl_one_time=excl_one_time_dollar,
+                accretion_dilution_pct_excl_one_time=excl_one_time_pct,
                 pro_forma_eps_excl_one_time_and_marks=excl_marks_eps,
-                accretion_dilution_pct_excl_one_time_and_marks=excl_marks_accretion,
+                dollar_accretion_excl_one_time_and_marks=excl_marks_dollar,
+                accretion_dilution_pct_excl_one_time_and_marks=excl_marks_pct,
             )
         return result
 
@@ -162,26 +207,36 @@ def compute_eps_accretion_dilution(
         acquirer_result.income_statement.net_income_available_to_common_mm
         / config.consideration.acquirer_shares_outstanding_mm
     )
+    # period 0 isn't a meaningful pro forma comparison either way (no income flow yet) --
+    # excluded here too, on top of the standalone_eps <= 0 condition (see module docstring)
+    accretion_pct_meaningful = standalone_eps > 0.0
+    accretion_pct_meaningful[0] = False
 
-    def _pro_forma_eps_and_accretion(
+    def _pro_forma_eps_dollar_and_pct(
         net_income_available_to_common_mm: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         eps = net_income_available_to_common_mm / pro_forma_shares_mm
+        dollar_accretion = eps - standalone_eps
         with np.errstate(divide="ignore", invalid="ignore"):
-            accretion_dilution_pct = eps / standalone_eps - 1.0
-        accretion_dilution_pct[0] = float("nan")  # period 0 isn't a meaningful pro forma comparison
-        return eps, accretion_dilution_pct
+            accretion_dilution_pct = np.where(
+                accretion_pct_meaningful, eps / standalone_eps - 1.0, float("nan")
+            )
+        return eps, dollar_accretion, accretion_dilution_pct
 
-    pro_forma_eps_gaap, accretion_dilution_pct_gaap = _pro_forma_eps_and_accretion(
-        pro_forma.net_income_available_to_common_mm
+    pro_forma_eps_gaap, dollar_accretion_gaap, accretion_dilution_pct_gaap = (
+        _pro_forma_eps_dollar_and_pct(pro_forma.net_income_available_to_common_mm)
     )
-    pro_forma_eps_excl_one_time, accretion_dilution_pct_excl_one_time = (
-        _pro_forma_eps_and_accretion(pro_forma.net_income_available_to_common_excl_one_time_mm)
-    )
-    pro_forma_eps_excl_one_time_and_marks, accretion_dilution_pct_excl_one_time_and_marks = (
-        _pro_forma_eps_and_accretion(
-            pro_forma.net_income_available_to_common_excl_one_time_and_marks_mm
-        )
+    (
+        pro_forma_eps_excl_one_time,
+        dollar_accretion_excl_one_time,
+        accretion_dilution_pct_excl_one_time,
+    ) = _pro_forma_eps_dollar_and_pct(pro_forma.net_income_available_to_common_excl_one_time_mm)
+    (
+        pro_forma_eps_excl_one_time_and_marks,
+        dollar_accretion_excl_one_time_and_marks,
+        accretion_dilution_pct_excl_one_time_and_marks,
+    ) = _pro_forma_eps_dollar_and_pct(
+        pro_forma.net_income_available_to_common_excl_one_time_and_marks_mm
     )
 
     return EpsAccretionResult(
@@ -190,11 +245,15 @@ def compute_eps_accretion_dilution(
         pro_forma_shares_outstanding_mm=pro_forma_shares_mm,
         exchange_ratio=exchange_ratio,
         standalone_eps=standalone_eps,
+        accretion_pct_meaningful=accretion_pct_meaningful,
         pro_forma_eps_gaap=pro_forma_eps_gaap,
+        dollar_accretion_gaap=dollar_accretion_gaap,
         accretion_dilution_pct_gaap=accretion_dilution_pct_gaap,
         pro_forma_eps_excl_one_time=pro_forma_eps_excl_one_time,
+        dollar_accretion_excl_one_time=dollar_accretion_excl_one_time,
         accretion_dilution_pct_excl_one_time=accretion_dilution_pct_excl_one_time,
         pro_forma_eps_excl_one_time_and_marks=pro_forma_eps_excl_one_time_and_marks,
+        dollar_accretion_excl_one_time_and_marks=dollar_accretion_excl_one_time_and_marks,
         accretion_dilution_pct_excl_one_time_and_marks=accretion_dilution_pct_excl_one_time_and_marks,
     )
 
@@ -364,3 +423,32 @@ def compute_acquirer_irr(
     cash_flows[-1] += irr_config.exit_multiple * exit_basis_mm
 
     return compute_irr_from_cash_flows(cash_flows)
+
+
+def compute_acquirer_irr_sensitivity(
+    acquirer_result: BankModelResult,
+    pro_forma: ProFormaProjection,
+    sources_and_uses: SourcesAndUses,
+    pro_forma_cet1_at_close_mm: float,
+    pro_forma_rwa_at_close_mm: float,
+    config: DealConfig,
+    exit_multiples: list[float],
+) -> dict[float, float]:
+    """`compute_acquirer_irr` at each of `exit_multiples`, holding every
+    other `config.irr` assumption fixed -- a quick sensitivity table,
+    since the exit multiple is a real market assumption this project has
+    no basis to pick a single "correct" value for (see `IrrConfig.
+    exit_multiple`'s own docstring)."""
+    return {
+        multiple: compute_acquirer_irr(
+            acquirer_result,
+            pro_forma,
+            sources_and_uses,
+            pro_forma_cet1_at_close_mm,
+            pro_forma_rwa_at_close_mm,
+            config.model_copy(
+                update={"irr": config.irr.model_copy(update={"exit_multiple": multiple})}
+            ),
+        )
+        for multiple in exit_multiples
+    }

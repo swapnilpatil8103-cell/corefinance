@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from corefin.bank.allowance import anchor_allowance_to_reported
 from corefin.bank.balance_sheet import BalanceSheet, project_balance_sheet
 from corefin.bank.capital import CapitalResult, compute_capital
 from corefin.bank.income_statement import IncomeStatement, compute_income_statement
@@ -38,11 +39,22 @@ def run_bank_model(
 ) -> BankModelResult:
     """`credit_projection` must already be a SINGLE-bank projection
     (`CreditLossProjection.bank_identifier == opening.bank_id`) aligned to
-    `timeline`."""
+    `timeline`. If `opening.reported_allowance_mm` is set, `credit_projection`
+    is first re-anchored to it (`corefin.bank.allowance.
+    anchor_allowance_to_reported`) -- see that module's docstring for why
+    (the credit engine's own raw jump-off allowance can disagree with the
+    bank's real reported figure, producing an artificial provision spike
+    at the first projected quarter). Left unanchored (old behavior) when
+    `reported_allowance_mm` is None, e.g. for synthetic test fixtures that
+    don't model this nuance."""
     if credit_projection.bank_identifier != opening.bank_id:
         raise ValueError(
             f"credit_projection is for bank_identifier={credit_projection.bank_identifier!r}, "
             f"expected {opening.bank_id!r} (opening.bank_id)"
+        )
+    if opening.reported_allowance_mm is not None:
+        credit_projection = anchor_allowance_to_reported(
+            credit_projection, opening.reported_allowance_mm
         )
 
     provision_expense_total_mm = credit_projection.provision_expense_mm.sum(axis=0)

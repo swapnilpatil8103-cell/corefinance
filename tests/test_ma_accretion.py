@@ -11,7 +11,7 @@ import pytest
 from corefin.bank.model import run_bank_model
 from corefin.bank.schema import BankConfig, BankOpeningBalance
 from corefin.credit.interface import CreditLossProjection
-from corefin.ma.accretion import compute_irr_from_cash_flows
+from corefin.ma.accretion import compute_acquirer_irr_sensitivity, compute_irr_from_cash_flows
 from corefin.ma.model import run_deal_model
 from corefin.ma.schema import (
     CdiConfig,
@@ -379,3 +379,83 @@ def test_tbv_earnback_label_reports_years_and_quarter_when_reached():
         label = result.tbv_earnback.earnback_label
         assert "beyond horizon" not in label
         assert "years" in label
+
+
+def test_accretion_pct_not_meaningful_when_standalone_eps_is_negative():
+    # acquirer's noninterest expense alone dwarfs its income -- negative pretax/net income/EPS
+    # every period, replicating the real pair's own Year-1 negative-standalone-EPS case
+    acquirer_opening = _balanced_opening(
+        "Acquirer Bank A",
+        "111",
+        "222",
+        net_loans_mm=2000.0,
+        noninterest_expense_jumpoff_mm=1000.0,
+    )
+    target_opening = _balanced_opening(
+        "Target Bank B",
+        "333",
+        "444",
+        net_loans_mm=784.0,
+        equity_mm=400.0,
+        deposits_mm=1200.0,
+        borrowings_mm=50.0,
+        other_liabilities_mm=20.0,
+        securities_mm=200.0,
+        other_assets_mm=40.0,
+    )
+    acquirer_result = _run_bank(acquirer_opening, 2000.0)
+    target_result = _run_bank(target_opening, 784.0)
+    assert acquirer_result.income_statement.net_income_available_to_common_mm[1] < 0.0
+
+    config = DealConfig(
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.5,
+            stock_pct=0.8,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        ),
+        credit_mark=CreditMarkConfig(credit_mark_pct=0.02, pcd_share=0.3),
+    )
+    result = run_deal_model(acquirer_result, target_result, BankConfig(), BankConfig(), config)
+
+    year1 = result.eps_accretion.annual()["Year 1"]
+    assert year1.standalone_eps < 0.0
+    assert year1.accretion_pct_meaningful is False
+    assert np.isnan(year1.accretion_dilution_pct_gaap)
+    assert np.isnan(year1.accretion_dilution_pct_excl_one_time)
+    assert np.isnan(year1.accretion_dilution_pct_excl_one_time_and_marks)
+    # the dollar figure is always reported and finite, even when the % isn't meaningful
+    assert np.isfinite(year1.dollar_accretion_gaap)
+
+
+def test_accretion_pct_is_meaningful_when_standalone_eps_is_positive():
+    result = _run_deal()
+    year1 = result.eps_accretion.annual()["Year 1"]
+    assert year1.standalone_eps > 0.0
+    assert year1.accretion_pct_meaningful is True
+    assert np.isfinite(year1.accretion_dilution_pct_gaap)
+
+
+def test_irr_sensitivity_is_monotonic_in_the_exit_multiple():
+    acquirer_result, target_result = _acquirer_and_target()
+    config = DealConfig(
+        consideration=ConsiderationConfig(
+            price_to_tbv=1.5,
+            stock_pct=0.8,
+            acquirer_share_price=25.0,
+            acquirer_shares_outstanding_mm=50.0,
+        ),
+        credit_mark=CreditMarkConfig(credit_mark_pct=0.02, pcd_share=0.3),
+    )
+    result = run_deal_model(acquirer_result, target_result, BankConfig(), BankConfig(), config)
+    irr_by_multiple = compute_acquirer_irr_sensitivity(
+        acquirer_result,
+        result.pro_forma_projection,
+        result.sources_and_uses,
+        result.pro_forma_cet1_bridge.pro_forma_cet1_mm,
+        result.pro_forma_capital_ratios.pro_forma_rwa_mm,
+        config,
+        exit_multiples=[1.0, 1.5, 2.0],
+    )
+    irrs = [irr_by_multiple[m] for m in (1.0, 1.5, 2.0)]
+    assert irrs[0] <= irrs[1] <= irrs[2]

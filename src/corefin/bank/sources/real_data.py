@@ -65,6 +65,8 @@ import pandas as pd
 
 from corefin.bank import schema
 from corefin.bank.schema import BankOpeningBalance
+from corefin.credit.panel import TOTAL_ALLOWANCE_RCFD_FALLBACK_ITEM
+from corefin.credit.schema import TOTAL_ALLOWANCE_ITEM
 
 _THOUSANDS_TO_MM = 1.0 / 1_000.0
 _YTD_Q4_TO_QUARTERLY = 1.0 / 4.0
@@ -116,7 +118,11 @@ def build_opening_balance_from_real_data(
     `capital_parse.parse_bank_capital_zip`'s / `fr_y9c.parse_y9c_bulk_zip`'s
     output, already filtered to this bank/holding company. Dollar item
     values are in thousands (both sources' own convention); converted to
-    $mm here. `bank_level_net_loans_mm`: the credit engine's own jump-off
+    $mm here. Also sets `BankOpeningBalance.reported_allowance_mm` from
+    `call_report_row`'s own RCON3123 (RCFD3123 fallback) -- the real
+    reported allowance `model.run_bank_model` anchors the credit engine's
+    own modeled allowance to; see `corefin.bank.allowance`'s module
+    docstring. `bank_level_net_loans_mm`: the credit engine's own jump-off
     total loan balance net of allowance (already in $mm), e.g.
     `CreditLossProjection.balance_total_mm[0] - CreditLossProjection.
     allowance_total_mm[0]`.
@@ -144,6 +150,21 @@ def build_opening_balance_from_real_data(
     hc_total_assets_mm = y9c_row[schema.HC_TOTAL_ASSETS_ITEM] * _THOUSANDS_TO_MM
     hc_total_liabilities_mm = y9c_row[schema.HC_TOTAL_LIABILITIES_ITEM] * _THOUSANDS_TO_MM
     preferred_stock_mm = y9c_row[schema.HC_PREFERRED_STOCK_ITEM] * _THOUSANDS_TO_MM
+
+    # bank-level (not HC-level), the SAME consolidation level as the credit engine's own
+    # loan/NCO data this anchors against -- see corefin.bank.allowance's module docstring.
+    # RCFD (consolidated) fallback wherever RCON (domestic-only) is missing or exactly zero,
+    # matching credit.panel.apply_rcfd_fallback's own documented convention.
+    rcon_allowance = call_report_row.get(TOTAL_ALLOWANCE_ITEM)
+    rcfd_allowance = call_report_row.get(TOTAL_ALLOWANCE_RCFD_FALLBACK_ITEM)
+    rcon_missing = rcon_allowance is None or pd.isna(rcon_allowance)
+    rcfd_available = rcfd_allowance is not None and not pd.isna(rcfd_allowance)
+    if (rcon_missing or rcon_allowance == 0) and rcfd_available:
+        reported_allowance_mm: float | None = rcfd_allowance * _THOUSANDS_TO_MM
+    elif not rcon_missing:
+        reported_allowance_mm = rcon_allowance * _THOUSANDS_TO_MM
+    else:
+        reported_allowance_mm = None  # item not present in this row -- anchoring skipped
 
     deposits_mm = call_report_row[schema.TOTAL_DEPOSITS_ITEM] * _THOUSANDS_TO_MM
     borrowings_mm = 0.0  # see module docstring -- folded into other_liabilities_mm
@@ -256,6 +277,7 @@ def build_opening_balance_from_real_data(
         noninterest_income_jumpoff_mm=noninterest_income_jumpoff_mm,
         noninterest_expense_jumpoff_mm=noninterest_expense_jumpoff_mm,
         preferred_dividends_jumpoff_mm=preferred_dividends_jumpoff_mm,
+        reported_allowance_mm=reported_allowance_mm,
         preferred_stock_mm=preferred_stock_mm,
         goodwill_net_of_dtl_mm=y9c_row[schema.HC_GOODWILL_NET_OF_DTL_ITEM] * _THOUSANDS_TO_MM,
         other_intangibles_net_of_dtl_mm=(

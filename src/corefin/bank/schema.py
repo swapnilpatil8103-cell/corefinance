@@ -385,6 +385,15 @@ class BankOpeningBalance(BaseModel):
     # static preferred_stock_mm face amount below, not with balance-sheet/earning-asset size.
     preferred_dividends_jumpoff_mm: float = Field(default=0.0, ge=0.0)
 
+    # The bank's own REPORTED total allowance for credit losses at jump-off (Call Report
+    # RCON3123, RCFD3123 fallback) -- None (default) leaves the credit engine's own modeled
+    # jump-off allowance unanchored, the old behavior, fine for synthetic test fixtures. When
+    # set, model.run_bank_model re-anchors the CreditLossProjection to this real figure before
+    # using it -- see corefin.bank.allowance's module docstring for why (the model's own
+    # backward-looking jump-off estimate can disagree with the real reported number, producing
+    # an artificial one-time provision spike at the first projected quarter).
+    reported_allowance_mm: float | None = Field(default=None, ge=0.0)
+
     # Explicit RC-R Part I CET1 bridge -- see "THE CET1 BRIDGE" in the module docstring.
     # Default 0.0 for items that are genuinely zero/rare for most banks (preferred stock, the
     # smaller AOCI sub-items) rather than forcing every caller to supply nine fields.
