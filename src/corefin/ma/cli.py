@@ -42,6 +42,14 @@ from corefin.credit.cli import _load_long_history_frames
 from corefin.credit.projection import FED_COMPARISON_QUARTERS
 from corefin.credit.sources.fed_stress_test_results import DFAST_2026_SEVERELY_ADVERSE_LOSS_RATES
 from corefin.ma.accretion import compute_acquirer_irr_sensitivity
+from corefin.ma.charts import (
+    render_eps_accretion_chart,
+    render_price_cost_save_heatmap,
+    render_sensitivity_tornado_chart,
+    render_stress_cet1_chart,
+    render_tbv_earnback_chart,
+)
+from corefin.ma.excel_export import export_deal_to_excel
 from corefin.ma.horizon import (
     build_deal_horizon_bank_result,
     extend_credit_loss_projection,
@@ -360,6 +368,12 @@ def run(
     ),
     monte_carlo_seed: int = typer.Option(
         0, "--monte-carlo-seed", help="Stage 6 Monte Carlo RNG seed (reproducible draws)."
+    ),
+    output: Path = typer.Option(
+        Path("deal.xlsx"), "--output", help="Where to export the detailed deal workbook."
+    ),
+    charts_dir: Path = typer.Option(
+        Path("."), "--charts-dir", help="Directory to write the five chart PNGs into."
     ),
 ) -> None:
     """Runs `config` (an `ExampleDealConfig` YAML -- see `configs/
@@ -765,6 +779,39 @@ def run(
         pct_str = "  ".join(f"p{p}={fmt.format(v)}" for p, v in pct.items())
         typer.echo(f"    {metric_name}: {pct_str}")
     typer.echo(f"    P(TBV earnback beyond horizon) = {mc.probability_beyond_horizon():.1%}")
+
+    typer.echo("\n=== Stage 7: Excel Export & Charts ===")
+    export_deal_to_excel(
+        str(output),
+        example.acquirer.label,
+        example.target.label,
+        example.deal,
+        deal_result.pro_forma_capital_ratios,
+        deal_result.eps_accretion,
+        deal_result.tbv_earnback,
+        irr_by_multiple,
+        stress_results,
+        tornado,
+        grid,
+        mc,
+    )
+    typer.echo(f"  Exported workbook to {output}")
+
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    render_eps_accretion_chart(deal_result.eps_accretion, str(charts_dir / "eps_accretion.png"))
+    render_tbv_earnback_chart(deal_result.tbv_earnback, str(charts_dir / "tbv_earnback.png"))
+    render_stress_cet1_chart(stress_results, str(charts_dir / "stress_cet1.png"))
+    render_sensitivity_tornado_chart(
+        tornado,
+        "year2_accretion_pct_excl_one_time",
+        "Year-2 accretion (excl. one-time)",
+        str(charts_dir / "tornado.png"),
+    )
+    render_price_cost_save_heatmap(grid, str(charts_dir / "heatmap.png"))
+    typer.echo(
+        f"  Exported charts to {charts_dir}/ (eps_accretion.png, tbv_earnback.png, "
+        "stress_cet1.png, tornado.png, heatmap.png)"
+    )
 
 
 if __name__ == "__main__":

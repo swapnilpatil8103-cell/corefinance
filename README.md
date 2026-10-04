@@ -1193,20 +1193,35 @@ residual scenario-severity difference.
 
 ## Bank M&A CET1 & Accretion Simulator
 
-Project #2: purchase accounting at deal close (goodwill, PCD/Day-2
-allowance, the pro forma CET1/Tier 1 leverage/total capital bridge) and
-Stage 4 deal economics (EPS accretion/dilution in three views, TBV per
-share dilution/earnback, acquirer IRR) for a two-bank merger, consuming
+Project #2: a two-bank merger model running purchase accounting at deal
+close through to a full stress test and sensitivity analysis, consuming
 each bank's own standalone statement model (`corefin.bank`) and the
 Credit-Loss Forecasting Engine's `CreditLossProjection` (above) for
 provision/allowance. Real two-bank example in
 `configs/example_bank_deal.yaml` (illustrative deal terms only, never a
-real announced transaction) -- run it with
+real announced transaction, and every printed/exported label is the
+anonymized "Acquirer Bank A"/"Target Bank B" -- real bank names/tickers
+never appear in committed or displayed output, only as RSSD IDs in
+config/docstrings) -- run it with
 `corefin ma run --config configs/example_bank_deal.yaml` (needs the same
 locally-fetched FFIEC/FR Y-9C/credit-engine files the rest of this
 project's real-data workflows do; see `corefin/ma/cli.py`'s own module
-docstring). A fuller CLI (Excel export, charts) and this section's own
-expanded write-up are Stage 7, queued.
+docstring).
+
+### Stages 1-4: purchase accounting, capital bridge and deal economics
+
+Stage 1-3 build each bank's opening balance sheet from real Call
+Report/FR Y-9C data, extend both banks' credit-loss projections to the
+deal's own horizon, and run purchase accounting at close: the credit
+mark (with a PCD/non-PCD split, so only the non-PCD share flows through
+goodwill), the rate mark on the target's securities/loans, core deposit
+intangible (CDI) amortization, goodwill as the balancing plug, and the
+resulting pro forma CET1/Tier 1 leverage/total capital bridge. Stage 4
+turns that into deal economics: EPS accretion/dilution in three views
+(GAAP; excluding one-time deal charges; excluding one-time charges AND
+purchase-accounting marks/CDI, to isolate the "clean" run-rate number),
+TBV per share dilution and earnback, and acquirer IRR across a range of
+exit multiples.
 
 **A finding worth flagging explicitly**, surfaced by `corefin ma run`'s
 own realized-vs-projected NCO rate report: the real example deal's
@@ -1225,6 +1240,20 @@ CONSERVATIVE relative to a simple extrapolation of this bank's own
 recent experience, not as this project's own best-guess "expected"
 case.
 
+### Stage 5: stress test
+
+`corefin.ma.stress` reruns both banks' PPNR and credit-loss paths under
+the Fed's severely adverse scenario over its own 9-quarter DFAST window
+(separate from the baseline-scenario deal horizon above) for two
+entities -- the acquirer standalone and the pro forma combined bank --
+and reports each one's minimum CET1 ratio, peak-to-trough CET1 change,
+whether it breaches the Basel III 4.5% minimum, and an illustrative
+stress capital buffer. On the real example deal, CET1 declines 3.40pp
+for the acquirer standalone and 4.26pp for the pro forma combined bank
+under severely adverse -- the pro forma entity falls further because
+the deal adds the target's own credit and rate risk without a
+proportional capital cushion at close.
+
 **A caveat on the calibrated NIM beta** (`corefin.bank.ppnr.
 calibrate_nim_beta`, Stage 5's PPNR stress): it's calibrated on
 2020Q1-2021Q4, the one real episode in this project's own cached data
@@ -1239,7 +1268,83 @@ NIM-to-rate sensitivity beyond what a rate move alone would cause, so
 the calibrated beta probably OVERSTATES this specific channel's true
 rate sensitivity -- `corefin ma run` reports each bank's own calibrated
 beta next to the illustrative default so this can be judged directly,
-not hidden behind a single number.
+not hidden behind a single number. On the real example deal the two
+banks calibrate to materially different betas (acquirer +0.467, target
++1.061), underscoring why a single shared illustrative default can't
+fit both.
+
+### Stage 6: sensitivities and Monte Carlo
+
+`corefin.ma.sensitivity` builds a tornado across seven deal drivers
+(price, credit mark, rate mark, cost saves, CDI, stock share of
+consideration, and NIM beta) against four metrics (year-2 accretion
+excluding one-time items, TBV dilution at close, earnback, and minimum
+stressed CET1); a price x cost-save grid of year-2 accretion and
+earnback; and a Monte Carlo over the four stochastic deal assumptions
+(credit mark, cost-save realization, rate mark, NIM beta), reusing this
+project's own seeded-RNG convention (`np.random.default_rng(seed)`,
+each variable's full array of draws generated in one vectorized call)
+rather than a tensor-vectorized scenario batch -- this project has no
+leading scenario/batch axis the way the Sponsor LBO engine's `DriverSet`
+does, so each draw's deal re-evaluation is looped in Python, with every
+individual evaluation itself fully vectorized across periods via the
+existing Stage 2-5 numpy functions. Varying price, credit mark, rate
+mark, cost saves, CDI or stock share only requires rerunning the deal
+model and stress test against the SAME two `BankModelResult`s; varying
+NIM beta additionally rebuilds both banks' PPNR path, since it feeds
+`run_bank_model` directly. NIM beta is deliberately treated as ONE
+shared driver, not two independent per-bank ones, matching the brief's
+own framing -- a sensitivity override applies the same scalar to both
+banks, while the base case (no override) still uses each bank's own
+calibrated value.
+
+**A result worth flagging, confirmed as correct rather than a bug**: in
+the tornado, the "Price (P/TBV)" driver's minimum-stressed-CET1 row
+shows byte-identical low and high values. For a 100%-or-mostly-stock
+deal this is exactly right, not a wiring mistake -- the stock
+consideration and the resulting goodwill both move by the same dollar
+amount as price changes (since the fair value of net assets acquired
+doesn't depend on price), so the CET1 bridge's `stock consideration -
+goodwill` term is price-invariant in dollars. TBV per share still moves
+with price in the same tornado, because new shares issued scales with
+price at a FIXED acquirer share price, diluting the per-share
+denominator even though the dollar TBV numerator doesn't move. This
+directly extends an earlier finding from the Sponsor LBO engine (TBV
+neutrality requires the acquirer's stock-issuance price to equal its
+own standalone TBV/share) into the regulatory-capital domain.
+
+### Stage 7: CLI, Excel export and charts
+
+`corefin ma run --config <file> [--output deal.xlsx] [--charts-dir dir]
+[--monte-carlo-draws N] [--monte-carlo-seed N]` runs every stage above
+end to end and exports a workbook with nine sheets -- Summary, EPS
+Accretion, TBV & IRR, Stress Test, Tornado, two price x cost-save grids
+(year-2 accretion and earnback), and Monte Carlo percentiles/draws --
+plus five PNGs into `--charts-dir`: EPS accretion by year (standalone
+vs. pro forma GAAP), the TBV/share earnback path with a marker at the
+crossover quarter, pro forma CET1 under baseline vs. severely adverse
+against the Basel III 4.5% minimum, a sensitivity tornado, and the price
+x cost-save heatmap. Both the workbook (`corefin.ma.excel_export`) and
+the charts (`corefin.ma.charts`) follow this project's established
+conventions from the Credit-Loss Engine and Sponsor LBO engine's own
+export modules -- one `_<name>_frame` helper per sheet, headless
+matplotlib with `fig.savefig(path, dpi=150)` -- and every label passed
+into either one is the caller's own `acquirer_label`/`target_label`
+string, never a hardcoded name.
+
+### Limitations, honestly
+
+- The NIM beta caveat above (Stage 5) is the single biggest judgment
+  call baked into this project's severely-adverse stress path.
+- The Monte Carlo (Stage 6) draws its four stochastic inputs
+  independently; a real deal's credit mark, rate mark and NIM beta are
+  plausibly correlated (all three worsen together in a genuine rate
+  shock), so the reported percentile spread is probably a bit wide in
+  the tails relative to a correlated draw.
+- `--monte-carlo-draws` defaults to 500, not enough for precise
+  tail percentiles (e.g. P1/P99) -- the default is tuned for a readable
+  CLI summary and a reasonably fast Excel export, not a research-grade
+  tail estimate.
 
 ## Testing conventions
 
