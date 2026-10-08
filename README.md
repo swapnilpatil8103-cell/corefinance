@@ -1208,6 +1208,47 @@ locally-fetched FFIEC/FR Y-9C/credit-engine files the rest of this
 project's real-data workflows do; see `corefin/ma/cli.py`'s own module
 docstring).
 
+### Results on the example deal (illustrative only)
+
+Every figure below is `corefin ma run`'s own output on
+`configs/example_bank_deal.yaml` -- illustrative deal terms against real
+bank financials, never a real announced transaction, and never a
+forecast or recommendation.
+
+| Metric | Value |
+| --- | ---: |
+| Year 1 EPS accretion (GAAP / excl. one-time) | -36.59% / -1.99% |
+| Year 2 EPS accretion (GAAP / excl. one-time) | +6.38% / +6.38% |
+| Year 3 EPS accretion (GAAP / excl. one-time) | +7.04% / +7.04% |
+| TBV per share dilution at close | -8.42% |
+| TBV earnback | beyond horizon |
+| Acquirer IRR at 1.5x exit (base case) | +5.32% |
+| Acquirer IRR, 1.0x-2.0x exit range | -2.88% to +11.56% |
+| Pro forma CET1 ratio at close | 12.19% |
+| Minimum CET1, severely adverse (acquirer standalone) | 8.27% |
+| Minimum CET1, severely adverse (pro forma combined) | 7.93% |
+| Monte Carlo year-2 accretion, p5 / p50 / p95 (500 draws) | +3.57% / +11.73% / +20.90% |
+| Monte Carlo TBV earnback, p5 / p50 / p95 (500 draws) | 100% of draws land beyond the 5-year horizon |
+
+Year 1's GAAP accretion is deeply negative mainly because of one-time
+deal charges (restructuring, Day-2 PCD provision) that Year 2 onward
+doesn't repeat -- the "excl. one-time" column isolates that, and both
+columns converge by Year 2. TBV earnback never completes within the
+5-year horizon on the example deal's own assumptions, consistent with
+every Monte Carlo draw also landing beyond it.
+
+![EPS accretion/dilution by year: standalone vs. pro forma GAAP](docs/ma/eps_accretion.png)
+
+TBV per share dilution at close and the (non-)earnback path over the
+deal horizon:
+
+![TBV per share: standalone vs. pro forma, with earnback marker](docs/ma/tbv_earnback.png)
+
+Pro forma combined CET1 ratio under baseline vs. the Fed's severely
+adverse scenario, against the Basel III 4.5% minimum:
+
+![Pro forma CET1: baseline vs. severely adverse](docs/ma/stress_cet1.png)
+
 ### Stages 1-4: purchase accounting, capital bridge and deal economics
 
 Stage 1-3 build each bank's opening balance sheet from real Call
