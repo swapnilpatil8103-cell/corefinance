@@ -1227,15 +1227,59 @@ forecast or recommendation.
 | Pro forma CET1 ratio at close | 12.19% |
 | Minimum CET1, severely adverse (acquirer standalone) | 8.27% |
 | Minimum CET1, severely adverse (pro forma combined) | 7.93% |
-| Monte Carlo year-2 accretion, p5 / p50 / p95 (500 draws) | +3.57% / +11.73% / +20.90% |
+| Monte Carlo year-2 accretion, p5 / p50 / p95 (500 draws) | +4.57% / +13.44% / +23.69% |
 | Monte Carlo TBV earnback, p5 / p50 / p95 (500 draws) | 100% of draws land beyond the 5-year horizon |
 
 Year 1's GAAP accretion is deeply negative mainly because of one-time
-deal charges (restructuring, Day-2 PCD provision) that Year 2 onward
-doesn't repeat -- the "excl. one-time" column isolates that, and both
-columns converge by Year 2. TBV earnback never completes within the
-5-year horizon on the example deal's own assumptions, consistent with
-every Monte Carlo draw also landing beyond it.
+deal charges (restructuring, the Day-2 CECL allowance booked on the
+target's NON-PCD loans -- the PCD share of the credit mark goes through
+the balance sheet/goodwill instead, with no income-statement effect at
+close) that Year 2 onward doesn't repeat -- the "excl. one-time" column
+isolates that, and both columns converge by Year 2. TBV earnback never
+completes within the 5-year horizon on the example deal's own
+assumptions, consistent with every Monte Carlo draw also landing beyond
+it. Standalone EPS itself also declines over the projection horizon
+($2.47 -> $1.97) -- that's the baseline-scenario NIM compression implied
+by the acquirer's own calibrated NIM beta (+0.467) against a declining
+baseline rate path, the SAME calibration the NIM beta caveat above flags
+as probably overstated, so this decline should be read with that caveat
+in mind, not as an independent finding.
+
+**Takeaway**: at the base case's 1.5x TBV price, this deal is
+value-destructive for the acquirer on the example deal's own
+assumptions -- only +5.3% IRR (below a typical double-digit cost-of-
+equity hurdle) and TBV earnback beyond the 5-year horizon -- mainly
+because the premium paid (0.5x TBV over book) buys the target's excess
+regulatory capital rather than earnings power, and that premium shows
+up entirely as dilution with nothing earning it back within the
+horizon. From the existing price x cost-save grid (above), earnback
+only falls within reach -- 3.75 years -- at the grid's lowest price
+(1.20x TBV) AND its highest illustrative cost-save assumption (35% of
+target noninterest expense) simultaneously; at every other combination
+in the grid, including 1.20x TBV at the base 25% cost-save assumption,
+earnback remains beyond the horizon.
+
+**A confirmed, non-obvious finding on the Monte Carlo/tornado's own NIM
+beta dimension**: centering the shared NIM-beta override on the
+acquirer's own calibrated beta (+0.467, the tighter of the two banks'
+own values) still leaves the Monte Carlo's median year-2 accretion
+(+13.44%) well above the true base case (+6.38%, which uses the
+acquirer's own +0.467 and the target's own +1.061 SEPARATELY, not a
+shared value). This isn't a centering bug -- a direct probe shows year-2
+accretion rising roughly monotonically with whatever single beta is
+shared across both banks (0.0 -> +6.97%, +0.467 -> +13.71%,
++1.061 -> +36.09%), and the true base case's own value sits closest to
+the beta=0 end of that curve, not to either bank's own value or their
+average. Forcing ONE shared scalar onto both banks (this module's own
+design choice, matching the brief's framing of NIM beta as a single
+driver) structurally collapses the acquirer/target DIVERGENCE in rate
+sensitivity that itself drives part of the true base case's result, and
+no single override value can reproduce that divergence. The base case
+does fall within the Monte Carlo's own p5-p95 range (+4.57% to +23.69%),
+just well below its median -- read the NIM-beta dimension of Stage 6 as
+"how would results change if both banks shared one rate-sensitivity
+assumption," not as a symmetric perturbation around the true,
+per-bank-calibrated base case.
 
 ![EPS accretion/dilution by year: standalone vs. pro forma GAAP](docs/ma/eps_accretion.png)
 

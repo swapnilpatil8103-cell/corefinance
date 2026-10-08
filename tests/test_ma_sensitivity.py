@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from corefin.bank.model import run_bank_model
-from corefin.bank.schema import BankConfig, BankOpeningBalance
+from corefin.bank.schema import BankConfig, BankOpeningBalance, PpnrStressConfig
 from corefin.credit.interface import CreditLossProjection
 from corefin.ma.model import run_deal_model
 from corefin.ma.schema import ConsiderationConfig, CreditMarkConfig, DealConfig
@@ -108,7 +108,9 @@ def _credit_projection_for(opening, net_loans_mm, timeline):
     )
 
 
-def _build_context() -> DealContext:
+def _build_context(
+    acquirer_nim_beta: float | None = None, target_nim_beta: float | None = None
+) -> DealContext:
     acquirer_opening = _balanced_opening("Acquirer Bank A", "111", "222", net_loans_mm=2000.0)
     target_opening = _balanced_opening(
         "Target Bank B",
@@ -127,13 +129,30 @@ def _build_context() -> DealContext:
     acquirer_stress_proj = _credit_projection_for(acquirer_opening, 2000.0, _STRESS_TIMELINE)
     target_stress_proj = _credit_projection_for(target_opening, 784.0, _STRESS_TIMELINE)
 
-    acquirer_bank_config = BankConfig()
-    target_bank_config = BankConfig()
+    acquirer_bank_config = (
+        BankConfig()
+        if acquirer_nim_beta is None
+        else BankConfig(ppnr_stress=PpnrStressConfig(nim_beta=acquirer_nim_beta))
+    )
+    target_bank_config = (
+        BankConfig()
+        if target_nim_beta is None
+        else BankConfig(ppnr_stress=PpnrStressConfig(nim_beta=target_nim_beta))
+    )
+    baseline_rate_path_pp = np.full(_BASELINE_TIMELINE.n_periods, 3.7)
     acquirer_result = run_bank_model(
-        acquirer_opening, acquirer_baseline_proj, acquirer_bank_config, _BASELINE_TIMELINE
+        acquirer_opening,
+        acquirer_baseline_proj,
+        acquirer_bank_config,
+        _BASELINE_TIMELINE,
+        rate_path_pp=baseline_rate_path_pp,
     )
     target_result = run_bank_model(
-        target_opening, target_baseline_proj, target_bank_config, _BASELINE_TIMELINE
+        target_opening,
+        target_baseline_proj,
+        target_bank_config,
+        _BASELINE_TIMELINE,
+        rate_path_pp=baseline_rate_path_pp,
     )
 
     base_config = DealConfig(
@@ -158,7 +177,7 @@ def _build_context() -> DealContext:
         target_baseline_projection=target_baseline_proj,
         acquirer_severely_adverse_projection=acquirer_stress_proj,
         target_severely_adverse_projection=target_stress_proj,
-        baseline_rate_path_pp=np.full(_BASELINE_TIMELINE.n_periods, 3.7),
+        baseline_rate_path_pp=baseline_rate_path_pp,
         severely_adverse_rate_path_pp=np.full(_STRESS_TIMELINE.n_periods, 3.7),
         base_config=base_config,
         acquirer_unexplained_cet1_residual_mm=0.0,
@@ -200,10 +219,28 @@ def test_evaluate_deal_nim_beta_override_changes_metrics():
 
 def test_build_default_tornado_drivers_have_seven_entries_with_low_below_high():
     ctx = _build_context()
-    drivers = build_default_tornado_drivers(ctx.base_config)
+    drivers = build_default_tornado_drivers(ctx)
     assert len(drivers) == 7
     for driver in drivers:
         assert driver.low <= driver.high
+
+
+def test_nim_beta_tornado_driver_is_centered_on_the_acquirers_own_calibrated_beta():
+    # Acquirer 0.467, target 1.061 -- the real example deal's own calibrated betas
+    # (see README). The shared-override range is centered on the ACQUIRER's own
+    # value, not the target's or an average -- see sensitivity.py's own module-level
+    # comment for why this still doesn't fully bracket the base case.
+    ctx = _build_context(acquirer_nim_beta=0.467, target_nim_beta=1.061)
+    drivers = build_default_tornado_drivers(ctx)
+    nim_beta_driver = next(d for d in drivers if d.name == "NIM beta")
+    assert nim_beta_driver.low == pytest.approx(0.467 - 0.225)
+    assert nim_beta_driver.high == pytest.approx(0.467 + 0.225)
+
+
+def test_monte_carlo_nim_beta_draws_are_centered_on_the_acquirers_own_calibrated_beta():
+    ctx = _build_context(acquirer_nim_beta=0.467, target_nim_beta=1.061)
+    result = run_monte_carlo(ctx, n_draws=2000, seed=0)
+    assert result.nim_beta.mean() == pytest.approx(0.467, abs=0.02)
 
 
 def test_compute_tornado_returns_one_row_per_driver():

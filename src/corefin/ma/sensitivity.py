@@ -38,13 +38,54 @@ from dataclasses import dataclass
 import numpy as np
 
 from corefin.bank.model import BankModelResult, run_bank_model
-from corefin.bank.schema import BankConfig, BankOpeningBalance, PpnrStressConfig
+from corefin.bank.schema import (
+    DEFAULT_NIM_BETA,
+    BankConfig,
+    BankOpeningBalance,
+    PpnrStressConfig,
+)
 from corefin.credit.interface import CreditLossProjection
 from corefin.ma.model import run_deal_model
 from corefin.ma.schema import DealConfig
 from corefin.ma.stress import run_stress_test
 
 DEFAULT_MONTE_CARLO_DRAWS = 500
+
+# The tornado/Monte Carlo override ONE shared nim_beta onto both banks (module
+# docstring), but the true base case uses each bank's own calibrated beta -- so the
+# override range needs to be centered on a single representative value (see
+# `_base_nim_beta`) rather than an arbitrary fixed point, or the sensitivity analysis
+# quietly samples a different world than the one it's supposed to perturb around. The
+# half-width matches the OLD fixed [0.15, 0.6] range's own total span (0.45).
+#
+# CONFIRMED (not fixable by choice of center, see README): on the real example deal,
+# centering on EITHER bank's own calibrated beta, or their average, still leaves the
+# tornado/Monte Carlo's year-2-accretion and minimum-stressed-CET1 metrics well above
+# the true base case (which uses the acquirer's 0.467 and the target's 1.061
+# SEPARATELY). A direct probe shows year-2 accretion rising roughly monotonically
+# with the SHARED beta -- 0.0 -> +6.97%, 0.467 -> +13.71%, 0.6 -> +16.66%,
+# 1.061 -> +36.09% -- while the true (divergent-beta) base case is +6.38%, closest to
+# the beta=0 END of that curve, not to either bank's own value or their average. The
+# acquirer's own beta is used here anyway (not the average) because it's the tighter
+# of the two and because the accretion metric is measured relative to the ACQUIRER's
+# own standalone EPS -- but this is a best-effort center, not one that closes the gap.
+NIM_BETA_SENSITIVITY_HALF_WIDTH = 0.225
+
+
+def _base_nim_beta(ctx: DealContext) -> float:
+    """A single representative NIM beta to center the tornado/Monte Carlo's shared
+    override range on: the ACQUIRER's own calibrated beta (falling back to
+    `DEFAULT_NIM_BETA` if it has no `ppnr_stress` configured at all) -- not an average
+    with the target's, since the accretion metrics this drives are measured relative
+    to the acquirer's own standalone EPS. See the CONFIRMED note above: this still
+    doesn't make the resulting distribution centered on the true base case when the
+    two banks' calibrated betas diverge sharply, because a SHARED override can't
+    reproduce a DIVERGENT-beta world no matter which single value it uses."""
+    return (
+        ctx.acquirer_bank_config.ppnr_stress.nim_beta
+        if ctx.acquirer_bank_config.ppnr_stress is not None
+        else DEFAULT_NIM_BETA
+    )
 
 
 @dataclass(frozen=True)
@@ -212,14 +253,17 @@ class TornadoDriver:
     high: float
 
 
-def build_default_tornado_drivers(base_config: DealConfig) -> list[TornadoDriver]:
-    """Illustrative +/- ranges around `base_config`'s own values -- not
-    derived from any real deal-pricing distribution -- clipped to each
-    field's own valid range (e.g. stock_pct can't exceed 1.0). `nim_beta`
-    has no single base value to perturb (each bank is calibrated
-    independently -- see module docstring), so its own range is a fixed
-    illustrative [0.15, 0.6] regardless of the base config."""
-    c = base_config
+def build_default_tornado_drivers(ctx: DealContext) -> list[TornadoDriver]:
+    """Illustrative +/- ranges around `ctx.base_config`'s own values --
+    not derived from any real deal-pricing distribution -- clipped to
+    each field's own valid range (e.g. stock_pct can't exceed 1.0).
+    `nim_beta` has no single base value to perturb directly (each bank
+    is calibrated independently -- see module docstring), so its range
+    is centered on `_base_nim_beta(ctx)` (the two banks' own calibrated
+    betas, averaged) instead of an arbitrary fixed point -- otherwise
+    the tornado would silently perturb around a different world than
+    the base case it's meant to bracket."""
+    c = ctx.base_config
     return [
         TornadoDriver(
             "Price (P/TBV)",
@@ -257,7 +301,12 @@ def build_default_tornado_drivers(base_config: DealConfig) -> list[TornadoDriver
             max(c.consideration.stock_pct - 0.2, 0.0),
             min(c.consideration.stock_pct + 0.2, 1.0),
         ),
-        TornadoDriver("NIM beta", "nim_beta", 0.15, 0.6),
+        TornadoDriver(
+            "NIM beta",
+            "nim_beta",
+            max(_base_nim_beta(ctx) - NIM_BETA_SENSITIVITY_HALF_WIDTH, 0.0),
+            _base_nim_beta(ctx) + NIM_BETA_SENSITIVITY_HALF_WIDTH,
+        ),
     ]
 
 
@@ -293,7 +342,7 @@ class TornadoResult:
 
 def compute_tornado(ctx: DealContext, drivers: list[TornadoDriver] | None = None) -> TornadoResult:
     if drivers is None:
-        drivers = build_default_tornado_drivers(ctx.base_config)
+        drivers = build_default_tornado_drivers(ctx)
     base_metrics = evaluate_deal(ctx)
     rows = [
         TornadoRow(
@@ -404,7 +453,10 @@ def run_monte_carlo(
         base.rate_mark.rate_mark_pct - 0.02,
         base.rate_mark.rate_mark_pct + 0.02,
     )
-    nb_lo, nb_hi = nim_beta_range or (0.15, 0.6)
+    nb_lo, nb_hi = nim_beta_range or (
+        max(_base_nim_beta(ctx) - NIM_BETA_SENSITIVITY_HALF_WIDTH, 0.0),
+        _base_nim_beta(ctx) + NIM_BETA_SENSITIVITY_HALF_WIDTH,
+    )
 
     rng = np.random.default_rng(seed)
     credit_mark_draws = rng.uniform(cm_lo, cm_hi, size=n_draws)
