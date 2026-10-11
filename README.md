@@ -12,19 +12,19 @@ FRED, Fed DFAST); Projects 1 and 2 use an illustrative, hypothetical deal.
 
 | Project | Business question | Data | Headline result |
 | --- | --- | --- | --- |
-| [Financing Structure Optimizer](#financing-structure-optimizer) | What debt/equity mix maximizes sponsor returns within leverage/coverage/covenant limits? | Illustrative mid-market LBO config (synthetic, hypothetical pricing) | Cuts leverage 5.50x→3.46x, turning -11.3% expected shortfall into +0.9%, for 0.8pp less mean IRR (11.6%→10.8%) |
+| [Financing Structure Optimizer](#financing-structure-optimizer) | What debt/equity mix maximizes sponsor returns within leverage/coverage/covenant limits? | Illustrative mid-market LBO config (synthetic, hypothetical pricing) | Cuts leverage 5.50x→3.46x (stress-scenario config, 5,000 scenarios), turning -11.3% expected shortfall into +0.9%, for 0.8pp less mean IRR (11.6%→10.8%) |
 | [Sponsor LBO Monte Carlo Engine](#sponsor-lbo-monte-carlo-engine) | What's the realistic range of returns for a structure, and what drives the risk? | Same illustrative deal; richer stochastic scenario generation (persistence, recession regimes, fat tails) | +1.0x more leverage on the optimized structure lifts mean IRR 10.8%→11.5%, but flips expected shortfall positive-to-negative (+0.9%→-1.3%) and nearly doubles loss-of-capital probability (2.7%→4.8%) |
-| [Credit-Loss Forecasting Engine](#credit-loss-forecasting-engine) | How much credit loss should a bank reserve against, by loan category, under the Fed's baseline/severely-adverse scenarios? | Real FFIEC Call Report data, 2001Q1-2025Q4 (~3.7M bank-quarter-category rows), Fed/FRED macro series | Backtested out-of-time against 2008 and COVID; C&I NCO-rate peak called 2 quarters early at 0.60% RMSE |
+| [Credit-Loss Forecasting Engine](#credit-loss-forecasting-engine) | How much credit loss should a bank reserve against, by loan category, under the Fed's baseline/severely-adverse scenarios? | Real FFIEC Call Report data, 2001Q1-2025Q4 (~3.7M bank-quarter-category rows), Fed/FRED macro series | Severely adverse 9-quarter losses land within ~1pt of the Fed's own DFAST 2026 results for residential mortgage, home equity and credit card, from 25 years of real Call Report data (2001-2025) |
 | [Bank M&A CET1 & Accretion Simulator](#bank-ma-cet1--accretion-simulator) | Does a bank M&A deal accrete EPS, dilute book value, and survive a Fed stress test? | Real FFIEC/FR Y-9C data for two real (anonymized) banks; illustrative, hypothetical deal terms | At the 1.5x TBV base case: value-destructive (+5.3% IRR, TBV earnback beyond 5 years); pro forma CET1 still clears the 4.5% minimum under severely adverse stress |
 
 <table>
 <tr>
-<td width="25%" align="center"><img src="docs/simulate/structure_comparison.png" width="100%"><br><sub>Optimizer: return vs. risk across structures</sub></td>
-<td width="25%" align="center"><img src="docs/simulate/value_bridge.png" width="100%"><br><sub>LBO Monte Carlo: value creation bridge</sub></td>
+<td width="50%" align="center"><img src="docs/simulate/structure_comparison.png" width="100%"><br><sub>Optimizer: return vs. risk across structures</sub></td>
+<td width="50%" align="center"><img src="docs/simulate/value_bridge.png" width="100%"><br><sub>LBO Monte Carlo: value creation bridge</sub></td>
 </tr>
 <tr>
-<td width="25%" align="center"><img src="docs/credit/backtest_chart_grid_2007-2010.png" width="100%"><br><sub>Credit engine: 2007-2010 backtest, every category</sub></td>
-<td width="25%" align="center"><img src="docs/ma/tbv_earnback.png" width="100%"><br><sub>Bank M&A: TBV dilution &amp; earnback (illustrative deal)</sub></td>
+<td width="50%" align="center"><img src="docs/credit/backtest_chart_grid_2007-2010.png" width="100%"><br><sub>Credit engine: 2007-2010 backtest, every category</sub></td>
+<td width="50%" align="center"><img src="docs/ma/tbv_earnback.png" width="100%"><br><sub>Bank M&A: TBV dilution &amp; earnback (illustrative deal)</sub></td>
 </tr>
 </table>
 
@@ -75,13 +75,16 @@ methodology and an honest limitations writeup for every project.
   TBV alone at the base cost-save assumption, earnback stays beyond the
   horizon.
 - **The illustrative deal helps the combined bank's capital in a normal
-  environment but hurts it exactly when it matters.** Under the baseline
-  scenario, the pro forma combined bank's minimum CET1 ratio is actually
-  *better* than the acquirer's own standalone path (+0.58pp) — the target
-  brings its own capital cushion. Under the Fed's severely adverse
-  scenario that flips: pro forma minimum CET1 is *worse* than acquirer
-  standalone (-0.34pp), because the deal adds the target's credit and
-  rate risk without a proportional capital cushion at close.
+  environment but hurts it exactly when it matters — and it isn't for
+  lack of a capital cushion.** Under the baseline scenario, the pro forma
+  combined bank's minimum CET1 ratio is actually *better* than the
+  acquirer's own standalone path (+0.58pp): the target brings real excess
+  capital (18.6% standalone CET1, well above the acquirer's own ratio).
+  Under the Fed's severely adverse scenario that flips: pro forma minimum
+  CET1 is *worse* than acquirer standalone (-0.34pp) — not because the
+  cushion isn't there, but because the target's own added stress losses,
+  plus the capital consumed by deal mechanics (goodwill, CDI
+  amortization, one-time deal charges), outweigh that excess capital.
 
 ## Technical details
 
