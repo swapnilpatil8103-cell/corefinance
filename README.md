@@ -1,22 +1,110 @@
 # corefin
 
-A vectorized core library for quantitative finance / investment banking
-projects, built as the shared foundation for:
+A vectorized Python library for quantitative finance / investment banking
+modeling: four engines sharing one core (`timeline`, scenario generation,
+and a validation-check framework) across LBO structuring, Monte Carlo risk
+simulation, credit-loss forecasting, and bank M&A analysis. Projects 3 and
+4 run against real public regulatory data (FFIEC Call Report, FR Y-9C,
+FRED, Fed DFAST); Projects 1 and 2 use an illustrative, hypothetical deal.
+~20,600 lines, 772 tests, no fabricated numbers.
 
-1. **Financing Structure Optimizer** (built — see [below](#financing-structure-optimizer))
-   — picks the debt/equity mix that maximizes sponsor returns subject to
-   leverage/coverage/covenant constraints, by calling this core model many
-   times over a grid of candidate structures.
-2. **Sponsor LBO Monte Carlo Engine** — runs thousands of operating
-   scenarios to produce distributions of IRR, MOIC and covenant breaches.
-3. **Credit-Loss Forecasting Engine** (built — see [below](#credit-loss-forecasting-engine)).
-4. **Bank M&A CET1 & Accretion Simulator** (later, bank-specific).
+## The four projects
+
+| Project | Business question | Data | Headline result |
+| --- | --- | --- | --- |
+| [Financing Structure Optimizer](#financing-structure-optimizer) | What debt/equity mix maximizes sponsor returns within leverage/coverage/covenant limits? | Illustrative mid-market LBO config (synthetic, hypothetical pricing) | Cuts leverage 5.50x→3.46x, turning -11.3% expected shortfall into +0.9%, for 0.8pp less mean IRR (11.6%→10.8%) |
+| [Sponsor LBO Monte Carlo Engine](#sponsor-lbo-monte-carlo-engine) | What's the realistic range of returns for a structure, and what drives the risk? | Same illustrative deal; richer stochastic scenario generation (persistence, recession regimes, fat tails) | +1.0x more leverage on the optimized structure lifts mean IRR 10.8%→11.5%, but flips expected shortfall positive-to-negative (+0.9%→-1.3%) and nearly doubles loss-of-capital probability (2.7%→4.8%) |
+| [Credit-Loss Forecasting Engine](#credit-loss-forecasting-engine) | How much credit loss should a bank reserve against, by loan category, under the Fed's baseline/severely-adverse scenarios? | Real FFIEC Call Report data, 2001Q1-2025Q4 (~3.7M bank-quarter-category rows), Fed/FRED macro series | Backtested out-of-time against 2008 and COVID; C&I NCO-rate peak called 2 quarters early at 0.60% RMSE |
+| [Bank M&A CET1 & Accretion Simulator](#bank-ma-cet1--accretion-simulator) | Does a bank M&A deal accrete EPS, dilute book value, and survive a Fed stress test? | Real FFIEC/FR Y-9C data for two real (anonymized) banks; illustrative, hypothetical deal terms | At the 1.5x TBV base case: value-destructive (+5.3% IRR, TBV earnback beyond 5 years); pro forma CET1 still clears the 4.5% minimum under severely adverse stress |
+
+<table>
+<tr>
+<td width="25%" align="center"><img src="docs/simulate/structure_comparison.png" width="100%"><br><sub>Optimizer: return vs. risk across structures</sub></td>
+<td width="25%" align="center"><img src="docs/simulate/value_bridge.png" width="100%"><br><sub>LBO Monte Carlo: value creation bridge</sub></td>
+</tr>
+<tr>
+<td width="25%" align="center"><img src="docs/credit/backtest_chart_grid_2007-2010.png" width="100%"><br><sub>Credit engine: 2007-2010 backtest, every category</sub></td>
+<td width="25%" align="center"><img src="docs/ma/tbv_earnback.png" width="100%"><br><sub>Bank M&A: TBV dilution &amp; earnback (illustrative deal)</sub></td>
+</tr>
+</table>
+
+**How it's built**: Python, a vectorized NumPy core (`(n_scenarios,
+n_periods)` arrays throughout), pydantic config, pandas for the
+credit/bank pipelines; `uv` + `pytest` (772 tests, `ruff` clean); real
+public data for Projects 3-4, illustrative configs for Projects 1-2. See
+[Technical details](#technical-details) below for the full architecture,
+methodology and an honest limitations writeup for every project.
+
+## Key findings
+
+- **The "optimized" LBO structure has a *lower* mean return than the
+  input structure — by design.** 3.46x leverage (vs. the input's 5.50x)
+  brings mean IRR down from 11.6% to 10.8%, but turns expected shortfall
+  in the worst 10% of scenarios from -11.3% to +0.9% and loss-of-capital
+  probability from 9.0% to 2.7% — a deliberate return-for-safety trade,
+  not a worse answer to the same question.
+- **Credit models can't learn a crisis they never saw, and one data gap
+  is structural, not fixable by tuning.** CRE construction's real
+  2008-2010 peak NCO rate (6.9%) is understated by every model (best:
+  2.0%) because FRED's own CRE charge-off release is a single combined
+  series across construction/multifamily/nonfarm-nonresidential — there's
+  no construction-specific history before 2001 to train on.
+- **Survivorship bias is real but isn't the dominant story.**
+  `anchored_to_aggregate`'s per-bank factor is built from today's
+  *surviving* banks only. Tested with 3 variants under severely-adverse:
+  it cuts in different directions by category (C&I's survivors are safer
+  than the industry average; CRE construction's are riskier) and closes
+  at most ~1 point of any category's multi-point gap to the Fed's own
+  figures.
+- **The Fed DFAST comparison gap is real, investigated, and partly (not
+  fully) explained.** This project's own severely-adverse loss figures
+  land within ~1pt of the Fed's DFAST 2026 results for residential
+  mortgage/home equity/credit card, but run 4.8-7.0pts lower for
+  C&I/CRE/consumer. A real confound was found and fixed along the way
+  (the crisis-replay diagnostic was mixing a bank-population effect into
+  what was supposed to be a pure macro-path comparison); the remaining
+  gap most likely reflects the Fed's ~32 largest banks carrying more
+  concentrated risk than this project's full industry-wide panel, but
+  isn't fully disentangled from scenario-severity differences.
+- **The example bank deal is value-destructive at its 1.5x TBV base
+  case, but a cheaper price with higher cost saves actually works.** At
+  1.5x TBV: +5.3% IRR and TBV earnback beyond the 5-year horizon. From
+  the price x cost-save grid, earnback only falls to 3.75 years at the
+  grid's lowest price (1.20x TBV) combined with its highest cost-save
+  assumption (35%) — at every other combination tried, including 1.20x
+  TBV alone at the base cost-save assumption, earnback stays beyond the
+  horizon.
+- **The illustrative deal helps the combined bank's capital in a normal
+  environment but hurts it exactly when it matters.** Under the baseline
+  scenario, the pro forma combined bank's minimum CET1 ratio is actually
+  *better* than the acquirer's own standalone path (+0.58pp) — the target
+  brings its own capital cushion. Under the Fed's severely adverse
+  scenario that flips: pro forma minimum CET1 is *worse* than acquirer
+  standalone (-0.34pp), because the deal adds the target's credit and
+  rate risk without a proportional capital cushion at close.
+
+## Technical details
+
+- [Install & run](#install--run)
+- [Architecture](#architecture)
+- [Sign & unit conventions](#sign--unit-conventions)
+- [The debt module and interest circularity](#the-debt-module-and-interest-circularity)
+- [Covenants](#covenants)
+- [Adding a new tranche type](#adding-a-new-tranche-type)
+- [A known simplification worth knowing about](#a-known-simplification-worth-knowing-about)
+- [Financing Structure Optimizer](#financing-structure-optimizer)
+- [Sponsor LBO Monte Carlo Engine](#sponsor-lbo-monte-carlo-engine)
+- [Where the bank model plugs in](#where-the-bank-model-plugs-in)
+- [Credit-Loss Forecasting Engine](#credit-loss-forecasting-engine)
+- [Bank M&A CET1 & Accretion Simulator](#bank-ma-cet1--accretion-simulator)
+- [Testing conventions](#testing-conventions)
 
 Projects 3 and 4 need a bank statement model, which is structurally
-different from a corporate model. It isn't built here, but the shared
-`timeline`, `assumptions`/`scenarios`, and `checks` layers are designed so
-it can be added as a sibling module — see [Where the bank model plugs
-in](#where-the-bank-model-plugs-in) below.
+different from a corporate model. The shared `timeline`,
+`assumptions`/`scenarios`, and `checks` layers were designed so one could
+be added as a sibling module — see [Where the bank model plugs
+in](#where-the-bank-model-plugs-in) below for how that turned out in
+practice once Projects 3 and 4 were actually built.
 
 ## Install & run
 
